@@ -11,6 +11,14 @@
   (unless (equal expected actual)
     (error "Assertion failed: ~a expected=~s actual=~s" message expected actual)))
 
+(defun assert-error (thunk message)
+  (let ((raised nil))
+    (handler-case
+        (funcall thunk)
+      (error () (setf raised t)))
+    (unless raised
+      (error "Assertion failed: ~a" message))))
+
 (defun make-test-state (&optional (dimension 8))
   (reality-engine-lsp::make-reality-state
    :dimension dimension
@@ -61,6 +69,47 @@
 (defun first-merge (step)
   (aref (reality-engine-lsp::jget step "mergeBatch") 0))
 
+(defun sta-fixture (&key life-safety clean)
+  (reality-engine-lsp::obj
+   "version" "1.0.0"
+   "machine" (reality-engine-lsp::obj
+              "id" (if life-safety "sta-life" "sta-routine")
+              "name" (if life-safety "STA Life" "STA Routine")
+              "metadata" (if life-safety
+                             (reality-engine-lsp::obj "severity" "life-safety")
+                             (reality-engine-lsp::obj "severity" "routine"))
+              "arbiterRule" "passthrough"
+              "perceptualMapping" (reality-engine-lsp::obj
+                                   "input" (reality-engine-lsp::obj "offset" 0 "length" 2)
+                                   "output" (reality-engine-lsp::obj "offset" 2 "length" 1))
+              "sequences" (reality-engine-lsp::vectorize
+                           (list
+                            (reality-engine-lsp::obj
+                             "id" "sta-seq"
+                             "name" "STA Sequence"
+                             "vectors" (reality-engine-lsp::vectorize
+                                        (list
+                                         (reality-engine-lsp::obj
+                                          "id" "sta-a"
+                                          "isInitial" t
+                                          "elements" (reality-engine-lsp::vectorize
+                                                      (list
+                                                       (reality-engine-lsp::obj "value" 0 "threshold" 0.5)
+                                                       (reality-engine-lsp::obj "value" 0 "threshold" 0.5)))
+                                          "nextVectorIds" (reality-engine-lsp::vectorize (list "sta-b")))
+                                         (reality-engine-lsp::obj
+                                          "id" "sta-b"
+                                          "isInitial" nil
+                                          "elements" (reality-engine-lsp::vectorize
+                                                      (list
+                                                       (reality-engine-lsp::obj "value" 1 "threshold" 0.5)
+                                                       (reality-engine-lsp::obj "value" (if clean 0 1) "threshold" 0.5)))
+                                          "outputVectors" (reality-engine-lsp::vectorize
+                                                           (list
+                                                            (reality-engine-lsp::obj
+                                                             "id" "sta-out"
+                                                             "vector" (reality-engine-lsp::vectorize (list 1))))))))))))))
+
 (defun run-tests ()
   (let* ((machine-json (reality-engine-lsp::obj
                        "id" "machine-test"
@@ -90,6 +139,18 @@
          (result (process-machine-input machine (list 1))))
     (assert-true (reality-engine-lsp::transition-result-machine-output result)
                  "machine output should fire on matching initial vector"))
+  (let* ((report (reality-engine-lsp::compute-sta-report (sta-fixture :life-safety t :clean nil)))
+         (summary (reality-engine-lsp::jget report "summary")))
+    (assert-true (reality-engine-lsp::jbool report "lifeSafety" nil)
+                 "STA report should mark life-safety machines")
+    (assert-equal 1 (reality-engine-lsp::jnumber summary "intraViolations" nil)
+                  "STA report should count HD>1 intra-sequence violations"))
+  (assert-error (lambda () (machine-from-json (sta-fixture :life-safety t :clean nil)))
+                "life-safety machine with STA violation should be rejected")
+  (assert-true (machine-from-json (sta-fixture :life-safety t :clean t))
+               "clean life-safety machine should load")
+  (assert-true (machine-from-json (sta-fixture :life-safety nil :clean nil))
+               "non-life-safety machine with STA violation should load")
   (let ((state (make-test-state 8)))
     (reality-engine-lsp::put-machine state (one-bit-machine "machine-z" "seq-z" 0 5))
     (reality-engine-lsp::put-machine state (one-bit-machine "machine-a" "seq-a" 0 6))

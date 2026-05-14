@@ -1,5 +1,142 @@
 (in-package #:reality-engine-lsp)
 
+(defparameter +sta-default-threshold+ 0.5d0)
+
+(defun sta-element-state (element)
+  (let ((threshold (or (jnumber element "threshold" nil) +sta-default-threshold+))
+        (value (or (jnumber element "value" 0.0d0) 0.0d0)))
+    (if (>= value threshold) 1 0)))
+
+(defun sta-vector-state (vector-json)
+  (mapcar #'sta-element-state
+          (jarray-list (or (jget vector-json "elements") (arr)))))
+
+(defun sta-hamming-distance (left right)
+  (when (= (length left) (length right))
+    (loop for a in left
+          for b in right
+          count (/= a b))))
+
+(defun sta-life-safety-p (machine-root)
+  (string= (jstring (or (jget machine-root "metadata") (obj)) "severity" "")
+           "life-safety"))
+
+(defun sta-vector-index (machine-root)
+  (let ((index (make-hash-table :test #'equal)))
+    (dolist (sequence (jarray-list (or (jget machine-root "sequences") (arr))))
+      (dolist (vector (jarray-list (or (jget sequence "vectors") (arr))))
+        (when (jstring vector "id" nil)
+          (setf (gethash (jstring vector "id" nil) index)
+                (obj "sequenceId" (jstring sequence "id" "")
+                     "vector" vector)))))
+    index))
+
+(defun compute-sta-report (json)
+  (let* ((machine-root (if (jobject-p (jget json "machine")) (jget json "machine") json))
+         (vector-index (sta-vector-index machine-root))
+         (sequences nil)
+         (intra-violations 0)
+         (inter-jumps 0))
+    (dolist (sequence (jarray-list (or (jget machine-root "sequences") (arr))))
+      (let ((local (make-hash-table :test #'equal))
+            (transitions nil)
+            (max-intra 0)
+            (any-violation nil))
+        (dolist (vector (jarray-list (or (jget sequence "vectors") (arr))))
+          (when (jstring vector "id" nil)
+            (setf (gethash (jstring vector "id" nil) local) vector)))
+        (dolist (vector (jarray-list (or (jget sequence "vectors") (arr))))
+          (let ((from-id (jstring vector "id" ""))
+                (from-state (sta-vector-state vector)))
+            (dolist (next-id (mapcar #'princ-to-string
+                                     (jarray-list (or (jget vector "nextVectorIds") (arr)))))
+              (let ((local-next (gethash next-id local)))
+                (cond
+                  (local-next
+                   (let* ((to-state (sta-vector-state local-next))
+                          (hd (sta-hamming-distance from-state to-state))
+                          (violation (or (null hd) (> hd 1))))
+                     (when hd (setf max-intra (max max-intra hd)))
+                     (when violation
+                       (setf any-violation t)
+                       (incf intra-violations))
+                     (push (obj "from" from-id
+                                "to" next-id
+                                "kind" "intra"
+                                "hd" (or hd +json-null+)
+                                "fromState" (vectorize from-state)
+                                "toState" (vectorize to-state)
+                                "violation" (json-bool violation)
+                                "error" (if hd +json-null+ "element-count-mismatch"))
+                           transitions)))
+                  ((gethash next-id vector-index)
+                   (let* ((found (gethash next-id vector-index))
+                          (target (jget found "vector"))
+                          (hd (sta-hamming-distance from-state (sta-vector-state target))))
+                     (incf inter-jumps)
+                     (push (obj "from" from-id
+                                "to" next-id
+                                "kind" "inter-sequence"
+                                "hd" (or hd +json-null+)
+                                "targetSequenceId" (jstring found "sequenceId" ""))
+                           transitions)))
+                  (t
+                   (setf any-violation t)
+                   (incf intra-violations)
+                   (push (obj "from" from-id
+                              "to" next-id
+                              "kind" "dangling"
+                              "hd" +json-null+
+                              "violation" t
+                              "error" "next vector id not found in machine")
+                         transitions)))))))
+        (push (obj "id" (jstring sequence "id" "")
+                   "name" (or (jstring sequence "name" nil) +json-null+)
+                   "transitions" (vectorize (nreverse transitions))
+                   "maxIntraHD" max-intra
+                   "anyViolation" (json-bool any-violation))
+              sequences)))
+    (obj "machineId" (or (jstring machine-root "id" nil) +json-null+)
+         "machineName" (or (jstring machine-root "name" nil) +json-null+)
+         "lifeSafety" (json-bool (sta-life-safety-p machine-root))
+         "declared" (or (jget (or (jget machine-root "metadata") (obj)) "singleTransitionAssumption") +json-null+)
+         "sequences" (vectorize (nreverse sequences))
+         "summary" (obj "intraViolations" intra-violations
+                        "interJumps" inter-jumps
+                        "drift" +json-null+))))
+
+(defun sta-offender-lines (report)
+  (let (lines)
+    (dolist (sequence (jarray-list (jget report "sequences")))
+      (dolist (transition (jarray-list (jget sequence "transitions")))
+        (when (or (jbool transition "violation" nil)
+                  (not (eq (jget transition "error" +json-null+) +json-null+)))
+          (push (format nil "~a: ~a -> ~a (HD=~a~a)"
+                        (jstring sequence "id" "")
+                        (jstring transition "from" "")
+                        (jstring transition "to" "")
+                        (if (eq (jget transition "hd") +json-null+)
+                            "null"
+                            (princ-to-string (jget transition "hd")))
+                        (if (eq (jget transition "error" +json-null+) +json-null+)
+                            ""
+                            (format nil ", ~a" (jget transition "error"))))
+                lines))))
+    (nreverse lines)))
+
+(defun assert-sta-for-life-safety (json)
+  (let* ((report (compute-sta-report json))
+         (summary (jget report "summary"))
+         (violations (truncate (or (jnumber summary "intraViolations" 0) 0))))
+    (when (and (jbool report "lifeSafety" nil) (> violations 0))
+      (error "STA violation in life-safety machine \"~a\": ~a intra-sequence transition(s) with HD>1.~%~{  - ~a~%~}"
+             (or (jstring report "machineName" nil)
+                 (jstring report "machineId" nil)
+                 "?")
+             violations
+             (sta-offender-lines report)))
+    report))
+
 (defun parse-vector-element (item)
   (cond
     ((numberp item) (make-vector-element :value item :comparator nil :threshold nil))
@@ -54,7 +191,9 @@
     (make-mapping :input (make-region-from-json (jget item "input"))
                   :output (make-region-from-json (jget item "output")))))
 
-(defun machine-from-json (json &optional forced-id)
+(defun machine-from-json (json &optional forced-id &key (strict-sta t))
+  (when strict-sta
+    (assert-sta-for-life-safety json))
   (let* ((root (if (jobject-p (jget json "machine")) (jget json "machine") json))
          (sequences (make-hash-table :test #'equal))
          (machine (make-machine
