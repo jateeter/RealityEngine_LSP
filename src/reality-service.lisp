@@ -2,26 +2,90 @@
 
 (defstruct reality-state
   dimension machines machine-dir perceptual-space history history-limit include-machine-results-p
-  include-perceptual-space-p vector-store sequences qdrant-url collection-name started-at)
+  include-perceptual-space-p vector-store sequences qdrant-url collection-name started-at
+  event-bus-subscriptions latched-event-bits step-count)
+
+(defun compose-key (producer-machine-id producer-sequence-id)
+  (format nil "~a|~a" producer-machine-id producer-sequence-id))
+
+(defun ensure-space-length (state length)
+  (when (> length (length (reality-state-perceptual-space state)))
+    (setf (reality-state-perceptual-space state)
+          (append (reality-state-perceptual-space state)
+                  (make-list (- length (length (reality-state-perceptual-space state)))
+                             :initial-element 0.0d0))))
+  (when (> length (reality-state-dimension state))
+    (setf (reality-state-dimension state) length)))
+
+(defun register-compose-subscriptions (state machine)
+  (let* ((compose (jget (machine-metadata machine) "compose"))
+         (subscriptions (and (jobject-p compose) (jget compose "subscriptions"))))
+    (when (jarray-p subscriptions)
+      (dolist (sub (jarray-list subscriptions))
+        (let ((producer-machine-id (jstring sub "producerMachineId" nil))
+              (producer-sequence-id (jstring sub "producerSequenceId" nil))
+              (bit-offset (jnumber sub "bitOffset" nil)))
+          (when (and producer-machine-id producer-sequence-id bit-offset (>= bit-offset 0))
+            (let* ((bit (truncate bit-offset))
+                   (key (compose-key producer-machine-id producer-sequence-id))
+                   (row (obj "producerMachineId" producer-machine-id
+                             "producerSequenceId" producer-sequence-id
+                             "subscriberMachineId" (machine-id machine)
+                             "bitOffset" bit)))
+              (push row (gethash key (reality-state-event-bus-subscriptions state)))
+              (ensure-space-length state (1+ bit)))))))))
+
+(defun unregister-compose-subscriptions (state machine-id)
+  (let ((updates nil)
+        (deletes nil))
+    (maphash
+     (lambda (key rows)
+       (let ((remaining (remove-if (lambda (row)
+                                     (string= (jstring row "subscriberMachineId" "") machine-id))
+                                   rows)))
+         (if remaining
+             (push (cons key remaining) updates)
+             (push key deletes))))
+     (reality-state-event-bus-subscriptions state))
+    (dolist (update updates)
+      (setf (gethash (car update) (reality-state-event-bus-subscriptions state))
+            (cdr update)))
+    (dolist (key deletes)
+      (remhash key (reality-state-event-bus-subscriptions state)))))
+
+(defun put-machine (state machine)
+  (unregister-compose-subscriptions state (machine-id machine))
+  (setf (gethash (machine-id machine) (reality-state-machines state)) machine)
+  (when (machine-mapping machine)
+    (ensure-space-length state (max (+ (region-offset (mapping-input (machine-mapping machine)))
+                                      (region-length (mapping-input (machine-mapping machine))))
+                                   (+ (region-offset (mapping-output (machine-mapping machine)))
+                                      (region-length (mapping-output (machine-mapping machine)))))))
+  (register-compose-subscriptions state machine)
+  machine)
 
 (defun make-reality-state-from-config (&key machine-dir dimension)
-  (let ((machines (make-hash-table :test #'equal)))
+  (let ((state
+          (make-reality-state
+           :dimension dimension
+           :machines (make-hash-table :test #'equal)
+           :machine-dir machine-dir
+           :perceptual-space (make-list dimension :initial-element 0.0d0)
+           :history nil
+           :history-limit (env-int "RE_HISTORY_LIMIT" 250)
+           :include-machine-results-p (env-bool "RE_INCLUDE_MACHINE_RESULTS" t)
+           :include-perceptual-space-p (env-bool "RE_INCLUDE_PERCEPTUAL_SPACE" t)
+           :vector-store (make-hash-table :test #'equal)
+           :sequences (make-hash-table :test #'equal)
+           :qdrant-url (env "QDRANT_URL" "http://localhost:4333")
+           :collection-name (env "QDRANT_REALITY_COLLECTION" "reality-vectors")
+           :started-at (now-ms)
+           :event-bus-subscriptions (make-hash-table :test #'equal)
+           :latched-event-bits (make-hash-table :test #'equal)
+           :step-count 0)))
     (dolist (machine (load-machines-from-directory machine-dir))
-      (setf (gethash (machine-id machine) machines) machine))
-    (make-reality-state
-     :dimension dimension
-     :machines machines
-     :machine-dir machine-dir
-     :perceptual-space (make-list dimension :initial-element 0.0d0)
-     :history nil
-     :history-limit (env-int "RE_HISTORY_LIMIT" 250)
-     :include-machine-results-p (env-bool "RE_INCLUDE_MACHINE_RESULTS" t)
-     :include-perceptual-space-p (env-bool "RE_INCLUDE_PERCEPTUAL_SPACE" t)
-     :vector-store (make-hash-table :test #'equal)
-     :sequences (make-hash-table :test #'equal)
-     :qdrant-url (env "QDRANT_URL" "http://localhost:4333")
-     :collection-name (env "QDRANT_REALITY_COLLECTION" "reality-vectors")
-     :started-at (now-ms))))
+      (put-machine state machine))
+    state))
 
 (defun record-history (state item)
   (push item (reality-state-history state))
@@ -70,7 +134,9 @@
            (reality-state-machines state))
   (setf (reality-state-perceptual-space state)
         (make-list (reality-state-dimension state) :initial-element 0.0d0)
-        (reality-state-history state) nil)
+        (reality-state-history state) nil
+        (reality-state-latched-event-bits state) (make-hash-table :test #'equal)
+        (reality-state-step-count state) 0)
   state)
 
 (defun assemble-input-vector (state body)
@@ -100,21 +166,96 @@
          out)))
     (t nil)))
 
+(defun sequence-by-id (machine sequence-id)
+  (gethash sequence-id (machine-sequences machine)))
+
+(defun merge-operation-json (machine sequence output output-index)
+  (let* ((values (output-vector-vector output))
+         (governance (resolve-governance machine (sequence-id sequence) values))
+         (deprecation (sequence-deprecation-json sequence))
+         (out (obj "region" (region-json (mapping-output (machine-mapping machine)))
+                   "machineId" (machine-id machine)
+                   "sequenceId" (sequence-id sequence)
+                   "outputIndex" output-index
+                   "values" (vectorize values)
+                   "provenance" (vectorize (output-vector-provenance output)))))
+    (when governance
+      (setf (jget out "governance") governance))
+    (when deprecation
+      (setf (jget out "deprecation") deprecation))
+    out))
+
+(defun sorted-event-bus-writes (writes)
+  (sort writes
+        (lambda (left right)
+          (let ((ls (jstring left "subscriberMachineId" ""))
+                (rs (jstring right "subscriberMachineId" ""))
+                (lb (or (jnumber left "bitOffset" 0) 0))
+                (rb (or (jnumber right "bitOffset" 0) 0))
+                (lm (jstring left "producerMachineId" ""))
+                (rm (jstring right "producerMachineId" ""))
+                (lq (jstring left "producerSequenceId" ""))
+                (rq (jstring right "producerSequenceId" "")))
+            (cond
+              ((not (string= ls rs)) (string< ls rs))
+              ((/= lb rb) (< lb rb))
+              ((not (string= lm rm)) (string< lm rm))
+              (t (string< lq rq)))))))
+
+(defun apply-event-bus (state merge-batch)
+  (let ((writes nil)
+        (seen (make-hash-table :test #'equal)))
+    (dolist (operation merge-batch)
+      (let* ((key (compose-key (jstring operation "machineId" "")
+                               (jstring operation "sequenceId" "")))
+             (subscriptions (gethash key (reality-state-event-bus-subscriptions state))))
+        (dolist (subscription subscriptions)
+          (let* ((bit (truncate (or (jnumber subscription "bitOffset" 0) 0)))
+                 (dedup (format nil "~a|~a|~a|~a"
+                                (jstring subscription "subscriberMachineId" "")
+                                bit
+                                (jstring operation "machineId" "")
+                                (jstring operation "sequenceId" ""))))
+            (unless (gethash dedup seen)
+              (setf (gethash dedup seen) t)
+              (push (obj "producerMachineId" (jstring operation "machineId" "")
+                         "producerSequenceId" (jstring operation "sequenceId" "")
+                         "subscriberMachineId" (jstring subscription "subscriberMachineId" "")
+                         "bitOffset" bit
+                         "value" 1.0d0
+                         "provenance" (jget operation "provenance"))
+                    writes)
+              (setf (gethash bit (reality-state-latched-event-bits state)) t))))))
+    (let ((sorted (sorted-event-bus-writes writes)))
+      (dolist (write sorted)
+        (let ((bit (truncate (or (jnumber write "bitOffset" 0) 0))))
+          (ensure-space-length state (1+ bit))
+          (setf (nth bit (reality-state-perceptual-space state)) (or (jnumber write "value" 1.0d0) 1.0d0))))
+      sorted)))
+
+(defun apply-latched-event-bits (state)
+  (maphash (lambda (bit _)
+             (declare (ignore _))
+             (ensure-space-length state (1+ bit))
+             (setf (nth bit (reality-state-perceptual-space state)) 1.0d0))
+           (reality-state-latched-event-bits state)))
+
 (defun process-perceptual-input (state input &key override include-machine-results include-perceptual-space)
+  (ensure-space-length state (max (reality-state-dimension state) (length input)))
   (setf (reality-state-perceptual-space state)
         (append input (make-list (max 0 (- (reality-state-dimension state) (length input)))
                                  :initial-element 0.0d0)))
+  (apply-latched-event-bits state)
   (let ((machine-results (make-hash-table :test #'equal))
         (merge-batch nil)
         (active-regions nil))
-    (maphash
-     (lambda (id machine)
+    (dolist (machine (object-values-sorted (reality-state-machines state)))
+      (let ((id (machine-id machine)))
        (when (machine-mapping machine)
          (let* ((mapping (machine-mapping machine))
                 (machine-input (extract-region (reality-state-perceptual-space state)
                                                (mapping-input mapping)))
-                (result (process-machine-input machine machine-input :override override))
-                (output (transition-result-machine-output result)))
+                (result (process-machine-input machine machine-input :override override)))
            (when include-machine-results
              (setf (gethash id machine-results) (transition-result-json result)))
            (push (obj "offset" (region-offset (mapping-input mapping))
@@ -122,25 +263,40 @@
                       "machineId" id
                       "type" "input")
                  active-regions)
-           (when output
-             (setf (reality-state-perceptual-space state)
-                   (merge-region (reality-state-perceptual-space state)
-                                 (mapping-output mapping)
-                                 (output-vector-vector output)))
-             (push (obj "machineId" id
-                        "outputVector" (output-vector-json output)
-                        "targetRegion" (region-json (mapping-output mapping))
-                        "provenance" (vectorize (output-vector-provenance output)))
-                   merge-batch)))))
-     (reality-state-machines state))
-    (let ((step (obj "success" t
+           (when (jbool (transition-result-arbiter-metadata result) "shouldOutput" nil)
+             (dolist (sequence-id (object-keys-sorted (transition-result-sequence-outputs result)))
+               (let ((sequence (sequence-by-id machine sequence-id))
+                     (outputs (gethash sequence-id (transition-result-sequence-outputs result)))
+                     (index 0))
+                 (dolist (output outputs)
+                   (when sequence
+                     (push (merge-operation-json machine sequence output index) merge-batch)
+                     (incf index))))))))))
+    (setf merge-batch (sorted-merge-operations merge-batch))
+    (dolist (operation merge-batch)
+      (let ((region (make-region-from-json (jget operation "region")))
+            (values (numbers-from-json (jget operation "values"))))
+        (setf (reality-state-perceptual-space state)
+              (merge-region (reality-state-perceptual-space state) region values))
+        (push (obj "offset" (region-offset region)
+                   "length" (region-length region)
+                   "machineId" (jstring operation "machineId" "")
+                   "type" "output")
+              active-regions)))
+    (let* ((event-bus (apply-event-bus state merge-batch))
+           (step-number (reality-state-step-count state))
+           (step (obj "success" t
+                     "stepNumber" step-number
                      "timestamp" (now-ms)
                      "inputVector" (vectorize input)
                      "machineResults" (if include-machine-results machine-results (obj))
-                     "mergeBatch" (vectorize (nreverse merge-batch))
+                     "mergeBatch" (vectorize merge-batch)
+                     "eventBus" (vectorize event-bus)
                      "activeRegions" (vectorize (nreverse active-regions)))))
+      (setf (reality-state-step-count state) (1+ step-number))
       (when include-perceptual-space
-        (setf (jget step "perceptualSpace") (vectorize (reality-state-perceptual-space state))))
+        (setf (jget step "perceptualSpace") (vectorize (reality-state-perceptual-space state))
+              (jget step "perceptualSpaceIsDebugProjection") t))
       (record-history state step)
       step)))
 
@@ -368,7 +524,7 @@
                                         (actor-ask actor
                                                    (lambda (state)
                                                      (let ((machine (machine-from-json body)))
-                                                       (setf (gethash (machine-id machine) (reality-state-machines state)) machine)
+                                                       (put-machine state machine)
                                                        (obj "success" t "machine" (machine-json machine :full t))))))))
    (make-route "PUT" "/api/machines/:id" (lambda (params body query)
                                           (declare (ignore query))
@@ -376,13 +532,14 @@
                                            (actor-ask actor
                                                       (lambda (state)
                                                         (let ((machine (machine-from-json body (gethash "id" params))))
-                                                          (setf (gethash (machine-id machine) (reality-state-machines state)) machine)
+                                                          (put-machine state machine)
                                                           (obj "success" t "machine" (machine-json machine :full t)))))))
    (make-route "DELETE" "/api/machines/:id" (lambda (params body query)
                                              (declare (ignore body query))
                                              (json-response
                                               (actor-ask actor
-                                                         (lambda (state)
+                                                           (lambda (state)
+                                                           (unregister-compose-subscriptions state (gethash "id" params))
                                                            (obj "success" (json-bool (remhash (gethash "id" params) (reality-state-machines state)))))))))
    (make-route "POST" "/api/machines/:id/process" (lambda (params body query)
                                                    (declare (ignore query))
@@ -456,8 +613,8 @@
                                                                    (let* ((name (gethash "name" params))
                                                                           (filename (if (uiop:string-suffix-p ".json" name) name (format nil "~a.json" name)))
                                                                           (path (merge-pathnames filename (uiop:ensure-directory-pathname (reality-state-machine-dir state))))
-                                                                          (machine (load-machine-from-file path)))
-                                                                     (setf (gethash (machine-id machine) (reality-state-machines state)) machine)
+                                                                     (machine (load-machine-from-file path)))
+                                                                     (put-machine state machine)
                                                                      (obj "success" t "machine" (machine-json machine :full t) "message" "Machine loaded successfully")))))
                                                    (error (condition) (error-response (princ-to-string condition) 404)))))
    (make-route "POST" "/api/machines/json/import" (lambda (_ body query)
@@ -466,7 +623,7 @@
                                                     (actor-ask actor
                                                                (lambda (state)
                                                                  (let ((machine (machine-from-json body)))
-                                                                   (setf (gethash (machine-id machine) (reality-state-machines state)) machine)
+                                                                   (put-machine state machine)
                                                                    (obj "success" t "machine" (machine-json machine :full t))))))))
    (make-route "GET" "/api/machines/:id/export" (lambda (params body query)
                                                  (declare (ignore body query))
@@ -568,7 +725,7 @@
                                          (state-json (lambda (state)
                                                        (obj "machines" (vectorize
                                                                         (mapcar #'machine-json
-                                                                                (object-values (reality-state-machines state)))))))))
+                                                                                (object-values-sorted (reality-state-machines state)))))))))
      (make-route "GET" "/api/machines/:id" (lambda (params body query)
                                              (declare (ignore body query))
                                              (let ((machine (actor-ask actor (lambda (state)
@@ -581,7 +738,7 @@
                                           (declare (ignore _ query))
                                           (state-json (lambda (state)
                                                         (let ((machine (machine-from-json body)))
-                                                          (setf (gethash (machine-id machine) (reality-state-machines state)) machine)
+                                                          (put-machine state machine)
                                                           (obj "success" t "machine" (machine-json machine :full t)))))))
      (make-route "POST" "/api/machines/:id/process" (lambda (params body query)
                                                       (declare (ignore query))

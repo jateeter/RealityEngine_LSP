@@ -80,7 +80,7 @@
   (let ((dir (uiop:ensure-directory-pathname directory))
         (machines nil))
     (when (uiop:directory-exists-p dir)
-      (dolist (path (uiop:directory-files dir "*.json"))
+      (dolist (path (sort (uiop:directory-files dir "*.json") #'string< :key #'namestring))
         (handler-case
             (push (load-machine-from-file path) machines)
           (error (condition)

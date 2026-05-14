@@ -7,6 +7,60 @@
   (unless value
     (error "Assertion failed: ~a" message)))
 
+(defun assert-equal (expected actual message)
+  (unless (equal expected actual)
+    (error "Assertion failed: ~a expected=~s actual=~s" message expected actual)))
+
+(defun make-test-state (&optional (dimension 8))
+  (reality-engine-lsp::make-reality-state
+   :dimension dimension
+   :machines (make-hash-table :test #'equal)
+   :machine-dir "/tmp"
+   :perceptual-space (make-list dimension :initial-element 0.0d0)
+   :history nil
+   :history-limit 25
+   :include-machine-results-p t
+   :include-perceptual-space-p t
+   :vector-store (make-hash-table :test #'equal)
+   :sequences (make-hash-table :test #'equal)
+   :qdrant-url "http://localhost:4333"
+   :collection-name "test"
+   :started-at (reality-engine-lsp::now-ms)
+   :event-bus-subscriptions (make-hash-table :test #'equal)
+   :latched-event-bits (make-hash-table :test #'equal)
+   :step-count 0))
+
+(defun one-bit-machine (id sequence-id input-offset output-offset &key metadata value)
+  (machine-from-json
+   (reality-engine-lsp::obj
+    "id" id
+    "name" id
+    "arbiterRule" "passthrough"
+    "metadata" (or metadata (reality-engine-lsp::obj))
+    "perceptualMapping" (reality-engine-lsp::obj
+                         "input" (reality-engine-lsp::obj "offset" input-offset "length" 1)
+                         "output" (reality-engine-lsp::obj "offset" output-offset "length" (length (or value (list 1)))))
+    "sequences" (reality-engine-lsp::vectorize
+                 (list
+                  (reality-engine-lsp::obj
+                   "id" sequence-id
+                   "name" sequence-id
+                   "vectors" (reality-engine-lsp::vectorize
+                              (list
+                               (reality-engine-lsp::obj
+                                "id" (format nil "~a-vector" sequence-id)
+                                "isInitial" t
+                                "elements" (reality-engine-lsp::vectorize
+                                            (list (reality-engine-lsp::obj "value" 1 "threshold" 0.5)))
+                                "outputVectors" (reality-engine-lsp::vectorize
+                                                 (list
+                                                  (reality-engine-lsp::obj
+                                                   "id" (format nil "~a-out" sequence-id)
+                                                   "vector" (reality-engine-lsp::vectorize (or value (list 1)))))))))))))))
+
+(defun first-merge (step)
+  (aref (reality-engine-lsp::jget step "mergeBatch") 0))
+
 (defun run-tests ()
   (let* ((machine-json (reality-engine-lsp::obj
                        "id" "machine-test"
@@ -36,6 +90,101 @@
          (result (process-machine-input machine (list 1))))
     (assert-true (reality-engine-lsp::transition-result-machine-output result)
                  "machine output should fire on matching initial vector"))
+  (let ((state (make-test-state 8)))
+    (reality-engine-lsp::put-machine state (one-bit-machine "machine-z" "seq-z" 0 5))
+    (reality-engine-lsp::put-machine state (one-bit-machine "machine-a" "seq-a" 0 6))
+    (let* ((step (reality-engine-lsp::process-perceptual-input state (list 1)
+                                                            :include-machine-results t
+                                                            :include-perceptual-space t))
+           (batch (coerce (reality-engine-lsp::jget step "mergeBatch") 'list)))
+      (assert-equal (list "machine-a" "machine-z")
+                    (mapcar (lambda (op) (reality-engine-lsp::jstring op "machineId" "")) batch)
+                    "mergeBatch should be sorted by machineId")
+      (assert-equal (list 1) (reality-engine-lsp::numbers-from-json (reality-engine-lsp::jget (first batch) "values"))
+                    "mergeBatch should carry output values")
+      (assert-equal (list "seq-a-vector")
+                    (coerce (reality-engine-lsp::jget (first batch) "provenance") 'list)
+                    "mergeBatch should carry provenance")))
+  (let* ((metadata (reality-engine-lsp::obj
+                    "governance" (reality-engine-lsp::obj
+                                  "ownerTeam" "machine-team"
+                                  "runbook" "https://runbook"
+                                  "escalationPolicy" "pager"
+                                  "sla" (reality-engine-lsp::obj "error" 60)
+                                  "contact" (reality-engine-lsp::obj "primary" "primary@example.org"))
+                    "triggerConfig" (reality-engine-lsp::obj
+                                     "rules" (reality-engine-lsp::vectorize
+                                              (list
+                                               (reality-engine-lsp::obj
+                                                "sequenceId" "seq-gov"
+                                                "outputMatches" (reality-engine-lsp::vectorize (list 4 3))
+                                                "ragStatusCode" "RED"
+                                                "processStatus" "error"
+                                                "description" "page"
+                                                "governance" (reality-engine-lsp::obj
+                                                              "ownerTeam" "rule-team"
+                                                              "slaSeconds" 30)))))))
+         (state (make-test-state 8)))
+    (reality-engine-lsp::put-machine state
+                                     (one-bit-machine "machine-gov" "seq-gov" 0 2
+                                                      :metadata metadata
+                                                      :value (list 4 3)))
+    (let* ((op (first-merge (reality-engine-lsp::process-perceptual-input
+                             state (list 1)
+                             :include-machine-results t
+                             :include-perceptual-space t)))
+           (governance (reality-engine-lsp::jget op "governance")))
+      (assert-equal "RED" (reality-engine-lsp::jstring governance "ragStatusCode" "")
+                    "governance ragStatusCode should be stamped")
+      (assert-equal "rule-team" (reality-engine-lsp::jstring governance "ownerTeam" "")
+                    "rule governance should override machine owner")
+      (assert-equal 30 (reality-engine-lsp::jnumber governance "slaSeconds" nil)
+                    "rule SLA should override machine SLA")))
+  (let* ((machine (one-bit-machine "machine-dep" "seq-dep" 0 2 :value (list 1)))
+         (sequence (gethash "seq-dep" (reality-engine-lsp::machine-sequences machine)))
+         (state (make-test-state 8)))
+    (setf (reality-engine-lsp::sequence-schema-version sequence) "1.0.0"
+          (reality-engine-lsp::sequence-deprecated-at sequence) "2026-02-01"
+          (reality-engine-lsp::sequence-replaced-by sequence) "seq-new")
+    (reality-engine-lsp::put-machine state machine)
+    (let* ((op (first-merge (reality-engine-lsp::process-perceptual-input
+                             state (list 1)
+                             :include-machine-results t
+                             :include-perceptual-space t)))
+           (deprecation (reality-engine-lsp::jget op "deprecation")))
+      (assert-equal "2026-02-01" (reality-engine-lsp::jstring deprecation "since" "")
+                    "deprecated sequence should stamp since")
+      (assert-equal "seq-new" (reality-engine-lsp::jstring deprecation "replacedBy" "")
+                    "deprecated sequence should stamp replacement")
+      (assert-true (> (reality-engine-lsp::jnumber deprecation "ageDays" 0) 0)
+                   "deprecated sequence should stamp ageDays")))
+  (let* ((state (make-test-state 12))
+         (agent-meta (reality-engine-lsp::obj
+                      "compose" (reality-engine-lsp::obj
+                                 "subscriptions" (reality-engine-lsp::vectorize
+                                                  (list
+                                                   (reality-engine-lsp::obj
+                                                    "producerMachineId" "producer"
+                                                    "producerSequenceId" "producer-seq"
+                                                    "bitOffset" 1)))))))
+    (reality-engine-lsp::put-machine state (one-bit-machine "agent" "agent-seq" 1 4 :metadata agent-meta))
+    (reality-engine-lsp::put-machine state (one-bit-machine "producer" "producer-seq" 0 3))
+    (let* ((step-1 (reality-engine-lsp::process-perceptual-input
+                    state (list 1 0)
+                    :include-machine-results t
+                    :include-perceptual-space t))
+           (event-bus (coerce (reality-engine-lsp::jget step-1 "eventBus") 'list)))
+      (assert-equal 1 (length event-bus) "compose producer should emit one event-bus write")
+      (assert-equal 1 (reality-engine-lsp::jnumber (first event-bus) "bitOffset" nil)
+                    "compose write should target subscriber bit"))
+    (let* ((step-2 (reality-engine-lsp::process-perceptual-input
+                    state (list 0 0)
+                    :include-machine-results t
+                    :include-perceptual-space t))
+           (batch (coerce (reality-engine-lsp::jget step-2 "mergeBatch") 'list)))
+      (assert-true (find "agent-seq" batch
+                         :key (lambda (op) (reality-engine-lsp::jstring op "sequenceId" ""))
+                         :test #'string=)
+                   "latched compose bit should let subscriber fire on the next step")))
   (format t "~&RealityEngine_LSP core tests passed.~%")
   t)
-

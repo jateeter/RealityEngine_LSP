@@ -9,7 +9,7 @@
 (defstruct (ces (:constructor make-ces) (:conc-name sequence-))
   id name metadata schema-version deprecated-at replaced-by vectors)
 (defstruct machine id name description metadata mapping match-algorithm arbiter-rule sequences)
-(defstruct transition-result input-vector timestamp sequence-results machine-output arbiter-metadata)
+(defstruct transition-result input-vector timestamp sequence-results sequence-outputs machine-output arbiter-metadata)
 
 (defun comparator-name (value)
   (string-downcase (or value "gte")))
@@ -59,7 +59,7 @@
        "metadata" (or (reality-vector-metadata vector) (obj))))
 
 (defun sequence-json (sequence &key full)
-  (let* ((vectors (object-values (sequence-vectors sequence)))
+  (let* ((vectors (object-values-sorted (sequence-vectors sequence)))
          (initials (remove-if-not #'reality-vector-initial-p vectors))
          (outputs (remove-if-not (lambda (v) (reality-vector-output-vectors v)) vectors))
          (out (obj "id" (sequence-id sequence)
@@ -79,7 +79,7 @@
     out))
 
 (defun machine-sequence-list (machine)
-  (object-values (machine-sequences machine)))
+  (object-values-sorted (machine-sequences machine)))
 
 (defun machine-json (machine &key full)
   (let* ((sequences (machine-sequence-list machine))
@@ -186,7 +186,7 @@
                (declare (ignore _))
                (setf (reality-vector-just-matched-p vector) nil))
              (sequence-vectors sequence))
-    (dolist (vector (remove-if-not #'reality-vector-active-p (object-values (sequence-vectors sequence))))
+    (dolist (vector (remove-if-not #'reality-vector-active-p (object-values-sorted (sequence-vectors sequence))))
       (multiple-value-bind (ok next-ids emitted _score _metadata chain)
           (transition-vector vector input :override override)
         (declare (ignore _score _metadata))
@@ -219,6 +219,7 @@
 
 (defun process-machine-input (machine input &key override)
   (let ((sequence-results (make-hash-table :test #'equal))
+        (sequence-outputs (make-hash-table :test #'equal))
         (all-outputs nil)
         (sequences-with-output 0))
     (dolist (sequence (machine-sequence-list machine))
@@ -227,7 +228,8 @@
         (remhash "%outputs" result)
         (when outputs (incf sequences-with-output))
         (setf all-outputs (append all-outputs outputs)
-              (gethash (sequence-id sequence) sequence-results) result)))
+              (gethash (sequence-id sequence) sequence-results) result
+              (gethash (sequence-id sequence) sequence-outputs) outputs)))
     (let* ((total (hash-table-count (machine-sequences machine)))
            (rule (arbiter-name (machine-arbiter-rule machine)))
            (should-output (cond
@@ -246,11 +248,111 @@
        :input-vector input
        :timestamp (now-ms)
        :sequence-results sequence-results
+       :sequence-outputs sequence-outputs
        :machine-output machine-output
        :arbiter-metadata (obj "rule" rule
                               "totalInputs" total
                               "sequencesWithOutput" sequences-with-output
                               "shouldOutput" (json-bool should-output))))))
+
+(defun values-equal-p (left right)
+  (and (= (length left) (length right))
+       (loop for a in left
+             for b in right
+             always (= (coerce a 'double-float) (coerce b 'double-float)))))
+
+(defun resolve-governance (machine sequence-id values)
+  (let* ((metadata (machine-metadata machine))
+         (trigger (jget metadata "triggerConfig"))
+         (rules (and (jobject-p trigger) (jget trigger "rules"))))
+    (unless (jarray-p rules)
+      (return-from resolve-governance nil))
+    (let ((match nil))
+      (dolist (rule (jarray-list rules))
+        (when (and (jobject-p rule)
+                   (string= (jstring rule "sequenceId" "") sequence-id)
+                   (values-equal-p values (numbers-from-json (jget rule "outputMatches"))))
+          (setf match rule)
+          (return)))
+      (unless match
+        (return-from resolve-governance nil))
+      (let* ((machine-gov (jget metadata "governance"))
+             (has-machine-gov (jobject-p machine-gov))
+             (rule-gov (jget match "governance"))
+             (has-rule-gov (jobject-p rule-gov))
+             (process-status (jstring match "processStatus" nil))
+             (sla-from-rule (and has-rule-gov (jnumber rule-gov "slaSeconds" nil)))
+             (sla-from-machine (and has-machine-gov
+                                    process-status
+                                    (jobject-p (jget machine-gov "sla"))
+                                    (jnumber (jget machine-gov "sla") process-status nil)))
+             (rule-contact (and has-rule-gov (jget rule-gov "contact")))
+             (machine-contact (and has-machine-gov (jget machine-gov "contact")))
+             (contact (obj)))
+        (let ((primary (or (and (jobject-p rule-contact) (jstring rule-contact "primary" nil))
+                           (and (jobject-p machine-contact) (jstring machine-contact "primary" nil))))
+              (secondary (or (and (jobject-p rule-contact) (jstring rule-contact "secondary" nil))
+                             (and (jobject-p machine-contact) (jstring machine-contact "secondary" nil)))))
+          (when primary (setf (jget contact "primary") primary))
+          (when secondary (setf (jget contact "secondary") secondary)))
+        (let ((out (obj
+                    "machineId" (machine-id machine)
+                    "machineName" (machine-name machine)
+                    "sequenceId" sequence-id
+                    "ragStatusCode" (or (jstring match "ragStatusCode" nil) +json-null+)
+                    "processStatus" (or process-status +json-null+)
+                    "ownerTeam" (or (and has-rule-gov (jstring rule-gov "ownerTeam" nil))
+                                     (and has-machine-gov (jstring machine-gov "ownerTeam" nil))
+                                     "unrouted")
+                    "slaSeconds" (or sla-from-rule sla-from-machine +json-null+)
+                    "runbook" (or (and has-rule-gov (jstring rule-gov "runbook" nil))
+                                  (and has-machine-gov (jstring machine-gov "runbook" nil))
+                                  +json-null+)
+                    "escalationPolicy" (or (and has-rule-gov (jstring rule-gov "escalationPolicy" nil))
+                                           (and has-machine-gov (jstring machine-gov "escalationPolicy" nil))
+                                           +json-null+)
+                    "contact" contact
+                    "source" (cond
+                                (has-rule-gov "rule-with-override")
+                                (has-machine-gov "rule-only")
+                                (t "machine-fallback"))
+                    "hasMachineGovernance" (json-bool has-machine-gov))))
+          (when (jstring match "description" nil)
+            (setf (jget out "description") (jstring match "description" nil)))
+          out)))))
+
+(defun days-since-date (value)
+  (handler-case
+      (when (and (stringp value) (>= (length value) 10))
+        (let* ((year (parse-integer value :start 0 :end 4))
+               (month (parse-integer value :start 5 :end 7))
+               (day (parse-integer value :start 8 :end 10))
+               (then (encode-universal-time 0 0 0 day month year 0))
+               (now (get-universal-time)))
+          (max 0 (floor (- now then) 86400))))
+    (error () 0)))
+
+(defun sequence-deprecation-json (sequence)
+  (when (sequence-deprecated-at sequence)
+    (let ((out (obj "since" (sequence-deprecated-at sequence)
+                    "ageDays" (or (days-since-date (sequence-deprecated-at sequence)) 0))))
+      (when (sequence-replaced-by sequence)
+        (setf (jget out "replacedBy") (sequence-replaced-by sequence)))
+      out)))
+
+(defun sorted-merge-operations (operations)
+  (sort operations
+        (lambda (left right)
+          (let ((lm (jstring left "machineId" ""))
+                (rm (jstring right "machineId" ""))
+                (ls (jstring left "sequenceId" ""))
+                (rs (jstring right "sequenceId" ""))
+                (li (or (jnumber left "outputIndex" 0) 0))
+                (ri (or (jnumber right "outputIndex" 0) 0)))
+            (cond
+              ((not (string= lm rm)) (string< lm rm))
+              ((not (string= ls rs)) (string< ls rs))
+              (t (< li ri)))))))
 
 (defun transition-result-json (result)
   (obj "inputVector" (vectorize (transition-result-input-vector result))

@@ -142,3 +142,16 @@
                  (push value values))
                object))
     (nreverse values)))
+
+(defun object-keys-sorted (object)
+  (let (keys)
+    (when (hash-table-p* object)
+      (maphash (lambda (key _)
+                 (declare (ignore _))
+                 (push key keys))
+               object))
+    (sort keys #'string<)))
+
+(defun object-values-sorted (object)
+  (mapcar (lambda (key) (gethash key object))
+          (object-keys-sorted object)))
