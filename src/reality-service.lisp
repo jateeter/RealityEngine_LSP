@@ -3,7 +3,7 @@
 (defstruct reality-state
   dimension machines machine-dir perceptual-space history history-limit include-machine-results-p
   include-perceptual-space-p vector-store sequences qdrant-url collection-name started-at
-  event-bus-subscriptions latched-event-bits step-count)
+  event-bus-subscriptions latched-event-bits step-count mapping-version)
 
 (defun compose-key (producer-machine-id producer-sequence-id)
   (format nil "~a|~a" producer-machine-id producer-sequence-id))
@@ -53,9 +53,18 @@
     (dolist (key deletes)
       (remhash key (reality-state-event-bus-subscriptions state)))))
 
+(defun event-bus-subscription-count (state)
+  (let ((count 0))
+    (maphash (lambda (_ rows)
+               (declare (ignore _))
+               (incf count (length rows)))
+             (reality-state-event-bus-subscriptions state))
+    count))
+
 (defun put-machine (state machine)
   (unregister-compose-subscriptions state (machine-id machine))
   (setf (gethash (machine-id machine) (reality-state-machines state)) machine)
+  (incf (reality-state-mapping-version state))
   (when (machine-mapping machine)
     (ensure-space-length state (max (+ (region-offset (mapping-input (machine-mapping machine)))
                                       (region-length (mapping-input (machine-mapping machine))))
@@ -82,7 +91,8 @@
            :started-at (now-ms)
            :event-bus-subscriptions (make-hash-table :test #'equal)
            :latched-event-bits (make-hash-table :test #'equal)
-           :step-count 0)))
+           :step-count 0
+           :mapping-version 0)))
     (dolist (machine (load-machines-from-directory machine-dir))
       (put-machine state machine))
     state))
@@ -124,7 +134,10 @@
          "vectorCount" vector-count
          "dimension" (reality-state-dimension state)
          "requiredDimension" (required-dimension state)
-         "historySize" (length (reality-state-history state)))))
+         "historySize" (length (reality-state-history state))
+         "mappingVersion" (reality-state-mapping-version state)
+         "eventBusSubscriptionCount" (event-bus-subscription-count state)
+         "latchedEventBitCount" (hash-table-count (reality-state-latched-event-bits state)))))
 
 (defun reset-reality-state (state)
   (maphash (lambda (_ machine)
@@ -458,7 +471,8 @@
                                                                 (obj "dimension" (reality-state-dimension state)
                                                                      "requiredDimension" (required-dimension state)
                                                                      "encoding" "dense-float64-clamped-0-1"
-                                                                     "mappingVersion" 0))))))
+                                                                     "mappingVersion" (reality-state-mapping-version state)
+                                                                     "eventBusSubscriptionCount" (event-bus-subscription-count state))))))
    (make-route "GET" "/api/runtime/options" (lambda (_ body query)
                                              (declare (ignore _ body query))
                                              (json-response
@@ -548,8 +562,11 @@
                                              (json-response
                                               (actor-ask actor
                                                            (lambda (state)
-                                                           (unregister-compose-subscriptions state (gethash "id" params))
-                                                           (obj "success" (json-bool (remhash (gethash "id" params) (reality-state-machines state)))))))))
+                                                             (unregister-compose-subscriptions state (gethash "id" params))
+                                                             (let ((removed (remhash (gethash "id" params) (reality-state-machines state))))
+                                                               (when removed
+                                                                 (incf (reality-state-mapping-version state)))
+                                                               (obj "success" (json-bool removed))))))))
    (make-route "POST" "/api/machines/:id/process" (lambda (params body query)
                                                    (declare (ignore query))
                                                    (let ((result (actor-ask actor
@@ -682,7 +699,7 @@
                                                                                                 (reality-state-include-machine-results-p state)))
                                                             :include-perceptual-space (jbool body "includePerceptualSpace"
                                                                                              (reality-state-include-perceptual-space-p state)))
-                                                           (obj "error" "Provide exactly one of: vector, sparseVector, domainVectors")))))))))
+                                                           (obj "error" "Provide exactly one of: vector, sparseVector, domainVectors"))))))))))
 
 (defun reality-routes (actor)
   (labels ((state-json (fn)
@@ -719,7 +736,8 @@
                                                                    (obj "dimension" (reality-state-dimension state)
                                                                         "requiredDimension" (required-dimension state)
                                                                         "encoding" "dense-float64-clamped-0-1"
-                                                                        "mappingVersion" 0)))))
+                                                                        "mappingVersion" (reality-state-mapping-version state)
+                                                                        "eventBusSubscriptionCount" (event-bus-subscription-count state)))))
      (make-route "GET" "/api/governance/route" (lambda (_ body query)
                                                  (declare (ignore _ body))
                                                  (let ((machine-id (gethash "machineId" query))
@@ -803,7 +821,7 @@
                                                                                                    (reality-state-include-machine-results-p state)))
                                                                :include-perceptual-space (jbool body "includePerceptualSpace"
                                                                                                 (reality-state-include-perceptual-space-p state)))
-                                                              (obj "error" "Provide exactly one of: vector, sparseVector, domainVectors"))))))))))
+                                                              (obj "error" "Provide exactly one of: vector, sparseVector, domainVectors")))))))))))
 
 (defun start-reality-service (&key (port 3299) (machine-dir "../RealityEngine_AI/examples/machines") (dimension 768))
   (let* ((state (make-reality-state-from-config :machine-dir machine-dir :dimension dimension))

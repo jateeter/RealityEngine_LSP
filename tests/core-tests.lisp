@@ -36,7 +36,8 @@
    :started-at (reality-engine-lsp::now-ms)
    :event-bus-subscriptions (make-hash-table :test #'equal)
    :latched-event-bits (make-hash-table :test #'equal)
-   :step-count 0))
+   :step-count 0
+   :mapping-version 0))
 
 (defun one-bit-machine (id sequence-id input-offset output-offset &key metadata value)
   (machine-from-json
@@ -65,6 +66,17 @@
                                                   (reality-engine-lsp::obj
                                                    "id" (format nil "~a-out" sequence-id)
                                                    "vector" (reality-engine-lsp::vectorize (or value (list 1)))))))))))))))
+
+(defun compose-metadata (&rest subscriptions)
+  (reality-engine-lsp::obj
+   "compose" (reality-engine-lsp::obj
+              "subscriptions" (reality-engine-lsp::vectorize subscriptions))))
+
+(defun compose-subscription (producer-machine-id producer-sequence-id bit-offset)
+  (reality-engine-lsp::obj
+   "producerMachineId" producer-machine-id
+   "producerSequenceId" producer-sequence-id
+   "bitOffset" bit-offset))
 
 (defun first-merge (step)
   (aref (reality-engine-lsp::jget step "mergeBatch") 0))
@@ -260,16 +272,12 @@
       (assert-true (> (reality-engine-lsp::jnumber deprecation "ageDays" 0) 0)
                    "deprecated sequence should stamp ageDays")))
   (let* ((state (make-test-state 12))
-         (agent-meta (reality-engine-lsp::obj
-                      "compose" (reality-engine-lsp::obj
-                                 "subscriptions" (reality-engine-lsp::vectorize
-                                                  (list
-                                                   (reality-engine-lsp::obj
-                                                    "producerMachineId" "producer"
-                                                    "producerSequenceId" "producer-seq"
-                                                    "bitOffset" 1)))))))
+         (agent-meta (compose-metadata
+                      (compose-subscription "producer" "producer-seq" 1))))
     (reality-engine-lsp::put-machine state (one-bit-machine "agent" "agent-seq" 1 4 :metadata agent-meta))
     (reality-engine-lsp::put-machine state (one-bit-machine "producer" "producer-seq" 0 3))
+    (assert-equal 1 (reality-engine-lsp::event-bus-subscription-count state)
+                  "compose subscription count should include registered metadata")
     (let* ((step-1 (reality-engine-lsp::process-perceptual-input
                     state (list 1 0)
                     :include-machine-results t
@@ -287,6 +295,44 @@
                          :key (lambda (op) (reality-engine-lsp::jstring op "sequenceId" ""))
                          :test #'string=)
                    "latched compose bit should let subscriber fire on the next step")))
+  (let* ((state (make-test-state 32))
+         (agent-meta (compose-metadata
+                      (compose-subscription "producer-c" "producer-c-seq" 9)
+                      (compose-subscription "producer-a" "producer-a-seq" 7)
+                      (compose-subscription "producer-b" "producer-b-seq" 8)
+                      (compose-subscription "producer-a" "producer-a-seq" 7))))
+    (reality-engine-lsp::put-machine state (one-bit-machine "agent-sort" "agent-sort-seq" 7 23 :metadata agent-meta))
+    (reality-engine-lsp::put-machine state (one-bit-machine "producer-c" "producer-c-seq" 2 22))
+    (reality-engine-lsp::put-machine state (one-bit-machine "producer-a" "producer-a-seq" 0 20))
+    (reality-engine-lsp::put-machine state (one-bit-machine "producer-b" "producer-b-seq" 1 21))
+    (assert-equal 4 (reality-engine-lsp::event-bus-subscription-count state)
+                  "compose subscription count should include duplicate declarations")
+    (let* ((step (reality-engine-lsp::process-perceptual-input
+                  state (list 1 1 1)
+                  :include-machine-results t
+                  :include-perceptual-space t))
+           (event-bus (coerce (reality-engine-lsp::jget step "eventBus") 'list)))
+      (assert-equal (list 7 8 9)
+                    (mapcar (lambda (write) (reality-engine-lsp::jnumber write "bitOffset" nil))
+                            event-bus)
+                    "eventBus writes should be deduped and sorted by subscriber/bit/producer/sequence")
+      (assert-equal (list "producer-a" "producer-b" "producer-c")
+                    (mapcar (lambda (write) (reality-engine-lsp::jstring write "producerMachineId" ""))
+                            event-bus)
+                    "eventBus writes should preserve producer identity")))
+  (let* ((state (make-test-state 16))
+         (agent-meta (compose-metadata
+                      (compose-subscription "producer-reset" "producer-reset-seq" 5))))
+    (reality-engine-lsp::put-machine state (one-bit-machine "agent-reset" "agent-reset-seq" 5 8 :metadata agent-meta))
+    (reality-engine-lsp::put-machine state (one-bit-machine "producer-reset" "producer-reset-seq" 0 7))
+    (reality-engine-lsp::process-perceptual-input state (list 1)
+                                                  :include-machine-results t
+                                                  :include-perceptual-space t)
+    (assert-equal 1 (hash-table-count (reality-engine-lsp::reality-state-latched-event-bits state))
+                  "compose writes should latch event bits")
+    (reality-engine-lsp::reset-reality-state state)
+    (assert-equal 0 (hash-table-count (reality-engine-lsp::reality-state-latched-event-bits state))
+                  "reset should clear latched compose bits"))
   (let ((patterns (mapcar #'reality-engine-lsp::route-pattern
                           (reality-engine-lsp::flatten-routes
                            (reality-engine-lsp::reality-routes nil)))))
