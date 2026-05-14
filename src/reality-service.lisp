@@ -169,6 +169,15 @@
 (defun sequence-by-id (machine sequence-id)
   (gethash sequence-id (machine-sequences machine)))
 
+(defun parse-comma-values (value)
+  (remove nil
+          (mapcar (lambda (part)
+                    (handler-case
+                        (let ((parsed (read-from-string part)))
+                          (when (numberp parsed) parsed))
+                      (error () nil)))
+                  (split-string (or value "") #\,))))
+
 (defun merge-operation-json (machine sequence output output-index)
   (let* ((values (output-vector-vector output))
          (governance (resolve-governance machine (sequence-id sequence) values))
@@ -711,6 +720,32 @@
                                                                         "requiredDimension" (required-dimension state)
                                                                         "encoding" "dense-float64-clamped-0-1"
                                                                         "mappingVersion" 0)))))
+     (make-route "GET" "/api/governance/route" (lambda (_ body query)
+                                                 (declare (ignore _ body))
+                                                 (let ((machine-id (gethash "machineId" query))
+                                                       (sequence-id (gethash "sequenceId" query))
+                                                       (values-text (gethash "values" query)))
+                                                   (cond
+                                                     ((or (null machine-id) (null sequence-id) (null values-text))
+                                                      (error-response "machineId, sequenceId, and values query parameters are required" 400))
+                                                     (t
+                                                      (let ((result (actor-ask actor
+                                                                               (lambda (state)
+                                                                                 (let ((machine (gethash machine-id (reality-state-machines state))))
+                                                                                   (cond
+                                                                                     ((null machine) :missing)
+                                                                                     (t (resolve-governance machine sequence-id
+                                                                                                            (parse-comma-values values-text)))))))))
+                                                        (cond
+                                                          ((eq result :missing)
+                                                           (error-response (format nil "Machine not found: ~a" machine-id) 404))
+                                                          ((null result)
+                                                           (error-response
+                                                            (format nil "No triggerConfig rule matches (sequenceId=~a, values=~a)"
+                                                                    sequence-id values-text)
+                                                            404))
+                                                          (t
+                                                           (json-response (obj "success" t "decision" result))))))))))
      (make-route "POST" "/api/engine/reset" (lambda (_ body query)
                                               (declare (ignore _ body query))
                                               (state-json (lambda (state) (reset-reality-state state) (obj "success" t)))))

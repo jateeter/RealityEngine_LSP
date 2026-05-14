@@ -139,7 +139,47 @@
       (assert-equal "rule-team" (reality-engine-lsp::jstring governance "ownerTeam" "")
                     "rule governance should override machine owner")
       (assert-equal 30 (reality-engine-lsp::jnumber governance "slaSeconds" nil)
-                    "rule SLA should override machine SLA")))
+                    "rule SLA should override machine SLA")
+      (assert-equal "https://runbook" (reality-engine-lsp::jstring governance "runbook" "")
+                    "machine runbook should fill PagingDecision")))
+  (let* ((metadata (reality-engine-lsp::obj
+                    "governance" (reality-engine-lsp::obj
+                                  "ownerTeam" "machine-team"
+                                  "runbook" "https://warning-runbook"
+                                  "sla" (reality-engine-lsp::obj "warning" 1800))
+                    "triggerConfig" (reality-engine-lsp::obj
+                                     "rules" (reality-engine-lsp::vectorize
+                                              (list
+                                               (reality-engine-lsp::obj
+                                                "sequenceId" "seq-warn"
+                                                "outputMatches" (reality-engine-lsp::vectorize (list 2 2))
+                                                "ragStatusCode" "AMBER"
+                                                "processStatus" "warning"))))))
+         (machine (one-bit-machine "machine-warn" "seq-warn" 0 2
+                                   :metadata metadata
+                                   :value (list 2 2)))
+         (decision (reality-engine-lsp::resolve-governance machine "seq-warn" (list 2 2))))
+    (assert-equal "machine-team" (reality-engine-lsp::jstring decision "ownerTeam" "")
+                  "machine governance should supply ownerTeam")
+    (assert-equal 1800 (reality-engine-lsp::jnumber decision "slaSeconds" nil)
+                  "machine SLA should be selected by processStatus")
+    (assert-equal "AMBER" (reality-engine-lsp::jstring decision "ragStatusCode" "")
+                  "RAG status should come from trigger rule"))
+  (let* ((metadata (reality-engine-lsp::obj
+                    "triggerConfig" (reality-engine-lsp::obj
+                                     "rules" (reality-engine-lsp::vectorize
+                                              (list
+                                               (reality-engine-lsp::obj
+                                                "sequenceId" "seq-legacy"
+                                                "outputMatches" (reality-engine-lsp::vectorize (list 1))
+                                                "ragStatusCode" "GREEN"
+                                                "processStatus" "info"))))))
+         (machine (one-bit-machine "machine-legacy" "seq-legacy" 0 2 :metadata metadata))
+         (decision (reality-engine-lsp::resolve-governance machine "seq-legacy" (list 1))))
+    (assert-equal "unrouted" (reality-engine-lsp::jstring decision "ownerTeam" "")
+                  "legacy rule-only machine should fall back to unrouted")
+    (assert-equal "machine-fallback" (reality-engine-lsp::jstring decision "source" "")
+                  "legacy rule-only machine should report fallback source"))
   (let* ((machine (one-bit-machine "machine-dep" "seq-dep" 0 2 :value (list 1)))
          (sequence (gethash "seq-dep" (reality-engine-lsp::machine-sequences machine)))
          (state (make-test-state 8)))
@@ -186,5 +226,10 @@
                          :key (lambda (op) (reality-engine-lsp::jstring op "sequenceId" ""))
                          :test #'string=)
                    "latched compose bit should let subscriber fire on the next step")))
+  (let ((patterns (mapcar #'reality-engine-lsp::route-pattern
+                          (reality-engine-lsp::flatten-routes
+                           (reality-engine-lsp::reality-routes nil)))))
+    (assert-true (find "/api/governance/route" patterns :test #'string=)
+                 "Reality routes should expose governance resolver"))
   (format t "~&RealityEngine_LSP core tests passed.~%")
   t)
