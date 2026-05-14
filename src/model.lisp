@@ -1,0 +1,278 @@
+(in-package #:reality-engine-lsp)
+
+(defstruct region offset length)
+(defstruct mapping input output)
+(defstruct vector-element value comparator threshold)
+(defstruct output-vector id vector metadata timestamp provenance)
+(defstruct reality-vector
+  id elements initial-p active-p match-algorithm metadata next-ids output-vectors just-matched-p predecessor-chain)
+(defstruct (ces (:constructor make-ces) (:conc-name sequence-))
+  id name metadata schema-version deprecated-at replaced-by vectors)
+(defstruct machine id name description metadata mapping match-algorithm arbiter-rule sequences)
+(defstruct transition-result input-vector timestamp sequence-results machine-output arbiter-metadata)
+
+(defun comparator-name (value)
+  (string-downcase (or value "gte")))
+
+(defun arbiter-name (value)
+  (string-downcase (or value "passthrough")))
+
+(defun make-region-from-json (value)
+  (make-region :offset (truncate (or (jnumber value "offset" 0) 0))
+               :length (truncate (or (jnumber value "length" 0) 0))))
+
+(defun region-json (region)
+  (obj "offset" (region-offset region)
+       "length" (region-length region)))
+
+(defun mapping-json (mapping)
+  (if mapping
+      (obj "input" (region-json (mapping-input mapping))
+           "output" (region-json (mapping-output mapping)))
+      +json-null+))
+
+(defun vector-element-json (element)
+  (let ((out (obj "value" (vector-element-value element))))
+    (when (vector-element-comparator element)
+      (setf (jget out "comparatorType") (vector-element-comparator element)))
+    (when (vector-element-threshold element)
+      (setf (jget out "threshold") (vector-element-threshold element)))
+    out))
+
+(defun output-vector-json (output)
+  (obj "id" (output-vector-id output)
+       "vector" (vectorize (output-vector-vector output))
+       "metadata" (or (output-vector-metadata output) (obj))
+       "timestamp" (or (output-vector-timestamp output) 0)
+       "provenance" (vectorize (or (output-vector-provenance output) nil))))
+
+(defun reality-vector-json (vector)
+  (obj "id" (reality-vector-id vector)
+       "matchAlgorithm" (reality-vector-match-algorithm vector)
+       "elements" (vectorize (mapcar #'vector-element-json (reality-vector-elements vector)))
+       "state" (if (reality-vector-active-p vector) "active" "inactive")
+       "isActive" (json-bool (reality-vector-active-p vector))
+       "nextVectorIds" (vectorize (reality-vector-next-ids vector))
+       "outputVectors" (vectorize (mapcar #'output-vector-json (reality-vector-output-vectors vector)))
+       "isInitial" (json-bool (reality-vector-initial-p vector))
+       "wasJustMatched" (json-bool (reality-vector-just-matched-p vector))
+       "metadata" (or (reality-vector-metadata vector) (obj))))
+
+(defun sequence-json (sequence &key full)
+  (let* ((vectors (object-values (sequence-vectors sequence)))
+         (initials (remove-if-not #'reality-vector-initial-p vectors))
+         (outputs (remove-if-not (lambda (v) (reality-vector-output-vectors v)) vectors))
+         (out (obj "id" (sequence-id sequence)
+                   "name" (sequence-name sequence)
+                   "vectors" (if full
+                                 (vectorize (mapcar #'reality-vector-json vectors))
+                                 (vectorize (mapcar #'reality-vector-json vectors)))
+                   "initialVectorIds" (vectorize (mapcar #'reality-vector-id initials))
+                   "outputVectorIds" (vectorize (mapcar #'reality-vector-id outputs))
+                   "metadata" (or (sequence-metadata sequence) (obj)))))
+    (when (sequence-schema-version sequence)
+      (setf (jget out "schemaVersion") (sequence-schema-version sequence)))
+    (when (sequence-deprecated-at sequence)
+      (setf (jget out "deprecatedAt") (sequence-deprecated-at sequence)))
+    (when (sequence-replaced-by sequence)
+      (setf (jget out "replacedBy") (sequence-replaced-by sequence)))
+    out))
+
+(defun machine-sequence-list (machine)
+  (object-values (machine-sequences machine)))
+
+(defun machine-json (machine &key full)
+  (let* ((sequences (machine-sequence-list machine))
+         (sequence-ids (mapcar #'sequence-id sequences))
+         (sequence-jsons (if full
+                             (mapcar (lambda (s) (sequence-json s :full t)) sequences)
+                             (mapcar (lambda (s) (obj "id" (sequence-id s) "name" (sequence-name s))) sequences)))
+         (total-vectors (loop for s in sequences sum (hash-table-count (sequence-vectors s)))))
+    (obj "id" (machine-id machine)
+         "name" (machine-name machine)
+         "description" (or (machine-description machine) "")
+         "matchAlgorithm" (machine-match-algorithm machine)
+         "arbiterRule" (machine-arbiter-rule machine)
+         "sequenceCount" (length sequences)
+         "totalVectors" total-vectors
+         "sequenceIds" (vectorize sequence-ids)
+         "sequences" (vectorize sequence-jsons)
+         "metadata" (or (machine-metadata machine) (obj))
+         "perceptualMapping" (mapping-json (machine-mapping machine)))))
+
+(defun vector-provenance-chain (vector)
+  (append (or (reality-vector-predecessor-chain vector) nil)
+          (list (reality-vector-id vector))))
+
+(defun reset-reality-vector (vector)
+  (setf (reality-vector-active-p vector) (reality-vector-initial-p vector)
+        (reality-vector-just-matched-p vector) nil
+        (reality-vector-predecessor-chain vector) nil)
+  vector)
+
+(defun match-element (element input-value override)
+  (let* ((type (comparator-name (or override (vector-element-comparator element) "gte")))
+         (expected (coerce (vector-element-value element) 'double-float))
+         (actual (coerce input-value 'double-float))
+         (threshold (or (vector-element-threshold element) 0.5d0)))
+    (cond
+      ((member type '("equals" "custom") :test #'string=)
+       (values (= expected actual) (if (= expected actual) 1.0d0 0.0d0)))
+      ((string= type "threshold")
+       (let* ((limit (or (vector-element-threshold element) 0.1d0))
+              (diff (abs (- expected actual)))
+              (ok (<= diff limit)))
+         (values ok (if ok (if (zerop limit) 1.0d0 (- 1.0d0 (/ diff limit))) 0.0d0))))
+      ((string= type "pattern")
+       (let* ((score (- 1.0d0 (abs (- expected actual))))
+              (ok (>= score threshold)))
+         (values ok score)))
+      (t
+       (let* ((input-high (>= actual threshold))
+              (value-high (>= expected threshold))
+              (ok (eq input-high value-high))
+              (score (if ok
+                         (if input-high
+                             (if (< threshold 1.0d0) (/ (- actual threshold) (- 1.0d0 threshold)) 1.0d0)
+                             (if (> threshold 0.0d0) (/ (- threshold actual) threshold) 1.0d0))
+                         0.0d0)))
+         (values ok (clamp01 score)))))))
+
+(defun match-reality-vector (vector input &key override)
+  (let ((elements (reality-vector-elements vector)))
+    (if (/= (length elements) (length input))
+        (values nil 0.0d0 (obj "error" "Vector dimension mismatch"))
+        (loop with total = 0.0d0
+              for element in elements
+              for actual in input
+              for index from 0
+              do (multiple-value-bind (ok score) (match-element element actual override)
+                   (unless ok
+                     (return (values nil (/ total (max 1 (length elements)))
+                                     (obj "failedAtIndex" index))))
+                   (incf total score))
+              finally (return (values t (/ total (max 1 (length elements))) (obj)))))))
+
+(defun transition-vector (vector input &key override)
+  (multiple-value-bind (matched score metadata) (match-reality-vector vector input :override override)
+    (unless matched
+      (unless (reality-vector-initial-p vector)
+        (setf (reality-vector-active-p vector) nil
+              (reality-vector-predecessor-chain vector) nil))
+      (return-from transition-vector
+        (values nil nil nil score metadata nil)))
+    (let* ((chain (vector-provenance-chain vector))
+           (outputs (mapcar (lambda (out)
+                              (make-output-vector
+                               :id (output-vector-id out)
+                               :vector (copy-list (output-vector-vector out))
+                               :metadata (or (output-vector-metadata out) (obj))
+                               :timestamp (now-ms)
+                               :provenance chain))
+                            (reality-vector-output-vectors vector)))
+           (final-p outputs)
+           (transitional-p (and (not (reality-vector-initial-p vector)) (not final-p))))
+      (when (and transitional-p (reality-vector-next-ids vector))
+        (setf (reality-vector-active-p vector) nil
+              (reality-vector-predecessor-chain vector) nil))
+      (values t (reality-vector-next-ids vector) outputs score metadata chain))))
+
+(defun transition-sequence (sequence input &key override)
+  (let ((matched nil)
+        (activated nil)
+        (outputs nil)
+        (pending (make-hash-table :test #'equal)))
+    (maphash (lambda (_ vector)
+               (declare (ignore _))
+               (setf (reality-vector-just-matched-p vector) nil))
+             (sequence-vectors sequence))
+    (dolist (vector (remove-if-not #'reality-vector-active-p (object-values (sequence-vectors sequence))))
+      (multiple-value-bind (ok next-ids emitted _score _metadata chain)
+          (transition-vector vector input :override override)
+        (declare (ignore _score _metadata))
+        (when ok
+          (push (reality-vector-id vector) matched)
+          (when (reality-vector-output-vectors vector)
+            (setf (reality-vector-just-matched-p vector) t))
+          (dolist (next-id next-ids)
+            (unless (gethash next-id pending)
+              (setf (gethash next-id pending) chain)))
+          (setf outputs (append outputs emitted)))))
+    (maphash (lambda (id chain)
+               (let ((next (gethash id (sequence-vectors sequence))))
+                 (when (and next (not (reality-vector-active-p next)))
+                   (setf (reality-vector-active-p next) t
+                         (reality-vector-predecessor-chain next) chain)
+                   (push id activated))))
+             pending)
+    (obj "matchedVectors" (vectorize (nreverse matched))
+         "activatedVectors" (vectorize (nreverse activated))
+         "assertedOutputs" (vectorize (mapcar #'output-vector-json outputs))
+         "%outputs" outputs)))
+
+(defun reset-sequence (sequence)
+  (maphash (lambda (_ vector)
+             (declare (ignore _))
+             (reset-reality-vector vector))
+           (sequence-vectors sequence))
+  sequence)
+
+(defun process-machine-input (machine input &key override)
+  (let ((sequence-results (make-hash-table :test #'equal))
+        (all-outputs nil)
+        (sequences-with-output 0))
+    (dolist (sequence (machine-sequence-list machine))
+      (let* ((result (transition-sequence sequence input :override override))
+             (outputs (jget result "%outputs")))
+        (remhash "%outputs" result)
+        (when outputs (incf sequences-with-output))
+        (setf all-outputs (append all-outputs outputs)
+              (gethash (sequence-id sequence) sequence-results) result)))
+    (let* ((total (hash-table-count (machine-sequences machine)))
+           (rule (arbiter-name (machine-arbiter-rule machine)))
+           (should-output (cond
+                            ((string= rule "and") (and (> total 0) (= sequences-with-output total)))
+                            ((string= rule "or") (> sequences-with-output 0))
+                            (t all-outputs)))
+           (machine-output (when (and should-output all-outputs)
+                             (let ((first (first all-outputs)))
+                               (make-output-vector
+                                :id (make-id "machine-output")
+                                :vector (output-vector-vector first)
+                                :metadata (obj "arbiter" t "combinedFrom" (length all-outputs))
+                                :timestamp (now-ms)
+                                :provenance (output-vector-provenance first))))))
+      (make-transition-result
+       :input-vector input
+       :timestamp (now-ms)
+       :sequence-results sequence-results
+       :machine-output machine-output
+       :arbiter-metadata (obj "rule" rule
+                              "totalInputs" total
+                              "sequencesWithOutput" sequences-with-output
+                              "shouldOutput" (json-bool should-output))))))
+
+(defun transition-result-json (result)
+  (obj "inputVector" (vectorize (transition-result-input-vector result))
+       "timestamp" (transition-result-timestamp result)
+       "sequenceResults" (transition-result-sequence-results result)
+       "machineOutput" (if (transition-result-machine-output result)
+                           (output-vector-json (transition-result-machine-output result))
+                           +json-null+)
+       "arbiterMetadata" (transition-result-arbiter-metadata result)))
+
+(defun extract-region (space region)
+  (let ((offset (region-offset region))
+        (length (region-length region)))
+    (loop for i from offset below (+ offset length)
+          collect (if (< i (length space)) (nth i space) 0.0d0))))
+
+(defun merge-region (space region values)
+  (let* ((offset (region-offset region))
+         (needed (+ offset (length values)))
+         (out (copy-list space)))
+    (loop while (< (length out) needed) do (setf out (append out (list 0.0d0))))
+    (loop for value in values
+          for i from offset
+          do (setf (nth i out) value))
+    out))
