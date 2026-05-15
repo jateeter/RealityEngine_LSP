@@ -1,7 +1,7 @@
 (in-package #:reality-engine-lsp)
 
 (defstruct region offset length)
-(defstruct mapping input output)
+(defstruct mapping input output bits-per-element)
 (defstruct vector-element value comparator threshold)
 (defstruct output-vector id vector metadata timestamp provenance)
 (defstruct reality-vector
@@ -27,8 +27,11 @@
 
 (defun mapping-json (mapping)
   (if mapping
-      (obj "input" (region-json (mapping-input mapping))
-           "output" (region-json (mapping-output mapping)))
+      (let ((out (obj "input" (region-json (mapping-input mapping))
+                      "output" (region-json (mapping-output mapping)))))
+        (when (mapping-bits-per-element mapping)
+          (setf (jget out "bitsPerElement") (mapping-bits-per-element mapping)))
+        out)
       +json-null+))
 
 (defun vector-element-json (element)

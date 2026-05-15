@@ -189,7 +189,10 @@
 (defun parse-mapping (item)
   (when (and (jobject-p item) (jobject-p (jget item "input")) (jobject-p (jget item "output")))
     (make-mapping :input (make-region-from-json (jget item "input"))
-                  :output (make-region-from-json (jget item "output")))))
+                  :output (make-region-from-json (jget item "output"))
+                  :bits-per-element (let ((bits (jnumber item "bitsPerElement" nil)))
+                                      (when (and bits (member (truncate bits) '(1 2 4 8)))
+                                        (truncate bits))))))
 
 (defun machine-from-json (json &optional forced-id &key (strict-sta t))
   (when strict-sta

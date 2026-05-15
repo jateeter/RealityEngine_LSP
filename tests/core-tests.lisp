@@ -333,10 +333,94 @@
     (reality-engine-lsp::reset-reality-state state)
     (assert-equal 0 (hash-table-count (reality-engine-lsp::reality-state-latched-event-bits state))
                   "reset should clear latched compose bits"))
+  (let* ((cells (list 0 1 2 3 0 1 2 3 2))
+         (packed (reality-engine-lsp::pack-cells cells 2)))
+    (assert-equal 3 (length packed) "2-bit cells should pack into three bytes")
+    (assert-equal 27 (aref packed 0) "2-bit packing should use the Option A1 MSB-first layout")
+    (assert-equal cells (reality-engine-lsp::unpack-cells packed (length cells) 2)
+                  "2-bit cells should round-trip")
+    (assert-equal "Gw==" (reality-engine-lsp::encode-packed-base64 (list 0 1 2 3) 2)
+                  "single packed byte should base64 encode identically to AI")
+    (let ((footprint (reality-engine-lsp::storage-footprint 4128 2)))
+      (assert-equal 33024 (reality-engine-lsp::jnumber footprint "float64Bytes" nil)
+                    "float64 footprint should remain engine-native")
+      (assert-equal 1032 (reality-engine-lsp::jnumber footprint "packedBytes" nil)
+                    "packed footprint should use declared cell width")
+      (assert-equal 32 (reality-engine-lsp::jnumber footprint "shrinkFactor" nil)
+                    "2-bit storage shrink factor should match AI"))
+    (assert-error (lambda () (reality-engine-lsp::pack-cells (list 4) 2))
+                  "out-of-range 2-bit cells should be rejected"))
+  (let* ((machine (machine-from-json
+                   (reality-engine-lsp::obj
+                    "id" "packed-loader"
+                    "name" "Packed Loader"
+                    "arbiterRule" "passthrough"
+                    "perceptualMapping" (reality-engine-lsp::obj
+                                         "input" (reality-engine-lsp::obj "offset" 0 "length" 1)
+                                         "output" (reality-engine-lsp::obj "offset" 1 "length" 4)
+                                         "bitsPerElement" 2)
+                    "sequences" (reality-engine-lsp::vectorize nil))))
+         (mapping (reality-engine-lsp::machine-mapping machine))
+         (mapping-json (reality-engine-lsp::mapping-json mapping)))
+    (assert-equal 2 (reality-engine-lsp::mapping-bits-per-element mapping)
+                  "loader should preserve perceptualMapping.bitsPerElement")
+    (assert-equal 2 (reality-engine-lsp::jnumber mapping-json "bitsPerElement" nil)
+                  "mapping JSON should expose bitsPerElement"))
+  (let* ((state (make-test-state 8))
+         (machine (machine-from-json
+                   (reality-engine-lsp::obj
+                    "id" "packed-machine"
+                    "name" "Packed Machine"
+                    "arbiterRule" "passthrough"
+                    "perceptualMapping" (reality-engine-lsp::obj
+                                         "input" (reality-engine-lsp::obj "offset" 0 "length" 1)
+                                         "output" (reality-engine-lsp::obj "offset" 1 "length" 4)
+                                         "bitsPerElement" 2)
+                    "sequences" (reality-engine-lsp::vectorize
+                                 (list
+                                  (reality-engine-lsp::obj
+                                   "id" "packed-seq"
+                                   "name" "Packed Sequence"
+                                   "vectors" (reality-engine-lsp::vectorize
+                                              (list
+                                               (reality-engine-lsp::obj
+                                                "id" "packed-start"
+                                                "isInitial" t
+                                                "elements" (reality-engine-lsp::vectorize
+                                                            (list (reality-engine-lsp::obj "value" 1 "threshold" 0.5)))
+                                                "outputVectors" (reality-engine-lsp::vectorize
+                                                                 (list
+                                                                  (reality-engine-lsp::obj
+                                                                   "id" "packed-out"
+                                                                   "vector" (reality-engine-lsp::vectorize
+                                                                             (list 0 1 2 3)))))))))))))))
+    (reality-engine-lsp::put-machine state machine)
+    (let* ((step (reality-engine-lsp::process-perceptual-input
+                  state (list 1)
+                  :include-machine-results t
+                  :include-perceptual-space t
+                  :compact t))
+           (packed (reality-engine-lsp::jget (first-merge step) "valuesPacked"))
+           (footprint (reality-engine-lsp::storage-footprint-json state)))
+      (assert-equal "Gw==" (reality-engine-lsp::jstring packed "base64" "")
+                    "compact merge batch should include packed base64 values")
+      (assert-equal 2 (reality-engine-lsp::jnumber packed "bitsPerElement" nil)
+                    "compact merge batch should use machine mapping bitsPerElement")
+      (assert-equal 4 (reality-engine-lsp::jnumber packed "length" nil)
+                    "compact merge batch should preserve unpacked length")
+      (assert-equal 1 (reality-engine-lsp::jnumber (reality-engine-lsp::jget footprint "widthHistogram") "2" nil)
+                    "storage footprint histogram should count 2-bit machines")
+      (assert-equal 2 (reality-engine-lsp::jnumber footprint "totalPackedBytes" nil)
+                    "storage footprint should total packed bytes")))
   (let ((patterns (mapcar #'reality-engine-lsp::route-pattern
                           (reality-engine-lsp::flatten-routes
                            (reality-engine-lsp::reality-routes nil)))))
     (assert-true (find "/api/governance/route" patterns :test #'string=)
                  "Reality routes should expose governance resolver"))
+  (let ((patterns (mapcar #'reality-engine-lsp::route-pattern
+                          (reality-engine-lsp::flatten-routes
+                           (reality-engine-lsp::reality-routes nil)))))
+    (assert-true (find "/api/runtime/storage-footprint" patterns :test #'string=)
+                 "Reality routes should expose storage footprint resolver"))
   (format t "~&RealityEngine_LSP core tests passed.~%")
   t)

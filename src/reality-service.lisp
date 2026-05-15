@@ -191,6 +191,166 @@
                       (error () nil)))
                   (split-string (or value "") #\,))))
 
+(defun compact-query-p (query)
+  (let ((value (and (hash-table-p* query) (gethash "compact" query))))
+    (and value (member value '("true" "1") :test #'string=))))
+
+(defparameter +cell-packing-base64-alphabet+
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+
+(defun allowed-bits-per-element-p (bits)
+  (member bits '(1 2 4 8)))
+
+(defun cell-integer (value bits index)
+  (let ((max-value (1- (ash 1 bits))))
+    (unless (and (realp value)
+                 (<= 0 value)
+                 (<= value max-value)
+                 (= value (truncate value)))
+      (error "cell[~a]=~a does not fit in ~a-bit cell (range 0..~a)"
+             index value bits max-value))
+    (truncate value)))
+
+(defun validate-cell-range (values bits)
+  (unless (allowed-bits-per-element-p bits)
+    (error "bitsPerElement must be one of 1, 2, 4, 8"))
+  (loop for value in values
+        for index from 0
+        collect (cell-integer value bits index)))
+
+(defun pack-cells (values bits)
+  (let* ((cells (validate-cell-range values bits))
+         (bytes (make-array (ceiling (* (length cells) bits) 8)
+                            :element-type '(unsigned-byte 8)
+                            :initial-element 0)))
+    (if (= bits 8)
+        (loop for cell in cells
+              for index from 0
+              do (setf (aref bytes index) cell))
+        (let ((mask (1- (ash 1 bits))))
+          (loop for cell in cells
+                for index from 0
+                for bit-index = (* index bits)
+                for byte-index = (floor bit-index 8)
+                for shift = (- 8 bits (mod bit-index 8))
+                do (setf (aref bytes byte-index)
+                         (logior (aref bytes byte-index)
+                                 (ash (logand cell mask) shift))))))
+    bytes))
+
+(defun unpack-cells (bytes length bits)
+  (unless (allowed-bits-per-element-p bits)
+    (error "bitsPerElement must be one of 1, 2, 4, 8"))
+  (let ((required (ceiling (* length bits) 8)))
+    (when (< (length bytes) required)
+      (error "bytes too small for packed cell payload")))
+  (if (= bits 8)
+      (loop for index below length collect (aref bytes index))
+      (let ((mask (1- (ash 1 bits))))
+        (loop for index below length
+              for bit-index = (* index bits)
+              for byte-index = (floor bit-index 8)
+              for shift = (- 8 bits (mod bit-index 8))
+              collect (logand (ash (aref bytes byte-index) (- shift)) mask)))))
+
+(defun encode-packed-base64 (values bits)
+  (let ((bytes (pack-cells values bits)))
+    (with-output-to-string (stream)
+      (loop for index from 0 below (length bytes) by 3
+            for b0 = (aref bytes index)
+            for b1-present = (< (1+ index) (length bytes))
+            for b2-present = (< (+ index 2) (length bytes))
+            for b1 = (if b1-present (aref bytes (1+ index)) 0)
+            for b2 = (if b2-present (aref bytes (+ index 2)) 0)
+            for triple = (logior (ash b0 16) (ash b1 8) b2)
+            do (progn
+                 (write-char (char +cell-packing-base64-alphabet+
+                                   (ldb (byte 6 18) triple))
+                             stream)
+                 (write-char (char +cell-packing-base64-alphabet+
+                                   (ldb (byte 6 12) triple))
+                             stream)
+                 (write-char (if b1-present
+                                 (char +cell-packing-base64-alphabet+
+                                       (ldb (byte 6 6) triple))
+                                 #\=)
+                             stream)
+                 (write-char (if b2-present
+                                 (char +cell-packing-base64-alphabet+
+                                       (ldb (byte 6 0) triple))
+                                 #\=)
+                             stream))))))
+
+(defun storage-footprint (length bits)
+  (unless (allowed-bits-per-element-p bits)
+    (error "bitsPerElement must be one of 1, 2, 4, 8"))
+  (let* ((float64-bytes (* length 8))
+         (packed-bytes (ceiling (* length bits) 8))
+         (shrink-factor (if (zerop packed-bytes) 0.0d0 (/ float64-bytes packed-bytes))))
+    (obj "float64Bytes" float64-bytes
+         "packedBytes" packed-bytes
+         "shrinkFactor" shrink-factor)))
+
+(defun machine-bits-per-element (machine)
+  (let ((bits (and (machine-mapping machine)
+                   (mapping-bits-per-element (machine-mapping machine)))))
+    (if (allowed-bits-per-element-p bits) bits 8)))
+
+(defun values-packed-json (values bits)
+  (let ((out (obj "bitsPerElement" bits
+                  "length" (length values))))
+    (handler-case
+        (setf (jget out "base64") (encode-packed-base64 values bits))
+      (error (e)
+        (setf (jget out "error") (princ-to-string e))))
+    out))
+
+(defun add-packed-merge-values (state merge-batch)
+  (dolist (operation merge-batch)
+    (let* ((machine (gethash (jstring operation "machineId" "")
+                             (reality-state-machines state)))
+           (bits (if machine (machine-bits-per-element machine) 8))
+           (values (numbers-from-json (jget operation "values"))))
+      (setf (jget operation "valuesPacked") (values-packed-json values bits))))
+  merge-batch)
+
+(defun storage-footprint-json (state)
+  (let ((per-machine nil)
+        (width-histogram (obj "1" 0 "2" 0 "4" 0 "8" 0))
+        (total-cells 0)
+        (total-float64-bytes 0)
+        (total-packed-bytes 0))
+    (dolist (machine (object-values-sorted (reality-state-machines state)))
+      (when (machine-mapping machine)
+        (let* ((mapping (machine-mapping machine))
+               (bits (machine-bits-per-element machine))
+               (cells (+ (region-length (mapping-input mapping))
+                         (region-length (mapping-output mapping))))
+               (footprint (storage-footprint cells bits)))
+          (incf total-cells cells)
+          (incf total-float64-bytes (jnumber footprint "float64Bytes" 0))
+          (incf total-packed-bytes (jnumber footprint "packedBytes" 0))
+          (setf (jget width-histogram (write-to-string bits))
+                (1+ (or (jnumber width-histogram (write-to-string bits) 0) 0)))
+          (push (obj "machineId" (machine-id machine)
+                     "machineName" (machine-name machine)
+                     "bitsPerElement" bits
+                     "inputCells" (region-length (mapping-input mapping))
+                     "outputCells" (region-length (mapping-output mapping))
+                     "float64Bytes" (jnumber footprint "float64Bytes" 0)
+                     "packedBytes" (jnumber footprint "packedBytes" 0)
+                     "shrinkFactor" (jnumber footprint "shrinkFactor" 0))
+                per-machine))))
+    (obj "machinesRegistered" (hash-table-count (reality-state-machines state))
+         "totalCells" total-cells
+         "totalFloat64Bytes" total-float64-bytes
+         "totalPackedBytes" total-packed-bytes
+         "cumulativeShrinkFactor" (if (zerop total-packed-bytes)
+                                      0.0d0
+                                      (/ total-float64-bytes total-packed-bytes))
+         "widthHistogram" width-histogram
+         "perMachine" (vectorize (nreverse per-machine)))))
+
 (defun merge-operation-json (machine sequence output output-index)
   (let* ((values (output-vector-vector output))
          (governance (resolve-governance machine (sequence-id sequence) values))
@@ -262,7 +422,7 @@
              (setf (nth bit (reality-state-perceptual-space state)) 1.0d0))
            (reality-state-latched-event-bits state)))
 
-(defun process-perceptual-input (state input &key override include-machine-results include-perceptual-space)
+(defun process-perceptual-input (state input &key override include-machine-results include-perceptual-space compact)
   (ensure-space-length state (max (reality-state-dimension state) (length input)))
   (setf (reality-state-perceptual-space state)
         (append input (make-list (max 0 (- (reality-state-dimension state) (length input)))
@@ -295,6 +455,8 @@
                      (push (merge-operation-json machine sequence output index) merge-batch)
                      (incf index))))))))))
     (setf merge-batch (sorted-merge-operations merge-batch))
+    (when compact
+      (add-packed-merge-values state merge-batch))
     (dolist (operation merge-batch)
       (let ((region (make-region-from-json (jget operation "region")))
             (values (numbers-from-json (jget operation "values"))))
@@ -473,6 +635,12 @@
                                                                      "encoding" "dense-float64-clamped-0-1"
                                                                      "mappingVersion" (reality-state-mapping-version state)
                                                                      "eventBusSubscriptionCount" (event-bus-subscription-count state))))))
+   (make-route "GET" "/api/runtime/storage-footprint" (lambda (_ body query)
+                                                       (declare (ignore _ body query))
+                                                       (json-response
+                                                        (actor-ask actor
+                                                                   (lambda (state)
+                                                                     (storage-footprint-json state))))))
    (make-route "GET" "/api/runtime/options" (lambda (_ body query)
                                              (declare (ignore _ body query))
                                              (json-response
@@ -683,7 +851,7 @@
                                                     (json-response (obj "universalInputSpace" (jget body "universalInputSpace")
                                                                         "resolvedInputs" (obj)))))
    (make-route "POST" "/api/perceive" (lambda (_ body query)
-                                       (declare (ignore _ query))
+                                       (declare (ignore _))
                                        (json-response
                                         (actor-ask actor
                                                    (lambda (state)
@@ -698,7 +866,9 @@
                                                                                                 nil
                                                                                                 (reality-state-include-machine-results-p state)))
                                                             :include-perceptual-space (jbool body "includePerceptualSpace"
-                                                                                             (reality-state-include-perceptual-space-p state)))
+                                                                                             (reality-state-include-perceptual-space-p state))
+                                                            :compact (or (jbool body "compact" nil)
+                                                                         (compact-query-p query)))
                                                            (obj "error" "Provide exactly one of: vector, sparseVector, domainVectors"))))))))))
 
 (defun reality-routes (actor)
@@ -738,6 +908,9 @@
                                                                         "encoding" "dense-float64-clamped-0-1"
                                                                         "mappingVersion" (reality-state-mapping-version state)
                                                                         "eventBusSubscriptionCount" (event-bus-subscription-count state)))))
+     (make-route "GET" "/api/runtime/storage-footprint" (lambda (_ body query)
+                                                          (declare (ignore _ body query))
+                                                          (state-json #'storage-footprint-json)))
      (make-route "GET" "/api/governance/route" (lambda (_ body query)
                                                  (declare (ignore _ body))
                                                  (let ((machine-id (gethash "machineId" query))
@@ -807,7 +980,7 @@
                                               (declare (ignore _ body query))
                                               (state-json #'machine-graph-json)))
      (make-route "POST" "/api/perceive" (lambda (_ body query)
-                                          (declare (ignore _ query))
+                                          (declare (ignore _))
                                           (state-json (lambda (state)
                                                         (let ((input (assemble-input-vector state body)))
                                                           (if input
@@ -820,7 +993,9 @@
                                                                                                    nil
                                                                                                    (reality-state-include-machine-results-p state)))
                                                                :include-perceptual-space (jbool body "includePerceptualSpace"
-                                                                                                (reality-state-include-perceptual-space-p state)))
+                                                                                                (reality-state-include-perceptual-space-p state))
+                                                               :compact (or (jbool body "compact" nil)
+                                                                            (compact-query-p query)))
                                                               (obj "error" "Provide exactly one of: vector, sparseVector, domainVectors")))))))))))
 
 (defun start-reality-service (&key (port 3299) (machine-dir "../RealityEngine_AI/examples/machines") (dimension 768))
