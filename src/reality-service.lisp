@@ -3,7 +3,11 @@
 (defstruct reality-state
   dimension machines machine-dir perceptual-space history history-limit include-machine-results-p
   include-perceptual-space-p vector-store sequences qdrant-url collection-name started-at
-  event-bus-subscriptions latched-event-bits step-count mapping-version)
+  event-bus-subscriptions latched-event-bits step-count mapping-version
+  ;; CES coverage counters — mirror RealityEngine_AI/CesCoverageRegistry and
+  ;; RealityEngine_CPP/CesCoverageRegistry so the same Prometheus scrape
+  ;; config covers all three runtimes.  Keyed by tab-joined identifiers.
+  cov-matched cov-activated cov-outputs cov-steps cov-paging cov-deprecated)
 
 (defun compose-key (producer-machine-id producer-sequence-id)
   (format nil "~a|~a" producer-machine-id producer-sequence-id))
@@ -92,7 +96,13 @@
            :event-bus-subscriptions (make-hash-table :test #'equal)
            :latched-event-bits (make-hash-table :test #'equal)
            :step-count 0
-           :mapping-version 0)))
+           :mapping-version 0
+           :cov-matched    (make-hash-table :test #'equal)
+           :cov-activated  (make-hash-table :test #'equal)
+           :cov-outputs    (make-hash-table :test #'equal)
+           :cov-steps      (make-hash-table :test #'equal)
+           :cov-paging     (make-hash-table :test #'equal)
+           :cov-deprecated (make-hash-table :test #'equal))))
     (dolist (machine (load-machines-from-directory machine-dir))
       (put-machine state machine))
     state))
@@ -149,8 +159,310 @@
         (make-list (reality-state-dimension state) :initial-element 0.0d0)
         (reality-state-history state) nil
         (reality-state-latched-event-bits state) (make-hash-table :test #'equal)
-        (reality-state-step-count state) 0)
+        (reality-state-step-count state) 0
+        (reality-state-cov-matched    state) (make-hash-table :test #'equal)
+        (reality-state-cov-activated  state) (make-hash-table :test #'equal)
+        (reality-state-cov-outputs    state) (make-hash-table :test #'equal)
+        (reality-state-cov-steps      state) (make-hash-table :test #'equal)
+        (reality-state-cov-paging     state) (make-hash-table :test #'equal)
+        (reality-state-cov-deprecated state) (make-hash-table :test #'equal))
   state)
+
+;; ── CES coverage helpers ────────────────────────────────────────────────────
+;; Mirror AI's CesCoverageRegistry / CPP's CesCoverageRegistry: every step
+;; bumps a small set of tab-joined hash counters that the /api/metrics route
+;; later renders as Prometheus text.
+
+(defun coverage-bump (table key)
+  (setf (gethash key table) (1+ (or (gethash key table) 0))))
+
+(defun coverage-key (&rest parts)
+  ;; Tab-joined identifier — mirrors the AI/CPP CesCoverageRegistry which
+  ;; uses tab-joined hash keys to avoid nested-map allocation on the hot
+  ;; path.  `~c` consumes a character, hence `code-char 9` rather than a
+  ;; literal string containing a tab.
+  (with-output-to-string (out)
+    (loop for p in parts
+          for first = t then nil
+          do (unless first (write-char (code-char 9) out))
+             (princ p out))))
+
+(defun record-machine-coverage (state machine transition-json)
+  "Walk one machine's transition result and bump the per-vector / per-sequence
+counters.  Called once per machine per step from process-perceptual-input."
+  (let ((mid (machine-id machine))
+        (mname (machine-name machine)))
+    (coverage-bump (reality-state-cov-steps state) (coverage-key mid mname))
+    (let ((seq-results (jget transition-json "sequenceResults")))
+      (when (jobject-p seq-results)
+        (dolist (sid (object-keys-sorted seq-results))
+          (let ((sr (jget seq-results sid)))
+            (let ((matched (jget sr "matchedVectors")))
+              (when (jarray-p matched)
+                (dolist (vid (jarray-list matched))
+                  (when (stringp vid)
+                    (coverage-bump (reality-state-cov-matched state)
+                                   (coverage-key mid mname sid vid))))))
+            (let ((activated (jget sr "activatedVectors")))
+              (when (jarray-p activated)
+                (dolist (vid (jarray-list activated))
+                  (when (stringp vid)
+                    (coverage-bump (reality-state-cov-activated state)
+                                   (coverage-key mid mname sid vid))))))
+            (let ((asserted (jget sr "assertedOutputs")))
+              (when (and (jarray-p asserted) (> (length (jarray-list asserted)) 0))
+                (setf (gethash (coverage-key mid mname sid)
+                               (reality-state-cov-outputs state))
+                      (+ (or (gethash (coverage-key mid mname sid)
+                                      (reality-state-cov-outputs state)) 0)
+                         (length (jarray-list asserted))))))))))))
+
+(defun record-merge-coverage (state operation)
+  "Bump paging-decision and deprecated-fire counters from one merge-batch
+entry.  Called for each operation in the sorted merge batch."
+  (let ((gov (jget operation "governance"))
+        (dep (jget operation "deprecation"))
+        (mid (jstring operation "machineId" ""))
+        (sid (jstring operation "sequenceId" ""))
+        (mname (jstring operation "machineName" "")))
+    (when (jobject-p gov)
+      (coverage-bump (reality-state-cov-paging state)
+                     (coverage-key (jstring gov "ownerTeam" "unrouted")
+                                   (jstring gov "processStatus" "unknown")
+                                   (jstring gov "ragStatusCode" "unknown")
+                                   mid)))
+    (when (jobject-p dep)
+      (coverage-bump (reality-state-cov-deprecated state)
+                     (coverage-key mid mname sid
+                                   (jstring dep "replacedBy" ""))))))
+
+;; ── Prometheus text exposition ──────────────────────────────────────────────
+;; Render the coverage counters in the standard Prometheus text-format so the
+;; same scrape config covers AI + CPP + LSP.  Every metric line is stamped
+;; with runtime="lsp"; metric names + labels match AI's
+;; CesCoverageRegistry.toPrometheusText byte-for-byte.
+
+(defun prom-escape-label (value)
+  (with-output-to-string (out)
+    (loop for c across (or value "") do
+      (cond ((char= c #\\) (write-string "\\\\" out))
+            ((char= c #\") (write-string "\\\"" out))
+            ((char= c #\Newline) (write-string "\\n" out))
+            (t (write-char c out))))))
+
+(defun prom-labels (pairs)
+  "Render a label set as {k=\"v\",...}.  Empty set returns empty string."
+  (if (null pairs)
+      ""
+      (with-output-to-string (out)
+        (write-char #\{ out)
+        (loop for (k . v) in pairs
+              for first = t then nil
+              do (unless first (write-char #\, out))
+                 (write-string k out)
+                 (write-string "=\"" out)
+                 (write-string (prom-escape-label v) out)
+                 (write-char #\" out))
+        (write-char #\} out))))
+
+(defun split-coverage-key (key)
+  (let (parts (current (make-string-output-stream)))
+    (loop for c across key do
+      (if (char= c (code-char 9))
+          (progn (push (get-output-stream-string current) parts)
+                 (setf current (make-string-output-stream)))
+          (write-char c current)))
+    (push (get-output-stream-string current) parts)
+    (nreverse parts)))
+
+(defun prom-metric-totals (state)
+  "Compute machine/sequence/vector totals for the gauges."
+  (let ((machines (hash-table-count (reality-state-machines state)))
+        (sequences 0) (vectors 0))
+    (maphash (lambda (_ m)
+               (declare (ignore _))
+               (dolist (seq (machine-sequence-list m))
+                 (incf sequences)
+                 (incf vectors (hash-table-count (sequence-vectors seq)))))
+             (reality-state-machines state))
+    (values machines sequences vectors)))
+
+(defun prom-per-machine-unfired (state)
+  "For each machine: (machineId, machineName, sequenceCount, vectorCount,
+unfiredSequences, unfiredVectors).  Mirrors AI snapshot.perMachine."
+  (let ((rows nil))
+    (maphash
+     (lambda (_ m)
+       (declare (ignore _))
+       (let ((mid (machine-id m)) (mname (machine-name m))
+             (seq-total 0) (seq-fired 0) (vec-total 0) (vec-fired 0))
+         (dolist (seq (machine-sequence-list m))
+           (incf seq-total)
+           (let ((seq-key (coverage-key mid mname (sequence-id seq))))
+             (when (gethash seq-key (reality-state-cov-outputs state))
+               (incf seq-fired)))
+           (maphash
+            (lambda (_ v)
+              (declare (ignore _))
+              (incf vec-total)
+              (let ((vk (coverage-key mid mname (sequence-id seq) (reality-vector-id v))))
+                (when (or (gethash vk (reality-state-cov-matched state))
+                          (gethash vk (reality-state-cov-activated state)))
+                  (incf vec-fired))))
+            (sequence-vectors seq)))
+         (push (list mid mname seq-total vec-total
+                     (- seq-total seq-fired) (- vec-total vec-fired)) rows)))
+     (reality-state-machines state))
+    (nreverse rows)))
+
+(defun prometheus-text-of (state &optional (runtime-tag "lsp"))
+  "Render the CES coverage telemetry as Prometheus text-format exposition.
+Every metric line — including the global gauges — is stamped with
+runtime=runtime-tag so a single scrape target identifies the source runtime."
+  (let ((base `(("runtime" . ,runtime-tag))))
+    (multiple-value-bind (machines sequences vectors) (prom-metric-totals state)
+      (with-output-to-string (out)
+        (flet ((emit-help (name help type)
+                 (format out "# HELP ~a ~a~%# TYPE ~a ~a~%" name help name type))
+               (emit (name labels value)
+                 (format out "~a~a ~a~%" name (prom-labels labels) value)))
+          (emit-help "ces_machines_total"  "Number of machines registered with the simulator." "gauge")
+          (emit "ces_machines_total" base machines)
+          (emit-help "ces_sequences_total" "Number of sequences across all registered machines." "gauge")
+          (emit "ces_sequences_total" base sequences)
+          (emit-help "ces_vectors_total"   "Number of event vectors across all registered machines." "gauge")
+          (emit "ces_vectors_total" base vectors)
+
+          (emit-help "ces_vector_matched_total"
+                     "Number of times a vector matched its input during a transition phase." "counter")
+          (maphash (lambda (k count)
+                     (let ((parts (split-coverage-key k)))
+                       (when (= (length parts) 4)
+                         (emit "ces_vector_matched_total"
+                               (append base
+                                       `(("machine" . ,(nth 1 parts))
+                                         ("machine_id" . ,(nth 0 parts))
+                                         ("sequence" . ,(nth 2 parts))
+                                         ("vector" . ,(nth 3 parts))))
+                               count))))
+                   (reality-state-cov-matched state))
+
+          (emit-help "ces_vector_activated_total"
+                     "Number of times a vector was activated as a successor in a transition." "counter")
+          (maphash (lambda (k count)
+                     (let ((parts (split-coverage-key k)))
+                       (when (= (length parts) 4)
+                         (emit "ces_vector_activated_total"
+                               (append base
+                                       `(("machine" . ,(nth 1 parts))
+                                         ("machine_id" . ,(nth 0 parts))
+                                         ("sequence" . ,(nth 2 parts))
+                                         ("vector" . ,(nth 3 parts))))
+                               count))))
+                   (reality-state-cov-activated state))
+
+          (emit-help "ces_sequence_outputs_total"
+                     "Number of asserted outputs emitted by a sequence." "counter")
+          (maphash (lambda (k count)
+                     (let ((parts (split-coverage-key k)))
+                       (when (= (length parts) 3)
+                         (emit "ces_sequence_outputs_total"
+                               (append base
+                                       `(("machine" . ,(nth 1 parts))
+                                         ("machine_id" . ,(nth 0 parts))
+                                         ("sequence" . ,(nth 2 parts))))
+                               count))))
+                   (reality-state-cov-outputs state))
+
+          (emit-help "ces_machine_steps_total"
+                     "Number of process_input calls observed for this machine." "counter")
+          (maphash (lambda (k count)
+                     (let ((parts (split-coverage-key k)))
+                       (when (= (length parts) 2)
+                         (emit "ces_machine_steps_total"
+                               (append base
+                                       `(("machine" . ,(nth 1 parts))
+                                         ("machine_id" . ,(nth 0 parts))))
+                               count))))
+                   (reality-state-cov-steps state))
+
+          (emit-help "ces_paging_decisions_total"
+                     "Number of governance-resolved paging decisions issued by the engine." "counter")
+          (maphash (lambda (k count)
+                     (let ((parts (split-coverage-key k)))
+                       (when (= (length parts) 4)
+                         (emit "ces_paging_decisions_total"
+                               (append base
+                                       `(("owner_team" . ,(nth 0 parts))
+                                         ("process_status" . ,(nth 1 parts))
+                                         ("rag_status_code" . ,(nth 2 parts))
+                                         ("machine_id" . ,(nth 3 parts))))
+                               count))))
+                   (reality-state-cov-paging state))
+
+          (emit-help "ces_deprecated_fires_total"
+                     "Number of times a deprecated sequence emitted output." "counter")
+          (maphash (lambda (k count)
+                     (let ((parts (split-coverage-key k)))
+                       (when (= (length parts) 4)
+                         (emit "ces_deprecated_fires_total"
+                               (append base
+                                       `(("machine" . ,(nth 1 parts))
+                                         ("machine_id" . ,(nth 0 parts))
+                                         ("sequence" . ,(nth 2 parts))
+                                         ("replaced_by" . ,(nth 3 parts))))
+                               count))))
+                   (reality-state-cov-deprecated state))
+
+          (emit-help "ces_unfired_sequences"
+                     "Number of sequences in this machine that have never emitted output." "gauge")
+          (dolist (row (prom-per-machine-unfired state))
+            (emit "ces_unfired_sequences"
+                  (append base `(("machine" . ,(nth 1 row))
+                                 ("machine_id" . ,(nth 0 row))))
+                  (nth 4 row)))
+
+          (emit-help "ces_unfired_vectors"
+                     "Number of vectors in this machine that have never matched or activated." "gauge")
+          (dolist (row (prom-per-machine-unfired state))
+            (emit "ces_unfired_vectors"
+                  (append base `(("machine" . ,(nth 1 row))
+                                 ("machine_id" . ,(nth 0 row))))
+                  (nth 5 row)))
+
+          (emit-help "ces_machine_sequence_count"
+                     "Total sequences declared by this machine." "gauge")
+          (dolist (row (prom-per-machine-unfired state))
+            (emit "ces_machine_sequence_count"
+                  (append base `(("machine" . ,(nth 1 row))
+                                 ("machine_id" . ,(nth 0 row))))
+                  (nth 2 row)))
+
+          (emit-help "ces_machine_vector_count"
+                     "Total vectors declared by this machine." "gauge")
+          (dolist (row (prom-per-machine-unfired state))
+            (emit "ces_machine_vector_count"
+                  (append base `(("machine" . ,(nth 1 row))
+                                 ("machine_id" . ,(nth 0 row))))
+                  (nth 3 row)))
+
+          (let ((uptime-ms (- (now-ms) (reality-state-started-at state))))
+            (emit-help "ces_registry_uptime_seconds"
+                       "Seconds since the coverage registry was instantiated." "gauge")
+            (emit "ces_registry_uptime_seconds" base
+                  (format nil "~,3f" (/ uptime-ms 1000.0))))
+
+          ;; re_runtime_* gauges — same shape as AI/CPP for cross-runtime
+          ;; vector-space + mapping monitoring.
+          (emit-help "re_runtime_dimension"
+                     "Current dimension of the shared perceptual space." "gauge")
+          (emit "re_runtime_dimension" base (reality-state-dimension state))
+          (emit-help "re_runtime_required_dimension"
+                     "Max(offset+length) across all registered machine mappings." "gauge")
+          (emit "re_runtime_required_dimension" base (required-dimension state))
+          (emit-help "re_runtime_mapping_version"
+                     "Monotonic version bumped on every put-machine/remove-machine." "gauge")
+          (emit "re_runtime_mapping_version" base (reality-state-mapping-version state)))))))
 
 (defun assemble-input-vector (state body)
   (cond
@@ -438,6 +750,9 @@
                 (machine-input (extract-region (reality-state-perceptual-space state)
                                                (mapping-input mapping)))
                 (result (process-machine-input machine machine-input :override override)))
+           ;; Coverage tracking — once per machine per step, regardless of
+           ;; whether the caller wanted machine-results in the response.
+           (record-machine-coverage state machine (transition-result-json result))
            (when include-machine-results
              (setf (gethash id machine-results) (transition-result-json result)))
            (push (obj "offset" (region-offset (mapping-input mapping))
@@ -455,6 +770,9 @@
                      (push (merge-operation-json machine sequence output index) merge-batch)
                      (incf index))))))))))
     (setf merge-batch (sorted-merge-operations merge-batch))
+    ;; Paging + deprecation coverage is per-merge-entry; counted after sort
+    ;; so the bump order matches AI/CPP exactly.
+    (dolist (op merge-batch) (record-merge-coverage state op))
     (when compact
       (add-packed-merge-values state merge-batch))
     (dolist (operation merge-batch)
@@ -894,6 +1212,22 @@
      (make-route "GET" "/api/engine/stats" (lambda (_ body query)
                                              (declare (ignore _ body query))
                                              (state-json (lambda (state) (obj "stats" (stats-json state))))))
+     ;; JSON runtime stats — same payload as /api/engine/stats plus a
+     ;; domainWorkerPool marker.  Kept for parity with the older route table.
+     (make-route "GET" "/api/runtime/metrics" (lambda (_ body query)
+                                               (declare (ignore _ body query))
+                                               (state-json (lambda (state)
+                                                             (obj "stats" (stats-json state)
+                                                                  "domainWorkerPool" (obj "semantics" "actor-mailbox"))))))
+     ;; Prometheus text-format exposition.  Metric names + labels match AI's
+     ;; /api/metrics so a single Prometheus scrape config covers all three
+     ;; runtimes.  Every line carries runtime="lsp" for cross-runtime filtering.
+     (make-route "GET" "/api/metrics" (lambda (_ body query)
+                                       (declare (ignore _ body query))
+                                       (text-response
+                                        (actor-ask actor (lambda (state) (prometheus-text-of state "lsp")))
+                                        200
+                                        "text/plain; version=0.0.4; charset=utf-8")))
      (make-route "GET" "/api/runtime/options" (lambda (_ body query)
                                                 (declare (ignore _ body query))
                                                 (state-json (lambda (state)

@@ -37,7 +37,13 @@
    :event-bus-subscriptions (make-hash-table :test #'equal)
    :latched-event-bits (make-hash-table :test #'equal)
    :step-count 0
-   :mapping-version 0))
+   :mapping-version 0
+   :cov-matched    (make-hash-table :test #'equal)
+   :cov-activated  (make-hash-table :test #'equal)
+   :cov-outputs    (make-hash-table :test #'equal)
+   :cov-steps      (make-hash-table :test #'equal)
+   :cov-paging     (make-hash-table :test #'equal)
+   :cov-deprecated (make-hash-table :test #'equal)))
 
 (defun one-bit-machine (id sequence-id input-offset output-offset &key metadata value)
   (machine-from-json
@@ -422,5 +428,37 @@
                            (reality-engine-lsp::reality-routes nil)))))
     (assert-true (find "/api/runtime/storage-footprint" patterns :test #'string=)
                  "Reality routes should expose storage footprint resolver"))
+
+  ;; /api/metrics Prometheus text-format emission — verifies cross-runtime
+  ;; parity with AI/CPP.  Every metric line must carry runtime="lsp" and the
+  ;; canonical metric names (ces_*, re_runtime_*) must all be present.
+  (let ((patterns (mapcar #'reality-engine-lsp::route-pattern
+                          (reality-engine-lsp::flatten-routes
+                           (reality-engine-lsp::reality-routes nil)))))
+    (assert-true (find "/api/metrics" patterns :test #'string=)
+                 "Reality routes should expose /api/metrics Prometheus endpoint"))
+  (let* ((state (make-test-state 8))
+         (text (reality-engine-lsp::prometheus-text-of state "lsp")))
+    (assert-true (search "runtime=\"lsp\"" text)
+                 "Prometheus emission should stamp runtime=\"lsp\"")
+    (dolist (name '("ces_machines_total"
+                    "ces_sequences_total"
+                    "ces_vectors_total"
+                    "ces_vector_matched_total"
+                    "ces_vector_activated_total"
+                    "ces_sequence_outputs_total"
+                    "ces_machine_steps_total"
+                    "ces_paging_decisions_total"
+                    "ces_deprecated_fires_total"
+                    "ces_unfired_sequences"
+                    "ces_unfired_vectors"
+                    "ces_machine_sequence_count"
+                    "ces_machine_vector_count"
+                    "ces_registry_uptime_seconds"
+                    "re_runtime_dimension"
+                    "re_runtime_required_dimension"
+                    "re_runtime_mapping_version"))
+      (assert-true (search (format nil "# HELP ~a " name) text)
+                   (format nil "Prometheus emission should declare ~a" name))))
   (format t "~&RealityEngine_LSP core tests passed.~%")
   t)
