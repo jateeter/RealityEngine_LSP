@@ -548,5 +548,89 @@
     (assert-true (null (reality-engine-lsp::mqtt-validate-overlaps registry t))
                  "allow-overlap suppresses warnings"))
 
+  ;; ── MQTT bridge in-process dispatcher ─────────────────────────────────
+  ;; Drives the full extract → normalize → ingest pipeline with no broker
+  ;; via mqtt-bridge-inject-message — same hatch the CPP and AI tests use.
+  (let* ((reg-json "{\"mappings\":[{
+                      \"id\":\"zone-temp\",
+                      \"topicFilter\":\"sensors/zone/+/temp\",
+                      \"sensorIdTemplate\":\"zone.{1}.temp\",
+                      \"region\":{\"offset\":0,\"length\":1},
+                      \"extract\":{\"type\":\"json\",\"pointer\":\"/value\"},
+                      \"normalize\":{\"mode\":\"minmax\",\"min\":0,\"max\":100,\"clamp\":true},
+                      \"ttlMs\":15000,
+                      \"pushMode\":\"immediate\"}]}")
+         (registry (reality-engine-lsp::mqtt-mapping-registry-from-json
+                    (reality-engine-lsp::parse-json reg-json)))
+         (config (reality-engine-lsp::make-mqtt-client-config :broker-host "127.0.0.1"
+                                                              :broker-port 1
+                                                              :client-id "test"))
+         (ingested-sensors nil)
+         (ingested-values nil)
+         (ingested-ttls nil)
+         (push-count 0)
+         (bridge (reality-engine-lsp::make-mqtt-bridge
+                  config registry
+                  (lambda (sid offset length values ttl-ms topic mapping-id)
+                    (declare (ignore offset length topic mapping-id))
+                    (push sid ingested-sensors)
+                    (push values ingested-values)
+                    (push ttl-ms ingested-ttls))
+                  (lambda () (incf push-count)))))
+    ;; Don't start() — we drive synthetically via inject-message.
+    (reality-engine-lsp::mqtt-bridge-inject-message bridge
+                                                    "sensors/zone/3/temp"
+                                                    "{\"value\":50}")
+    (assert-equal 1 (length ingested-sensors) "exactly one ingest after one valid message")
+    (when ingested-sensors
+      (assert-equal "zone.3.temp" (car ingested-sensors) "sensor-id resolved via template")
+      (assert-equal 0.5d0 (coerce (car (car ingested-values)) 'double-float)
+                    "JSON 50 → minmax(0,100) → 0.5"))
+    (assert-equal 15000 (car ingested-ttls) "TTL carried from mapping rule")
+    (assert-equal 1 push-count "immediate push mode fired exactly once")
+
+    ;; Bad payload — length validation rejects.  Counters should reflect it.
+    (reality-engine-lsp::mqtt-bridge-inject-message bridge
+                                                    "sensors/zone/3/temp"
+                                                    "{\"missing\":1}")
+    (assert-equal 1 (length ingested-sensors) "rejected payload is not ingested")
+    (let ((stats (reality-engine-lsp::mqtt-bridge-stats-snapshot bridge)))
+      (assert-true (>= (cdr (assoc "messagesRejected" stats :test #'string=)) 1)
+                   "bridge counts the rejected message"))
+
+    ;; Unmatched topic — separate counter, no ingest.
+    (reality-engine-lsp::mqtt-bridge-inject-message bridge "unknown/topic" "")
+    (let ((stats (reality-engine-lsp::mqtt-bridge-stats-snapshot bridge)))
+      (assert-true (>= (cdr (assoc "messagesUnmatched" stats :test #'string=)) 1)
+                   "bridge counts the unmatched topic")))
+
+  ;; ── MQTT bridge fan-out: one message → many rules ─────────────────────
+  (let* ((reg-json "{\"mappings\":[
+                      {\"id\":\"temp\",\"topicFilter\":\"s/x/v1\",
+                       \"region\":{\"offset\":0,\"length\":1},
+                       \"extract\":{\"type\":\"json\",\"pointer\":\"/t\"},
+                       \"normalize\":{\"mode\":\"passthrough\",\"clamp\":false}},
+                      {\"id\":\"humid\",\"topicFilter\":\"s/x/v1\",
+                       \"region\":{\"offset\":1,\"length\":1},
+                       \"extract\":{\"type\":\"json\",\"pointer\":\"/h\"},
+                       \"normalize\":{\"mode\":\"passthrough\",\"clamp\":false}}]}")
+         (registry (reality-engine-lsp::mqtt-mapping-registry-from-json
+                    (reality-engine-lsp::parse-json reg-json)))
+         (config (reality-engine-lsp::make-mqtt-client-config :broker-host "127.0.0.1"
+                                                              :broker-port 1
+                                                              :client-id "test"))
+         (ingested-mappings nil)
+         (bridge (reality-engine-lsp::make-mqtt-bridge
+                  config registry
+                  (lambda (sid offset length values ttl-ms topic mapping-id)
+                    (declare (ignore sid offset length values ttl-ms topic))
+                    (push mapping-id ingested-mappings))
+                  (lambda () nil))))
+    (reality-engine-lsp::mqtt-bridge-inject-message bridge "s/x/v1" "{\"t\":0.25,\"h\":0.75}")
+    (assert-equal 2 (length ingested-mappings) "one PUBLISH → two ingests on fan-out")
+    (assert-true (and (find "temp" ingested-mappings :test #'string=)
+                       (find "humid" ingested-mappings :test #'string=))
+                 "both fan-out mappings dispatched"))
+
   (format t "~&RealityEngine_LSP core tests passed.~%")
   t)

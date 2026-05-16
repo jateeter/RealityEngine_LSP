@@ -5,9 +5,11 @@
   :version "0.1.0"
   :serial t
   :depends-on (#:alexandria
+               #:babel
                #:bordeaux-threads
                #:hunchentoot
                #:drakma
+               #:usocket
                #:yason)
   :components ((:module "src"
                 :serial t
@@ -23,6 +25,8 @@
                  (:file "reality-service")
                  (:file "perception-service")
                  (:file "mqtt-mapping")
+                 (:file "mqtt-client")
+                 (:file "mqtt-bridge")
                  (:file "main")))))
 
 (asdf:defsystem #:reality-engine-lsp/tests
