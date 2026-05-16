@@ -327,6 +327,14 @@ the addressed value or :missing when any component is absent."
                    (/ (- v (mqtt-normalize-rule-min norm)) denom)))
                 ((string= mode "linear")
                  (+ (* v (mqtt-normalize-rule-scale norm)) (mqtt-normalize-rule-offset norm)))
+                ((string= mode "band")
+                 ;; Status-bit semantics — 1.0 when v ∈ [min,max], 0.0 else.
+                 ;; Matches AI / CPP "band" mode used to drive 4-cell status
+                 ;; inputs on ag-domain operational CES.
+                 (if (and (>= v (mqtt-normalize-rule-min norm))
+                          (<= v (mqtt-normalize-rule-max norm)))
+                     1.0d0
+                     0.0d0))
                 (t (return-from mqtt-normalize
                      (values nil (format nil "unknown normalize.mode: ~a" mode))))))
              (final (if (mqtt-normalize-rule-clamp-p norm)
