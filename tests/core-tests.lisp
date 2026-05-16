@@ -460,5 +460,93 @@
                     "re_runtime_mapping_version"))
       (assert-true (search (format nil "# HELP ~a " name) text)
                    (format nil "Prometheus emission should declare ~a" name))))
+
+  ;; ── Sensor TTL parity with C++ ─────────────────────────────────────────
+  ;; A stale sensor (last-updated older than ttl-ms) should drop out of the
+  ;; assembled perception vector and report stale=true in source-json.
+  (let* ((engine (reality-engine-lsp::make-perception-engine-state 4))
+         (now (reality-engine-lsp::now-ms))
+         (fresh (reality-engine-lsp::make-source
+                 :id "s-fresh" :kind "sensor" :name "fresh"
+                 :active-p t
+                 :region (reality-engine-lsp::make-region :offset 0 :length 1)
+                 :sensor-id "fresh-sid"
+                 :last-value (list 0.7d0)
+                 :last-updated (- now 1000) :ttl-ms 5000))
+         (stale (reality-engine-lsp::make-source
+                 :id "s-stale" :kind "sensor" :name "stale"
+                 :active-p t
+                 :region (reality-engine-lsp::make-region :offset 1 :length 1)
+                 :sensor-id "stale-sid"
+                 :last-value (list 0.9d0)
+                 :last-updated (- now 60000) :ttl-ms 5000)))
+    (reality-engine-lsp::ensure-source-id engine fresh)
+    (reality-engine-lsp::ensure-source-id engine stale)
+    (let ((vec (reality-engine-lsp::assemble-perception-vector engine)))
+      (assert-equal 0.7d0 (nth 0 vec) "fresh sensor contributes its value")
+      (assert-equal 0.0d0 (nth 1 vec) "stale sensor contributes zero"))
+    (let ((js (reality-engine-lsp::source-json stale)))
+      (assert-true (reality-engine-lsp::jbool js "stale" nil) "stale sensor reports stale=true in JSON")
+      (assert-true (> (reality-engine-lsp::jnumber js "ageMs" 0) 0) "stale sensor reports positive ageMs")))
+
+  ;; ── MQTT mapping registry parity ──────────────────────────────────────
+  (let* ((json-text "{\"mappings\":[
+                       {\"id\":\"zone-temp\",
+                        \"topicFilter\":\"sensors/zone/+/temp\",
+                        \"sensorIdTemplate\":\"zone.{1}.temp\",
+                        \"region\":{\"offset\":0,\"length\":1},
+                        \"extract\":{\"type\":\"json\",\"pointer\":\"/value\"},
+                        \"normalize\":{\"mode\":\"minmax\",\"min\":0,\"max\":100,\"clamp\":true},
+                        \"ttlMs\":15000,
+                        \"pushMode\":\"immediate\"}]}")
+         (parsed (reality-engine-lsp::parse-json json-text))
+         (registry (reality-engine-lsp::mqtt-mapping-registry-from-json parsed)))
+    (assert-equal 1 (length (reality-engine-lsp::mqtt-mapping-registry-rules registry))
+                  "one mapping rule parsed")
+    (let* ((match (reality-engine-lsp::mqtt-match-topic registry "sensors/zone/3/temp")))
+      (assert-true match "topic matched against wildcard filter")
+      (when match
+        (let* ((rule-index (car match))
+               (captures (cdr match))
+               (rule (aref (reality-engine-lsp::mqtt-mapping-registry-rules registry) rule-index))
+               (sid (reality-engine-lsp::mqtt-resolve-sensor-id rule "sensors/zone/3/temp" captures)))
+          (assert-equal "zone.3.temp" sid "sensorId template interpolated capture"))))
+
+    ;; Decode end-to-end: JSON payload {"value":50} → minmax(0,100) → 0.5
+    (let ((rule (aref (reality-engine-lsp::mqtt-mapping-registry-rules registry) 0)))
+      (multiple-value-bind (values err) (reality-engine-lsp::mqtt-decode rule "{\"value\":50}")
+        (assert-true (null err) (format nil "decode succeeded; got error: ~a" err))
+        (assert-equal 1 (length values) "decode returned one value")
+        (when values
+          (assert-equal 0.5d0 (coerce (car values) 'double-float)
+                        "JSON 50 → minmax(0,100) → 0.5"))))
+
+    ;; Bad payload (missing pointer) is rejected.
+    (let ((rule (aref (reality-engine-lsp::mqtt-mapping-registry-rules registry) 0)))
+      (multiple-value-bind (values err) (reality-engine-lsp::mqtt-decode rule "{\"missing\":1}")
+        (assert-true (and (null values) err) "missing JSON pointer rejected")))
+
+    ;; Length mismatch is rejected — a JSON array with 2 elements into a
+    ;; 1-wide region should fail length validation.
+    (let* ((multi-json "{\"mappings\":[{\"id\":\"a\",\"topicFilter\":\"x\",
+                          \"region\":{\"offset\":0,\"length\":1},
+                          \"extract\":{\"type\":\"csv-float\"}}]}")
+           (multi-reg (reality-engine-lsp::mqtt-mapping-registry-from-json
+                       (reality-engine-lsp::parse-json multi-json)))
+           (rule (aref (reality-engine-lsp::mqtt-mapping-registry-rules multi-reg) 0)))
+      (multiple-value-bind (values err) (reality-engine-lsp::mqtt-decode rule "1,2")
+        (assert-true (and (null values) err) "length mismatch rejected"))))
+
+  ;; ── Overlap detection ─────────────────────────────────────────────────
+  (let* ((json-text "{\"mappings\":[
+                       {\"id\":\"a\",\"topicFilter\":\"x\",\"region\":{\"offset\":0,\"length\":3},\"extract\":{\"type\":\"csv-float\"}},
+                       {\"id\":\"b\",\"topicFilter\":\"y\",\"region\":{\"offset\":2,\"length\":2},\"extract\":{\"type\":\"csv-float\"}}]}")
+         (registry (reality-engine-lsp::mqtt-mapping-registry-from-json
+                    (reality-engine-lsp::parse-json json-text)))
+         (warnings (reality-engine-lsp::mqtt-validate-overlaps registry nil)))
+    (assert-equal 1 (length warnings) "overlapping regions reported as one warning")
+    (assert-true (null (reality-engine-lsp::mqtt-validate-overlaps registry t))
+                 "allow-overlap suppresses warnings"))
+
   (format t "~&RealityEngine_LSP core tests passed.~%")
   t)

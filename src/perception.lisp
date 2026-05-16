@@ -16,13 +16,27 @@
                           :auto-running-p nil
                           :auto-interval-ms 1000))
 
+(defun sensor-stale-p (source &optional (now (now-ms)))
+  "Return true when a sensor source's last-updated timestamp is older than
+its TTL window.  Aligns LSP staleness semantics with the C++ runtime — a
+stale sensor sources contributes zeros to assembled perception vectors so
+machines downstream don't keep reading a value that was supposed to expire."
+  (let ((kind (source-kind source))
+        (last-updated (or (source-last-updated source) 0))
+        (ttl (or (source-ttl-ms source) 0)))
+    (and (string= kind "sensor")
+         (> last-updated 0)
+         (> ttl 0)
+         (> (- now last-updated) ttl))))
+
 (defun source-json (source)
-  (let ((out (obj "id" (source-id source)
-                  "type" (source-kind source)
-                  "kind" (source-kind source)
-                  "name" (source-name source)
-                  "active" (json-bool (source-active-p source))
-                  "region" (region-json (source-region source)))))
+  (let* ((now (now-ms))
+         (out (obj "id" (source-id source)
+                   "type" (source-kind source)
+                   "kind" (source-kind source)
+                   "name" (source-name source)
+                   "active" (json-bool (source-active-p source))
+                   "region" (region-json (source-region source)))))
     (cond
       ((string= (source-kind source) "test")
        (setf (jget out "machineId") (or (source-machine-id source) "")
@@ -34,10 +48,16 @@
              (jget out "cursor") (or (source-cursor source) 0)
              (jget out "loop") (json-bool (source-loop-p source))))
       ((string= (source-kind source) "sensor")
-       (setf (jget out "sensorId") (or (source-sensor-id source) "")
-             (jget out "lastValue") (vectorize (or (source-last-value source) nil))
-             (jget out "lastUpdated") (or (source-last-updated source) 0)
-             (jget out "ttlMs") (or (source-ttl-ms source) 5000)))
+       (let* ((last-updated (or (source-last-updated source) 0))
+              (ttl (or (source-ttl-ms source) 5000))
+              (age (if (> last-updated 0) (- now last-updated) 0))
+              (stale-p (sensor-stale-p source now)))
+         (setf (jget out "sensorId") (or (source-sensor-id source) "")
+               (jget out "lastValue") (vectorize (or (source-last-value source) nil))
+               (jget out "lastUpdated") last-updated
+               (jget out "ttlMs") ttl
+               (jget out "ageMs") age
+               (jget out "stale") (json-bool stale-p))))
       (t
        (setf (jget out "pattern") (or (source-pattern source) "constant")
              (jget out "frequency") (or (source-frequency source) 1.0d0)
@@ -101,7 +121,12 @@
                               (setf (source-cursor source) 0)))
                         selected))))
                  ((string= (source-kind source) "sensor")
-                  (source-last-value source))
+                  ;; TTL eviction — when a sensor source has gone stale we
+                  ;; drop its contribution to the assembled vector.  Matches
+                  ;; CPP behaviour where the C++ engine's sample path checks
+                  ;; the TTL window on every sample call.
+                  (when (not (sensor-stale-p source))
+                    (source-last-value source)))
                  (t
                   (make-list length :initial-element (or (source-dc-offset source) 0.0d0))))))
         (loop for value in (or payload nil)

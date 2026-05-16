@@ -22,6 +22,7 @@
                  (:file "http")
                  (:file "reality-service")
                  (:file "perception-service")
+                 (:file "mqtt-mapping")
                  (:file "main")))))
 
 (asdf:defsystem #:reality-engine-lsp/tests
