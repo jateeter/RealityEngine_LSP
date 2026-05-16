@@ -126,45 +126,56 @@
     (push (get-output-stream-string current) out)
     (nreverse out)))
 
+(defun %mqtt-try-filter (topic-levels filter-levels)
+  "Return reversed-captures list when filter matches; :no-match otherwise."
+  (let ((captures nil) (fi 0) (ti 0) (n-filter (length filter-levels))
+        (n-topic (length topic-levels)) (ok t) (done nil))
+    (loop while (and (< fi n-filter) (not done)) do
+      (let ((f (nth fi filter-levels)))
+        (cond
+          ((string= f "#")
+           (let ((tail (with-output-to-string (out)
+                         (loop for k from ti below n-topic
+                               for first = t then nil
+                               do (unless first (write-char #\/ out))
+                                  (write-string (nth k topic-levels) out)))))
+             (push tail captures))
+           (setf ti n-topic)
+           (incf fi)
+           (setf done t))
+          ((>= ti n-topic) (setf ok nil) (setf done t))
+          ((string= f "+") (push (nth ti topic-levels) captures) (incf ti) (incf fi))
+          ((string= f (nth ti topic-levels)) (incf ti) (incf fi))
+          (t (setf ok nil) (setf done t)))))
+    (if (and ok (= fi n-filter) (= ti n-topic)) captures :no-match)))
+
 (defun mqtt-match-topic (registry topic)
-  "Return (rule-index . captures) for the first matching rule, or NIL."
+  "Return (rule-index . captures) for the first matching rule, or NIL.
+The bridge ingest path uses mqtt-match-all-topics so a single PUBLISH on
+a multi-field sensor topic fans out to every rule that shares a filter."
   (let ((rules (mqtt-mapping-registry-rules registry))
         (topic-levels (mqtt-split-topic topic)))
-    (loop for i from 0 below (length rules)
-          for rule = (aref rules i)
-          for filter-levels = (mqtt-split-topic (mqtt-mapping-rule-topic-filter rule))
-          for captures = nil
-          for fi = 0 then (1+ fi)
-          do (block try
-               (let ((ti 0) (ok t))
-                 (loop while (< fi (length filter-levels)) do
-                   (let ((f (nth fi filter-levels)))
-                     (cond
-                       ((string= f "#")
-                        ;; Multi-level wildcard absorbs the rest.
-                        (let ((tail (with-output-to-string (out)
-                                      (loop for k from ti below (length topic-levels)
-                                            for first = t then nil
-                                            do (unless first (write-char #\/ out))
-                                               (write-string (nth k topic-levels) out)))))
-                          (push tail captures))
-                        (setf ti (length topic-levels))
-                        (incf fi)
-                        (loop-finish))
-                       ((>= ti (length topic-levels))
-                        (setf ok nil) (loop-finish))
-                       ((string= f "+")
-                        (push (nth ti topic-levels) captures))
-                       ((not (string= f (nth ti topic-levels)))
-                        (setf ok nil) (loop-finish)))
-                     (incf ti)
-                     (incf fi)))
-                 (when (and ok
-                            (= fi (length filter-levels))
-                            (= ti (length topic-levels)))
-                   (return-from mqtt-match-topic
-                     (cons i (nreverse captures)))))))
+    (loop for i from 0 below (length rules) do
+      (let ((captures (%mqtt-try-filter
+                       topic-levels
+                       (mqtt-split-topic (mqtt-mapping-rule-topic-filter (aref rules i))))))
+        (unless (eq captures :no-match)
+          (return-from mqtt-match-topic (cons i (nreverse captures))))))
     nil))
+
+(defun mqtt-match-all-topics (registry topic)
+  "Return a list of (rule-index . captures) cons cells, one per matching
+rule, in declaration order.  Empty list when no rule matches."
+  (let ((rules (mqtt-mapping-registry-rules registry))
+        (topic-levels (mqtt-split-topic topic))
+        (out nil))
+    (loop for i from 0 below (length rules) do
+      (let ((captures (%mqtt-try-filter
+                       topic-levels
+                       (mqtt-split-topic (mqtt-mapping-rule-topic-filter (aref rules i))))))
+        (unless (eq captures :no-match)
+          (push (cons i (nreverse captures)) out))))
+    (nreverse out)))
 
 ;; ── sensorId template substitution ─────────────────────────────────────────
 
