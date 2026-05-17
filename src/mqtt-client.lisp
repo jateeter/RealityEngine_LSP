@@ -351,16 +351,32 @@ holding the client lock for any meaningful time."
           (error () nil)))))
   client)
 
+(defparameter +default-mqtt-broker-host+ "yuma.lateraledge.cloud"
+  "Default broker target — points at the Lateral Edge sensor mesh that
+the live yuma demonstration runs against, so operators get a sensible
+default without configuration.  Setting MQTT_BROKER_HOST=\"\" (empty
+string) or MQTT_DISABLED=1 explicitly opts out.  Bridge still requires
+MQTT_MAPPINGS_FILE / MQTT_MAPPINGS_JSON before it actually boots.")
+
 (defun make-mqtt-client-from-env ()
   "Convenience: build an mqtt-client-config from the canonical MQTT_* env
-vars.  Returns NIL when MQTT_BROKER_HOST is unset (the disabled case)."
-  (let ((host (env "MQTT_BROKER_HOST" nil)))
-    (when (and host (not (string= host "")))
-      (make-mqtt-client-config
-       :broker-host host
-       :broker-port (env-int "MQTT_BROKER_PORT" 1883)
-       :client-id (env "MQTT_CLIENT_ID" "reality-engine-pe-lsp")
-       :username (env "MQTT_USERNAME" nil)
-       :password (env "MQTT_PASSWORD" nil)
-       :keepalive-sec (env-int "MQTT_KEEPALIVE" 60)
-       :clean-session-p t))))
+vars.  Returns NIL when the operator has explicitly opted out
+(MQTT_BROKER_HOST='' or MQTT_DISABLED=1).  Otherwise defaults to the
+shared yuma.lateraledge.cloud broker."
+  (let ((disabled (env "MQTT_DISABLED" "0")))
+    (when (member disabled '("1" "true" "TRUE" "yes") :test #'string=)
+      (return-from make-mqtt-client-from-env nil)))
+  (let ((host-env (uiop:getenv "MQTT_BROKER_HOST")))
+    (cond
+      ((and host-env (string= host-env ""))
+       nil)
+      (t
+       (let ((host (or host-env +default-mqtt-broker-host+)))
+         (make-mqtt-client-config
+          :broker-host host
+          :broker-port (env-int "MQTT_BROKER_PORT" 1883)
+          :client-id (env "MQTT_CLIENT_ID" "reality-engine-pe-lsp")
+          :username (env "MQTT_USERNAME" nil)
+          :password (env "MQTT_PASSWORD" nil)
+          :keepalive-sec (env-int "MQTT_KEEPALIVE" 60)
+          :clean-session-p t))))))
