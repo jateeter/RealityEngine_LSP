@@ -72,6 +72,103 @@
          "failedMachines" (vectorize (nreverse failed))
          "localAIBaseUrl" (perception-state-localai-url state))))
 
+(defun consolidate-stale-test-sources (engine)
+  "Migration: prior bootstrap shapes created one source per sequence;
+clear any group of >1 test source for the same machineId so the
+consolidated source replaces them.  Idempotent for single-source
+machines."
+  (let ((sources-table (perception-engine-sources engine))
+        (per-machine (make-hash-table :test #'equal)))
+    (maphash (lambda (id src)
+               (when (and (string= (source-kind src) "test")
+                          (source-machine-id src))
+                 (push id (gethash (source-machine-id src) per-machine))))
+             sources-table)
+    (maphash (lambda (_mid ids)
+               (declare (ignore _mid))
+               (when (> (length ids) 1)
+                 (dolist (id ids) (remhash id sources-table))))
+             per-machine)))
+
+(defun bootstrap-test-sources-from-machines (state)
+  "Fetch /api/machines from the Reality Engine and materialize one
+consolidated test source per machine — its `inputs` is the flat
+concatenation of every authored inputSequence, so the first sequence
+completes before the second begins and `loop=t` wraps the entire set.
+Per-sequence boundaries live in metadata.segments for UI display."
+  (consolidate-stale-test-sources (perception-state-engine state))
+  (let* ((engine (perception-state-engine state))
+         (sources-table (perception-engine-sources engine))
+         (existing (make-hash-table :test #'equal))
+         (created 0) (skipped 0) (machines-seen 0) (errors nil))
+    (maphash (lambda (_ src)
+               (declare (ignore _))
+               (when (and (string= (source-kind src) "test")
+                          (source-machine-id src))
+                 (setf (gethash (source-machine-id src) existing) t)))
+             sources-table)
+    (let ((data (handler-case
+                    (http-get-json (format nil "~a/api/machines"
+                                           (perception-state-reality-url state)))
+                  (error (c) (push (princ-to-string c) errors) nil))))
+      (when data
+        (let ((machines (jarray-list (or (jget data "machines") (arr)))))
+          (setf machines-seen (length machines))
+          (dolist (machine machines)
+            (let* ((mid (jstring machine "id" nil))
+                   (mname (or (jstring machine "name" nil) mid))
+                   (mapping (jget machine "perceptualMapping"))
+                   (input-region (and (jobject-p mapping) (jget mapping "input")))
+                   (metadata (jget machine "metadata"))
+                   (input-sequences
+                    (and (jobject-p metadata)
+                         (jarray-list (or (jget metadata "inputSequences") (arr))))))
+              (cond
+                ((or (null mid) (gethash mid existing)
+                     (not (jobject-p input-region))
+                     (null input-sequences))
+                 (incf skipped))
+                (t
+                 (let ((concat-inputs nil) (segments nil))
+                   (dolist (seq input-sequences)
+                     (let ((vectors (jarray-list (or (jget seq "vectors") (arr))))
+                           (seq-name (or (jstring seq "name" nil) "Test sequence")))
+                       (when vectors
+                         (push (obj "name" seq-name "length" (length vectors)) segments)
+                         (dolist (v vectors)
+                           (push (numbers-from-json v) concat-inputs)))))
+                   (if concat-inputs
+                       (let* ((seg-list (nreverse segments))
+                              (inputs-list (nreverse concat-inputs))
+                              (label (if (= 1 (length seg-list))
+                                         (jstring (first seg-list) "name" "Test")
+                                         (format nil "~a sequences" (length seg-list))))
+                              (src (make-source
+                                    :id (format nil "test-~a" mid)
+                                    :kind "test"
+                                    :name (format nil "~a / ~a" mname label)
+                                    :active-p nil
+                                    :region (make-region
+                                             :offset (truncate (or (jnumber input-region "offset" 0) 0))
+                                             :length (truncate (or (jnumber input-region "length" 0) 0)))
+                                    :machine-id mid
+                                    :machine-name mname
+                                    :sequence-name label
+                                    :sequence-metadata (obj "segments" (vectorize seg-list))
+                                    :test-sequence (obj)
+                                    :inputs inputs-list
+                                    :cursor 0
+                                    :loop-p t)))
+                         (ensure-source-id engine src)
+                         (setf (gethash mid existing) t)
+                         (incf created))
+                       (incf skipped))))))))))
+    (obj "created" created
+         "skipped" skipped
+         "machinesSeen" machines-seen
+         "errors" (vectorize (mapcar #'identity errors))
+         "vectorSize" (perception-engine-dimension engine))))
+
 (defun localai-status-json (state)
   (let ((sensors nil))
     (dolist (spec (localai-sensor-specs))
@@ -282,6 +379,10 @@
                                                                             (setf (source-active-p source) (jbool body "active" t)))
                                                                           (source-json source)))))))
                                              (if result (json-response (obj "source" result)) (error-response "Source not found" 404)))))
+   (make-route "POST" "/api/sources/bootstrap-from-machines" (lambda (_ body query)
+                                                              (declare (ignore _ body query))
+                                                              (json-response
+                                                               (actor-ask actor #'bootstrap-test-sources-from-machines))))
    (make-route "DELETE" "/api/sources/:id" (lambda (params body query)
                                             (declare (ignore body query))
                                             (json-response

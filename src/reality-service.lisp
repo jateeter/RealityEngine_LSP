@@ -386,18 +386,26 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                                count))))
                    (reality-state-cov-steps state))
 
+          ;; `machine` (name) label is derived from machine_id so the
+          ;; dashboard `machine=~"$machine"` filter resolves; the event
+          ;; hash keys carry only machine_id because owner_team /
+          ;; process_status are the partitioning axes.
           (emit-help "ces_paging_decisions_total"
                      "Number of governance-resolved paging decisions issued by the engine." "counter")
           (maphash (lambda (k count)
                      (let ((parts (split-coverage-key k)))
                        (when (= (length parts) 4)
-                         (emit "ces_paging_decisions_total"
-                               (append base
-                                       `(("owner_team" . ,(nth 0 parts))
-                                         ("process_status" . ,(nth 1 parts))
-                                         ("rag_status_code" . ,(nth 2 parts))
-                                         ("machine_id" . ,(nth 3 parts))))
-                               count))))
+                         (let* ((mid (nth 3 parts))
+                                (m (gethash mid (reality-state-machines state)))
+                                (mname (if m (machine-name m) "")))
+                           (emit "ces_paging_decisions_total"
+                                 (append base
+                                         `(("owner_team" . ,(nth 0 parts))
+                                           ("process_status" . ,(nth 1 parts))
+                                           ("rag_status_code" . ,(nth 2 parts))
+                                           ("machine_id" . ,mid)
+                                           ("machine" . ,mname)))
+                                 count)))))
                    (reality-state-cov-paging state))
 
           (emit-help "ces_deprecated_fires_total"
@@ -445,6 +453,31 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                   (append base `(("machine" . ,(nth 1 row))
                                  ("machine_id" . ,(nth 0 row))))
                   (nth 3 row)))
+
+          ;; Zero-baseline counter series so dashboards plot rate() /
+          ;; by(machine) before any events fire.  Event-keyed series
+          ;; above carry sequence / vector sub-labels (distinct Prom
+          ;; label sets) so they coexist with these baselines;
+          ;; ces_machine_steps_total shares its baseline label shape,
+          ;; so we skip machines already seen in cov-steps.
+          (let ((seen-steps (make-hash-table :test #'equal)))
+            (maphash (lambda (k v)
+                       (declare (ignore v))
+                       (let ((parts (split-coverage-key k)))
+                         (when (= (length parts) 2)
+                           (setf (gethash (nth 0 parts) seen-steps) t))))
+                     (reality-state-cov-steps state))
+            (dolist (row (prom-per-machine-unfired state))
+              (let* ((mid (nth 0 row))
+                     (mname (nth 1 row))
+                     (labels (append base `(("machine" . ,mname)
+                                            ("machine_id" . ,mid)))))
+                (emit "ces_vector_matched_total"   labels 0)
+                (emit "ces_vector_activated_total" labels 0)
+                (emit "ces_sequence_outputs_total" labels 0)
+                (emit "ces_deprecated_fires_total" labels 0)
+                (unless (gethash mid seen-steps)
+                  (emit "ces_machine_steps_total"  labels 0)))))
 
           (let ((uptime-ms (- (now-ms) (reality-state-started-at state))))
             (emit-help "ces_registry_uptime_seconds"
