@@ -128,6 +128,191 @@
                                                              "id" "sta-out"
                                                              "vector" (reality-engine-lsp::vectorize (list 1))))))))))))))
 
+;; ── Cross-runtime parity helpers (AI + C++ + LSP must agree) ──────────────
+;;
+;; The same corpus walked by:
+;;   RealityEngine_AI/src/__tests__/AiTriggerDispatch.test.ts
+;;   RealityEngine_CPP/tests/e2e_ai_trigger_dispatch.cpp
+;; reports 895/4480/3586/3586 — pinning the same counters here catches any
+;; LSP-side drift in process-machine-input or resolve-governance.  And the
+;; Yuma 3-tick cascade (AGX051→AGX055→AgYieldOptimizationAI) asserts the
+;; same mergeBatch shapes both other runtimes already enforce.
+
+(defparameter +ai-machines-dir+
+  (or (probe-file "../RealityEngine_AI/examples/machines/")
+      (probe-file "../../RealityEngine_AI/examples/machines/")))
+
+(defun reset-machine (machine)
+  (dolist (sequence (reality-engine-lsp::machine-sequence-list machine))
+    (reality-engine-lsp::reset-sequence sequence))
+  machine)
+
+(defun zero-region (list offset length)
+  (loop for i from offset below (+ offset length)
+        do (setf (nth i list) 0.0d0))
+  list)
+
+(defun find-merge-by-machine (batch machine-id)
+  (find machine-id (coerce batch 'list)
+        :key (lambda (op) (reality-engine-lsp::jstring op "machineId" ""))
+        :test #'string=))
+
+(defun envelope-for (machine sequence-id values)
+  "Build the envelope-field bundle the dispatcher would emit, or NIL on miss.
+   Mirrors envelopeFor in AiTriggerDispatch.test.ts."
+  (let ((decision (reality-engine-lsp::resolve-governance machine sequence-id values)))
+    (unless decision (return-from envelope-for nil))
+    (let* ((md (reality-engine-lsp::machine-metadata machine))
+           (sla (reality-engine-lsp::jget decision "slaSeconds")))
+      (reality-engine-lsp::obj
+       "dispatchableAgent" (reality-engine-lsp::jstring md "dispatchableAgent" "")
+       "aiTrigger"         (reality-engine-lsp::jstring md "aiTrigger" "")
+       "ragStatusCode"     (reality-engine-lsp::jstring decision "ragStatusCode" "")
+       "processStatus"     (reality-engine-lsp::jstring decision "processStatus" "")
+       "ownerTeam"         (reality-engine-lsp::jstring decision "ownerTeam" "")
+       "slaSeconds"        (if (or (eq sla reality-engine-lsp::+json-null+) (null sla)) nil sla)))))
+
+(defun walk-corpus-for-envelopes (machine-dir)
+  "Auto-discover machines, replay each inputSequences[] entry, return a plist
+   of (:machines :sequences :outputs :envelopes :failures).  Same skip rules
+   as the AI + C++ counterparts: bypass machines without triggerConfig+
+   dispatchableAgent+aiTrigger; skip baseline (expectedOutputCount=0) sequences;
+   require SLA only for paging tiers (processStatus ∈ {error, warning})."
+  (let ((machines 0) (sequences 0) (outputs 0) (envelopes 0) (failures nil))
+    (dolist (path (sort (uiop:directory-files machine-dir "*.json") #'string< :key #'namestring))
+      (let* ((raw (reality-engine-lsp::safe-read-file (namestring path)))
+             (root (handler-case (reality-engine-lsp::parse-json raw)
+                     (error (c) (push (format nil "~a: parse failed — ~a" (file-namestring path) c) failures)
+                            nil))))
+        (unless root (return))
+        (let* ((machine-obj (reality-engine-lsp::jget root "machine"))
+               (md (reality-engine-lsp::jget machine-obj "metadata"))
+               (tc (reality-engine-lsp::jget md "triggerConfig"))
+               (rules (and (reality-engine-lsp::jobject-p tc) (reality-engine-lsp::jget tc "rules"))))
+          (when (and (reality-engine-lsp::jarray-p rules)
+                     (> (length (reality-engine-lsp::jarray-list rules)) 0)
+                     (let ((da (reality-engine-lsp::jstring md "dispatchableAgent" "")))
+                       (> (length da) 0))
+                     (let ((at (reality-engine-lsp::jstring md "aiTrigger" "")))
+                       (> (length at) 0)))
+            (incf machines)
+            (let ((machine (handler-case (reality-engine-lsp::load-machine-from-file path)
+                             (error (c) (push (format nil "~a: load failed — ~a" (file-namestring path) c) failures)
+                                    nil))))
+              (when machine
+                (let ((input-seqs (reality-engine-lsp::jget machine-obj "inputSequences")))
+                  (when (reality-engine-lsp::jarray-p input-seqs)
+                    (dolist (seq-json (reality-engine-lsp::jarray-list input-seqs))
+                      (reset-machine machine)
+                      (incf sequences)
+                      (let* ((seq-name (reality-engine-lsp::jstring seq-json "name" "unnamed"))
+                             (seq-meta (reality-engine-lsp::jget seq-json "metadata"))
+                             (scenario (reality-engine-lsp::jstring seq-meta "scenario" ""))
+                             (expected-count (reality-engine-lsp::jnumber seq-meta "expectedOutputCount" nil))
+                             (vectors-json (reality-engine-lsp::jget seq-json "vectors")))
+                        ;; Baseline sequences (expectedOutputCount: 0) intentionally do not fire.
+                        ;; Same skip applied by the AI + C++ tests.  Use cond, NOT
+                        ;; (return) — `return` from a dolist exits the entire loop and
+                        ;; would drop the remaining sequences for the machine.
+                        (cond
+                          ((eql expected-count 0) nil)
+                          ((not (reality-engine-lsp::jarray-p vectors-json))
+                           (push (format nil "~a / ~a: missing input vectors" (file-namestring path) seq-name) failures))
+                          (t
+                        (let ((fired nil))
+                          (dolist (vec-json (reality-engine-lsp::jarray-list vectors-json))
+                            (let* ((input (reality-engine-lsp::numbers-from-json vec-json))
+                                   (tr (reality-engine-lsp::process-machine-input machine input)))
+                              (maphash
+                               (lambda (sid outs)
+                                 (dolist (ov outs)
+                                   (push (cons sid (reality-engine-lsp::output-vector-vector ov)) fired)
+                                   (incf outputs)))
+                               (reality-engine-lsp::transition-result-sequence-outputs tr))))
+                          (when (and expected-count (> expected-count 0)
+                                     (/= (length fired) expected-count))
+                            (push (format nil "~a / ~a: expected ~a output(s), got ~a"
+                                          (file-namestring path) seq-name expected-count (length fired)) failures))
+                          (let ((envelopes-this-run 0))
+                            (dolist (pair fired)
+                              (let ((env (envelope-for machine (car pair) (cdr pair))))
+                                (when env
+                                  (incf envelopes-this-run)
+                                  (incf envelopes)
+                                  (let ((where (format nil "~a / ~a / ~a" (file-namestring path) seq-name scenario))
+                                        (ps (reality-engine-lsp::jstring env "processStatus" ""))
+                                        (rs (reality-engine-lsp::jstring env "ragStatusCode" ""))
+                                        (ot (reality-engine-lsp::jstring env "ownerTeam" ""))
+                                        (da (reality-engine-lsp::jstring env "dispatchableAgent" ""))
+                                        (at (reality-engine-lsp::jstring env "aiTrigger" ""))
+                                        (sla (reality-engine-lsp::jget env "slaSeconds")))
+                                    (when (zerop (length da)) (push (format nil "~a: dispatchableAgent empty" where) failures))
+                                    (when (zerop (length at)) (push (format nil "~a: aiTrigger empty" where) failures))
+                                    (unless (member rs '("RED" "AMBER" "GREEN") :test #'string=)
+                                      (push (format nil "~a: ragStatusCode='~a' not in {RED,AMBER,GREEN}" where rs) failures))
+                                    (unless (member ps '("error" "warning" "info" "ok") :test #'string=)
+                                      (push (format nil "~a: processStatus='~a' not in {error,warning,info,ok}" where ps) failures))
+                                    (when (or (zerop (length ot)) (string= ot "unrouted"))
+                                      (push (format nil "~a: ownerTeam unrouted (governance not backfilled)" where) failures))
+                                    (when (member ps '("error" "warning") :test #'string=)
+                                      (unless (and sla (numberp sla) (> sla 0))
+                                        (push (format nil "~a: paging tier '~a' has no slaSeconds — envelope would page with no contract" where ps) failures)))))))
+                            (when (zerop envelopes-this-run)
+                              (push (format nil "~a / ~a: no fired output matched any triggerConfig rule — envelope would be dropped"
+                                            (file-namestring path) seq-name) failures))))))))))))))))
+    (list :machines machines :sequences sequences :outputs outputs :envelopes envelopes
+          :failures (nreverse failures))))
+
+;; Yuma tier-1 input patterns lifted from each AGX051-054 inputSequences[]
+;; block — same constants the AI + C++ cascade tests use.
+(defparameter +tier1-normal-input+ '(1 1 0 1))
+(defparameter +tier1-urgent-ticks+ '((1 1 1 1) (1 0 1 0) (0 0 0 0)))
+
+(defun cascade-state ()
+  "Build a fresh reality-state seeded with AGX051-055 + AgYieldOptimizationAI."
+  (let ((state (reality-engine-lsp::make-reality-state
+                :dimension 0
+                :machines (make-hash-table :test #'equal)
+                :machine-dir (namestring +ai-machines-dir+)
+                :perceptual-space (make-list 0 :initial-element 0.0d0)
+                :history nil :history-limit 25
+                :include-machine-results-p t :include-perceptual-space-p t
+                :vector-store (make-hash-table :test #'equal)
+                :sequences (make-hash-table :test #'equal)
+                :qdrant-url "http://localhost:4333" :collection-name "test"
+                :started-at (reality-engine-lsp::now-ms)
+                :event-bus-subscriptions (make-hash-table :test #'equal)
+                :latched-event-bits (make-hash-table :test #'equal)
+                :step-count 0 :mapping-version 0
+                :cov-matched    (make-hash-table :test #'equal)
+                :cov-activated  (make-hash-table :test #'equal)
+                :cov-outputs    (make-hash-table :test #'equal)
+                :cov-steps      (make-hash-table :test #'equal)
+                :cov-paging     (make-hash-table :test #'equal)
+                :cov-deprecated (make-hash-table :test #'equal))))
+    (dolist (file '("AGX051_yuma-aqua-maintenance-forecaster.json"
+                    "AGX052_yuma-do-probe-reliability-tracker.json"
+                    "AGX053_yuma-vpd-hvac-service-planner.json"
+                    "AGX054_yuma-co2-safety-compliance-officer.json"
+                    "AGX055_yuma-facility-ai-synthesis-bridge.json"
+                    "AgYieldOptimizationAI.json"))
+      (reality-engine-lsp::put-machine state
+        (reality-engine-lsp::load-machine-from-file (merge-pathnames file +ai-machines-dir+))))
+    state))
+
+(defun stage1-input (state tick-values)
+  "Build the stage-1 input vector: zero-fill to dim, then write the tier-1
+   sensor regions.  The simulator overwrites the entire perceptual space
+   with this input every call, so AGX052-054 sensors must be re-driven on
+   every tick of the AGX051 escalation."
+  (let* ((dim (reality-engine-lsp::reality-state-dimension state))
+         (v (make-list dim :initial-element 0.0d0)))
+    (loop for x in tick-values        for i from 40  do (setf (nth i v) x))
+    (loop for x in +tier1-normal-input+ for i from 84  do (setf (nth i v) x))
+    (loop for x in +tier1-normal-input+ for i from 184 do (setf (nth i v) x))
+    (loop for x in +tier1-normal-input+ for i from 228 do (setf (nth i v) x))
+    v))
+
 (defun run-tests ()
   (let* ((machine-json (reality-engine-lsp::obj
                        "id" "machine-test"
@@ -163,8 +348,13 @@
                  "STA report should mark life-safety machines")
     (assert-equal 1 (reality-engine-lsp::jnumber summary "intraViolations" nil)
                   "STA report should count HD>1 intra-sequence violations"))
-  (assert-error (lambda () (machine-from-json (sta-fixture :life-safety t :clean nil)))
-                "life-safety machine with STA violation should be rejected")
+  ;; Strict-STA must be opted in explicitly — same convention as
+  ;; MachineLoader.loadFromJSON({strictSta:true}) on AI and
+  ;; load_machine_from_json_string(.., LoadOptions{strictSta:true}) on CPP.
+  (assert-error (lambda () (machine-from-json (sta-fixture :life-safety t :clean nil) nil :strict-sta t))
+                "life-safety machine with STA violation should be rejected when strict-sta is on")
+  (assert-true (machine-from-json (sta-fixture :life-safety t :clean nil))
+               "life-safety machine with STA violation loads when strict-sta is off (AI/CPP parity default)")
   (assert-true (machine-from-json (sta-fixture :life-safety t :clean t))
                "clean life-safety machine should load")
   (assert-true (machine-from-json (sta-fixture :life-safety nil :clean nil))
@@ -631,6 +821,150 @@
     (assert-true (and (find "temp" ingested-mappings :test #'string=)
                        (find "humid" ingested-mappings :test #'string=))
                  "both fan-out mappings dispatched"))
+
+  ;; ── Cross-runtime parity (AI + C++ + LSP) ─────────────────────────────
+  ;; Skipped automatically when the AI corpus directory isn't sibling-located
+  ;; (e.g. CI runs that haven't checked out RealityEngine_AI).
+  (cond
+    ((null +ai-machines-dir+)
+     (format t "~&[parity] skipping — RealityEngine_AI/examples/machines not found alongside RealityEngine_LSP~%"))
+    (t
+     (let* ((result (walk-corpus-for-envelopes +ai-machines-dir+))
+            (machines  (getf result :machines))
+            (sequences (getf result :sequences))
+            (outputs   (getf result :outputs))
+            (envelopes (getf result :envelopes))
+            (failures  (getf result :failures)))
+       (when failures
+         (format *error-output* "~&[parity] envelope-dispatch failures (first 10):~%")
+         (dolist (f (subseq failures 0 (min 10 (length failures))))
+           (format *error-output* "  - ~a~%" f)))
+       (assert-equal nil failures "AiTriggerDispatch parity — corpus walk must produce no failures")
+       ;; Counter parity — same numbers reported by:
+       ;;   RealityEngine_AI  AiTriggerDispatch.test.ts          (jest)
+       ;;   RealityEngine_CPP e2e_ai_trigger_dispatch            (C++ exec)
+       (format t "~&[parity] LSP walked corpus: machines=~a sequences=~a outputs=~a envelopes=~a (AI/CPP target: 895/4480/3586/3586)~%"
+               machines sequences outputs envelopes)
+       (assert-equal 895  machines  "AiTriggerDispatch parity — machinesWithTriggers != 895 (AI/CPP value)")
+       (assert-equal 4480 sequences "AiTriggerDispatch parity — inputSequencesRun  != 4480 (AI/CPP value)")
+       (assert-equal 3586 outputs   "AiTriggerDispatch parity — outputsProduced    != 3586 (AI/CPP value)")
+       (assert-equal 3586 envelopes "AiTriggerDispatch parity — envelopesResolved  != 3586 (AI/CPP value)"))
+
+     ;; AGX051 pin — urgent_maint resolves to aquaculture_predictive_maintenance_agent / RED / sla=900.
+     (let* ((m (reality-engine-lsp::load-machine-from-file
+                (merge-pathnames "AGX051_yuma-aqua-maintenance-forecaster.json" +ai-machines-dir+)))
+            (env (envelope-for m "agx-051-urgent-maint" '(1 0 0 0))))
+       (assert-true env                                                                "AGX051 urgent_maint: envelope unresolved")
+       (assert-equal "aquaculture_predictive_maintenance_agent"                        (reality-engine-lsp::jstring env "dispatchableAgent" "") "AGX051 urgent_maint: dispatch agent")
+       (assert-equal "agriculture-yuma-aqua-maintenance-forecaster-maintenance"        (reality-engine-lsp::jstring env "aiTrigger" "")        "AGX051 urgent_maint: aiTrigger")
+       (assert-equal "RED"                                                              (reality-engine-lsp::jstring env "ragStatusCode" "")    "AGX051 urgent_maint: ragStatusCode")
+       (assert-equal "error"                                                            (reality-engine-lsp::jstring env "processStatus" "")    "AGX051 urgent_maint: processStatus")
+       (assert-equal "agriculture-operations"                                           (reality-engine-lsp::jstring env "ownerTeam" "")        "AGX051 urgent_maint: ownerTeam")
+       (assert-equal 900                                                                (reality-engine-lsp::jget env "slaSeconds")             "AGX051 urgent_maint: slaSeconds != 900")
+       (let ((green (envelope-for m "agx-051-normal" '(0 0 0 1))))
+         (assert-true green                                                             "AGX051 normal: envelope unresolved")
+         (assert-equal "GREEN" (reality-engine-lsp::jstring green "ragStatusCode" "")   "AGX051 normal: ragStatusCode")))
+
+     ;; AGX055 pin — five sequences route to agriculture_yield_optimization_ai with matching RAG.
+     (let ((m (reality-engine-lsp::load-machine-from-file
+               (merge-pathnames "AGX055_yuma-facility-ai-synthesis-bridge.json" +ai-machines-dir+))))
+       (dolist (case '(("agx-055-aqua-urgent"     (1 0 0 0 0 0 0 0 0 0 0 0) "RED")
+                       ("agx-055-do-urgent"       (0 0 0 1 0 0 0 0 0 0 0 0) "RED")
+                       ("agx-055-climate-urgent"  (0 0 0 0 0 0 1 0 0 0 0 0) "RED")
+                       ("agx-055-safety-urgent"   (0 0 0 0 0 0 0 0 0 1 0 0) "RED")
+                       ("agx-055-facility-stable" (0 0 0 0 0 0 0 0 0 0 0 1) "GREEN")))
+         (let ((env (envelope-for m (first case) (second case))))
+           (assert-true env (format nil "AGX055 ~a: envelope unresolved" (first case)))
+           (assert-equal "agriculture_yield_optimization_ai"        (reality-engine-lsp::jstring env "dispatchableAgent" "") (format nil "AGX055 ~a: dispatchableAgent" (first case)))
+           (assert-equal "ag-yield-optimization-ai-yuma-facility-bridge" (reality-engine-lsp::jstring env "aiTrigger" "")     (format nil "AGX055 ~a: aiTrigger" (first case)))
+           (assert-equal (third case)                                (reality-engine-lsp::jstring env "ragStatusCode" "")     (format nil "AGX055 ~a: ragStatusCode" (first case)))
+           (assert-equal "agriculture-operations"                   (reality-engine-lsp::jstring env "ownerTeam" "")         (format nil "AGX055 ~a: ownerTeam" (first case))))))
+
+     ;; Bridge perceptual contract — AGX055.output == AgYieldOptimizationAI.input == length 12.
+     (let* ((bridge-root (reality-engine-lsp::parse-json (reality-engine-lsp::safe-read-file (namestring (merge-pathnames "AGX055_yuma-facility-ai-synthesis-bridge.json" +ai-machines-dir+)))))
+            (yield-root  (reality-engine-lsp::parse-json (reality-engine-lsp::safe-read-file (namestring (merge-pathnames "AgYieldOptimizationAI.json"                 +ai-machines-dir+)))))
+            (bridge-out (reality-engine-lsp::jget (reality-engine-lsp::jget (reality-engine-lsp::jget bridge-root "machine") "perceptualMapping") "output"))
+            (yield-in   (reality-engine-lsp::jget (reality-engine-lsp::jget (reality-engine-lsp::jget yield-root "machine") "perceptualMapping") "input")))
+       (assert-equal (reality-engine-lsp::jnumber bridge-out "offset" nil) (reality-engine-lsp::jnumber yield-in "offset" nil) "bridge contract — output.offset != yield input.offset")
+       (assert-equal (reality-engine-lsp::jnumber bridge-out "length" nil) (reality-engine-lsp::jnumber yield-in "length" nil) "bridge contract — output.length != yield input.length")
+       (assert-equal 12 (reality-engine-lsp::jnumber bridge-out "length" nil)                                                   "bridge contract — length != 12"))
+
+     ;; Yuma cascade — 3-tick AGX051 escalation, AGX055 fires AQUA_URGENT, [3959]=1.
+     (let* ((state (cascade-state))
+            (agx051-id (reality-engine-lsp::machine-id (gethash "machine-AGX051_yuma-aqua-maintenance-forecaster"      (reality-engine-lsp::reality-state-machines state))))
+            (agx055-id (reality-engine-lsp::machine-id (gethash "machine-AGX055_yuma-facility-ai-synthesis-bridge"     (reality-engine-lsp::reality-state-machines state))))
+            (yield-id  (reality-engine-lsp::machine-id (gethash "machine-AgYieldOptimizationAI"                        (reality-engine-lsp::reality-state-machines state))))
+            (m051-final nil))
+       ;; Stage 1 — 3 ticks of escalation
+       (dolist (tick +tier1-urgent-ticks+)
+         (let* ((step (reality-engine-lsp::process-perceptual-input
+                       state (stage1-input state tick)
+                       :include-machine-results t :include-perceptual-space t))
+                (batch (reality-engine-lsp::jget step "mergeBatch")))
+           (let ((m051 (find-merge-by-machine batch agx051-id))
+                 (m055 (find-merge-by-machine batch agx055-id)))
+             (when m051 (setf m051-final m051))
+             (assert-equal nil m055 "stage 1 tick: AGX055 must not fire before tier-1 outputs propagate"))))
+       (assert-true m051-final "stage 1: AGX051 never fired URGENT_MAINT across 3-tick escalation")
+       (when m051-final
+         (assert-equal "agx-051-urgent-maint" (reality-engine-lsp::jstring m051-final "sequenceId" "") "AGX051 sequenceId")
+         (assert-equal '(1 0 0 0) (reality-engine-lsp::numbers-from-json (reality-engine-lsp::jget m051-final "values")) "AGX051 values != URGENT_MAINT one-hot")
+         (let ((gov (reality-engine-lsp::jget m051-final "governance")))
+           (assert-equal "RED"   (reality-engine-lsp::jstring gov "ragStatusCode" "") "AGX051 gov.rag")
+           (assert-equal 900     (reality-engine-lsp::jnumber gov "slaSeconds" nil)   "AGX051 gov.sla != 900")))
+
+       ;; Stage 2 — carry-forward perceptual space, zero tier-1 sensors, AGX055 fires
+       (let* ((stage2 (copy-list (reality-engine-lsp::reality-state-perceptual-space state)))
+              (_ (zero-region stage2 40 4))  (_ (zero-region stage2 84 4))
+              (_ (zero-region stage2 184 4)) (_ (zero-region stage2 228 4))
+              (s2 (reality-engine-lsp::process-perceptual-input
+                   state stage2 :include-machine-results t :include-perceptual-space t))
+              (batch2 (reality-engine-lsp::jget s2 "mergeBatch"))
+              (m055 (find-merge-by-machine batch2 agx055-id)))
+         (declare (ignore _))
+         (assert-true m055 "stage 2: AGX055 did not fire — bridge contract broken")
+         (when m055
+           (assert-equal "agx-055-aqua-urgent" (reality-engine-lsp::jstring m055 "sequenceId" "") "AGX055 sequenceId")
+           (assert-equal '(1 0 0 0 0 0 0 0 0 0 0 0) (reality-engine-lsp::numbers-from-json (reality-engine-lsp::jget m055 "values")) "AGX055 values != AQUA_URGENT one-hot")
+           (let ((gov (reality-engine-lsp::jget m055 "governance")))
+             (assert-equal "RED" (reality-engine-lsp::jstring gov "ragStatusCode" "") "AGX055 gov.rag")
+             (assert-equal 600   (reality-engine-lsp::jnumber gov "slaSeconds" nil)   "AGX055 gov.sla != 600")))
+         (assert-equal nil (find-merge-by-machine batch2 yield-id) "stage 2: AgYieldOptimizationAI fired before AGX055 projection landed"))
+
+       ;; Stage 3 — projection landing: perceptualSpace[3959]=1, [3960:3971]=0
+       (let* ((stage3 (copy-list (reality-engine-lsp::reality-state-perceptual-space state)))
+              (_ (zero-region stage3 40 4))  (_ (zero-region stage3 84 4))
+              (_ (zero-region stage3 184 4)) (_ (zero-region stage3 228 4))
+              (_ (zero-region stage3 256 16)))
+         (declare (ignore _))
+         (assert-true (>= (length stage3) 3971) "stage 3: perceptualSpace not grown to 3971")
+         (assert-equal 1 (nth 3959 stage3) "stage 3: AQUA_URGENT bit at [3959] missing")
+         (loop for i from 3960 below 3971 do
+               (assert-equal 0 (nth i stage3) (format nil "stage 3: stray bit at [~a] — one-hot projection violated" i)))
+         (reality-engine-lsp::process-perceptual-input state stage3
+                                                       :include-machine-results t :include-perceptual-space t)))
+
+     ;; Stable path — all-NORMAL inputs → AGX055 FACILITY_STABLE / GREEN
+     (let* ((state (cascade-state))
+            (agx055-id (reality-engine-lsp::machine-id (gethash "machine-AGX055_yuma-facility-ai-synthesis-bridge" (reality-engine-lsp::reality-state-machines state))))
+            (input (let ((v (make-list (reality-engine-lsp::reality-state-dimension state) :initial-element 0.0d0)))
+                     (loop for x in +tier1-normal-input+ for i from 40  do (setf (nth i v) x))
+                     (loop for x in +tier1-normal-input+ for i from 84  do (setf (nth i v) x))
+                     (loop for x in +tier1-normal-input+ for i from 184 do (setf (nth i v) x))
+                     (loop for x in +tier1-normal-input+ for i from 228 do (setf (nth i v) x))
+                     v)))
+       (reality-engine-lsp::process-perceptual-input state input :include-machine-results t :include-perceptual-space t)
+       (let* ((stage2 (copy-list (reality-engine-lsp::reality-state-perceptual-space state)))
+              (_ (zero-region stage2 40 4))  (_ (zero-region stage2 84 4))
+              (_ (zero-region stage2 184 4)) (_ (zero-region stage2 228 4))
+              (s2 (reality-engine-lsp::process-perceptual-input state stage2 :include-machine-results t :include-perceptual-space t))
+              (m055 (find-merge-by-machine (reality-engine-lsp::jget s2 "mergeBatch") agx055-id)))
+         (declare (ignore _))
+         (assert-true m055 "stable path: AGX055 did not fire FACILITY_STABLE")
+         (when m055
+           (assert-equal "agx-055-facility-stable" (reality-engine-lsp::jstring m055 "sequenceId" "") "stable path: sequenceId")
+           (assert-equal '(0 0 0 0 0 0 0 0 0 0 0 1) (reality-engine-lsp::numbers-from-json (reality-engine-lsp::jget m055 "values")) "stable path: values != FACILITY_STABLE one-hot")
+           (assert-equal "GREEN" (reality-engine-lsp::jstring (reality-engine-lsp::jget m055 "governance") "ragStatusCode" "") "stable path: rag != GREEN"))))))
 
   (format t "~&RealityEngine_LSP core tests passed.~%")
   t)

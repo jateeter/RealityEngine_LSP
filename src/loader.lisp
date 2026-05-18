@@ -194,7 +194,12 @@
                                       (when (and bits (member (truncate bits) '(1 2 4 8)))
                                         (truncate bits))))))
 
-(defun machine-from-json (json &optional forced-id &key (strict-sta t))
+;; STA strictness defaults to NIL — matches AI's MachineLoader.loadFromJSON
+;; (`options.strictSta` opt-in) and C++'s `LoadOptions{strictSta=false}` so
+;; the same machine corpus loads identically across all three runtimes.
+;; Callers that need the hot-path STA gate (patient-safety hosts, replay
+;; harnesses) pass `:strict-sta t` explicitly.
+(defun machine-from-json (json &optional forced-id &key (strict-sta nil))
   (when strict-sta
     (assert-sta-for-life-safety json))
   (let* ((root (if (jobject-p (jget json "machine")) (jget json "machine") json))
