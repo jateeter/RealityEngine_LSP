@@ -798,57 +798,96 @@ dispatch_triggers and TS Dispatcher.onStep: drop ops without governance
          "timestamp" (now-ms))))
 
 (defun carekit-status-json (state)
-  (obj "bridgeId" (perception-state-carekit-bridge-id state)
-       "defaultSourceMappingId" (perception-state-carekit-default-source-mapping-id state)
-       "tokenRequired" (json-bool (perception-state-carekit-bridge-token state))
-       "statusEndpoint" "/api/integrations/carekit/status"
-       "ingestEndpoint" "/api/integrations/carekit/ingest"))
+  (let ((token-set (perception-state-carekit-bridge-token state)))
+    (obj "bridgeId" (perception-state-carekit-bridge-id state)
+         "defaultSourceMappingId" (perception-state-carekit-default-source-mapping-id state)
+         "tokenConfigured" (json-bool token-set)
+         "tokenRequired" (json-bool token-set)
+         "nativeAppRequired" t
+         "nativeWorkOutsideRepo" t
+         "statusEndpoint" "/api/integrations/carekit/status"
+         "ingestEndpoint" "/api/integrations/carekit/ingest"
+         "contract" (obj "transport" "https"
+                         "singleSample" (arr "bridgeId" "sampleType" "sourceMappingId" "values")
+                         "batchSamples" (arr "bridgeId" "samples[]")
+                         "auth" (if token-set "bridgeToken" "external-transport")))))
 
 (defun ingest-carekit-one (state body)
-  (let* ((sample-type (or (jstring body "sampleType" nil) "task-event"))
-         (mapping-id (or (jstring body "sourceMappingId" nil)
-                         (perception-state-carekit-default-source-mapping-id state)))
-         (mapping (source-mapping-by-id state mapping-id))
-         (values (numbers-from-json (or (jget body "values") (jget body "vector") (arr))))
-         (sensor-id (or (jstring body "sensorId" nil)
-                        (render-sensor-template
-                         (or (jstring mapping "sensorIdTemplate" nil) "carekit.{sampleType}")
-                         (list (cons "sampleType" sample-type)
-                               (cons "taskId" (or (jstring body "taskId" nil) sample-type))
-                               (cons "carePlanId" (or (jstring body "carePlanId" nil) "care-plan"))))))
-         (region (make-region-from-json (or (jget mapping "region")
-                                            (obj "offset" 4310 "length" (length values)))))
-         (ttl-ms (or (jnumber mapping "ttlMs" nil) 900000))
-         (source (commit-signal-source state
-                                       sensor-id
-                                       (or (jstring body "name" nil) (format nil "carekit:~a" sample-type))
-                                       region
-                                       values
-                                       ttl-ms)))
-    (obj "sourceMappingId" mapping-id
-         "sampleType" sample-type
-         "taskId" (or (jstring body "taskId" nil) +json-null+)
-         "carePlanId" (or (jstring body "carePlanId" nil) +json-null+)
-         "sensorId" sensor-id
-         "source" (source-json source))))
+  (handler-case
+    (let* ((bridge-id (or (jstring body "bridgeId" nil)
+                          (perception-state-carekit-bridge-id state)))
+           (sample-type (or (jstring body "sampleType" nil)
+                            (jstring body "type" nil)
+                            "task-event"))
+           (mapping-id (or (jstring body "sourceMappingId" nil)
+                           (perception-state-carekit-default-source-mapping-id state)))
+           (mapping (source-mapping-by-id state mapping-id))
+           (values (numbers-from-json (or (jget body "values") (jget body "vector") (arr))))
+           (sensor-id (or (jstring body "sensorId" nil)
+                          (render-sensor-template
+                           (or (jstring mapping "sensorIdTemplate" nil) "carekit.{sampleType}")
+                           (list (cons "bridgeId" bridge-id)
+                                 (cons "sampleType" sample-type)
+                                 (cons "type" sample-type)
+                                 (cons "taskId" (or (jstring body "taskId" nil) sample-type))
+                                 (cons "carePlanId" (or (jstring body "carePlanId" nil) "care-plan"))))))
+           (region (make-region-from-json (or (jget mapping "region")
+                                              (obj "offset" 4310 "length" (length values)))))
+           (ttl-ms (or (jnumber mapping "ttlMs" nil) 900000))
+           (source (commit-signal-source state
+                                         sensor-id
+                                         (or (jstring body "name" nil) (format nil "carekit:~a" sample-type))
+                                         region
+                                         values
+                                         ttl-ms)))
+      (obj "success" t
+           "sourceMappingId" mapping-id
+           "sampleType" sample-type
+           "taskId" (or (jstring body "taskId" nil) +json-null+)
+           "carePlanId" (or (jstring body "carePlanId" nil) +json-null+)
+           "sensorId" sensor-id
+           "source" (source-json source)))
+    (error (condition)
+      (obj "success" +json-false+
+           "sampleType" (or (jstring body "sampleType" nil) (jstring body "type" nil) "task-event")
+           "taskId" (or (jstring body "taskId" nil) +json-null+)
+           "carePlanId" (or (jstring body "carePlanId" nil) +json-null+)
+           "reason" (princ-to-string condition)))))
 
 (defun ingest-carekit (state body)
+  ;; Returns (cons http-status body-hash) so the route handler can set the correct status.
   (let ((required-token (perception-state-carekit-bridge-token state)))
     (when (and required-token
                (not (string= required-token (or (jstring body "token" nil)
                                                 (jstring body "bridgeToken" nil)
                                                 ""))))
-      (return-from ingest-carekit (obj "success" +json-false+ "error" "invalid CareKit bridge token"))))
-  (let ((results nil))
+      (return-from ingest-carekit
+        (cons 401 (obj "success" +json-false+ "error" "invalid CareKit bridge token")))))
+  (let ((results nil)
+        (all-ok t)
+        (reserved-keys '("samples" "bridgeToken" "token")))
     (if (and (not (eq (jget body "samples" :missing) :missing))
              (jarray-p (jget body "samples")))
         (dolist (sample (jarray-list (jget body "samples")))
-          (push (ingest-carekit-one state sample) results))
-        (push (ingest-carekit-one state body) results))
-    (obj "success" t
-         "bridgeId" (perception-state-carekit-bridge-id state)
-         "results" (vectorize (nreverse results))
-         "timestamp" (now-ms))))
+          ;; Merge top-level fields into sample (sample keys win); strip reserved keys.
+          (let ((merged (make-hash-table :test #'equal)))
+            (maphash (lambda (k v)
+                       (unless (member k reserved-keys :test #'string=)
+                         (setf (gethash k merged) v)))
+                     body)
+            (when (hash-table-p* sample)
+              (maphash (lambda (k v) (setf (gethash k merged) v)) sample))
+            (let ((r (ingest-carekit-one state merged)))
+              (unless (eq (gethash "success" r) t) (setf all-ok nil))
+              (push r results))))
+        (let ((r (ingest-carekit-one state body)))
+          (unless (eq (gethash "success" r) t) (setf all-ok nil))
+          (push r results)))
+    (cons (if all-ok 200 207)
+          (obj "success" (json-bool all-ok)
+               "bridgeId" (perception-state-carekit-bridge-id state)
+               "results" (vectorize (nreverse results))
+               "timestamp" (now-ms)))))
 
 (defun ollama-status-json (state &optional (probe t))
   (let ((reachable nil)
@@ -1091,10 +1130,12 @@ dispatch_triggers and TS Dispatcher.onStep: drop ops without governance
                                                           (json-response (actor-ask actor #'carekit-status-json))))
    (make-route "POST" "/api/integrations/carekit/ingest" (lambda (_ body query)
                                                            (declare (ignore _ query))
-                                                           (json-response
-                                                            (actor-ask actor
-                                                                       (lambda (state)
-                                                                         (ingest-carekit state body))))))
+                                                           (let ((result (actor-ask actor
+                                                                                    (lambda (state)
+                                                                                      (ingest-carekit state body)))))
+                                                             (if (consp result)
+                                                                 (json-response (cdr result) (car result))
+                                                                 (json-response result)))))
    (make-route "GET" "/api/integrations/localai/status" (lambda (_ body query)
                                                          (declare (ignore _ body query))
                                                          (json-response (actor-ask actor #'localai-status-json))))
