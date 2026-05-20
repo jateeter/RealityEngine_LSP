@@ -363,8 +363,7 @@ Per-sequence boundaries live in metadata.segments for UI display."
   state)
 
 (defun source-mapping-by-id (state id)
-  (or (and id (gethash id (perception-state-source-mappings state)))
-      (gethash "agent-completion-risk" (perception-state-source-mappings state))))
+  (when id (gethash id (perception-state-source-mappings state))))
 
 (defun replace-all-substrings (value token replacement)
   (let ((out value)
@@ -713,40 +712,67 @@ dispatch_triggers and TS Dispatcher.onStep: drop ops without governance
     (error () nil)))
 
 (defun ingest-completion (state body)
+  ;; Returns (cons http-status body-hash) — route handler unpacks it.
   (let* ((provider (or (jstring body "provider" nil) "agent"))
-         (agent (or (jstring body "agent" nil) provider))
-         (mapping-id (or (jstring body "sourceMappingId" nil) "agent-completion-risk"))
-         (mapping (source-mapping-by-id state mapping-id))
-         (values (or (jget body "values")
-                     (jget body "vector")
-                     (and (jobject-p (jget body "completion"))
-                          (jget (jget body "completion") "values"))))
-         (numbers (numbers-from-json values))
-         (template (or (jstring mapping "sensorIdTemplate" nil) "agent.{agent}.completion"))
-         (sensor-id (or (jstring body "sensorId" nil)
-                        (render-sensor-template template
-                                                (list (cons "provider" provider)
-                                                      (cons "agent" agent)))))
-         (region (make-region-from-json (or (jget mapping "region")
-                                            (obj "offset" 4200 "length" (length numbers)))))
-         (ttl-ms (or (jnumber mapping "ttlMs" nil) 300000))
-         (source (commit-signal-source state
-                                       sensor-id
-                                       (or (jstring body "name" nil)
-                                           (format nil "agent:~a/~a/completion" provider agent))
-                                       region
-                                       numbers
-                                       ttl-ms)))
-    (obj "success" t
-         "completion" (obj "provider" provider
-                           "agent" agent
-                           "sourceMappingId" mapping-id
-                           "completionId" (or (jstring body "completionId" nil)
-                                              (jstring body "id" nil)
-                                              +json-null+)
-                           "correlationId" (or (jstring body "correlationId" nil) +json-null+))
-         "source" (source-json source)
-         "timestamp" (now-ms))))
+         (agent (or (jstring body "agent" nil)
+                    (jstring body "agentId" nil)
+                    provider))
+         ;; sourceMappingId / mappingId alias — empty string means no registry lookup.
+         (mapping-id-raw (or (jstring body "sourceMappingId" nil)
+                             (jstring body "mappingId" nil)))
+         (mapping (when mapping-id-raw (source-mapping-by-id state mapping-id-raw))))
+    ;; 404 when an explicit ID was given but is not in the registry — matches CPP / AI.
+    (when (and mapping-id-raw (not mapping))
+      (return-from ingest-completion
+        (cons 404 (obj "error" (format nil "Unknown sourceMappingId \"~a\"" mapping-id-raw)))))
+    ;; Inline sourceMapping merged on top of registry entry — matches CPP / AI.
+    (when (jobject-p (jget body "sourceMapping"))
+      (unless mapping (setf mapping (make-hash-table :test #'equal)))
+      (maphash (lambda (k v) (setf (gethash k mapping) v))
+               (jget body "sourceMapping")))
+    (let* ((mapping-id (or mapping-id-raw ""))
+           (values (or (jget body "values")
+                       (jget body "vector")
+                       (and (jobject-p (jget body "completion"))
+                            (jget (jget body "completion") "values"))))
+           (numbers (numbers-from-json values))
+           (template (or (and mapping (jstring mapping "sensorIdTemplate" nil))
+                         "agent.{agent}.completion"))
+           (sensor-id (or (jstring body "sensorId" nil)
+                          (render-sensor-template
+                           template
+                           (list (cons "provider" provider)
+                                 (cons "agent" agent)
+                                 (cons "correlationId" (or (jstring body "correlationId" nil) ""))
+                                 (cons "envelopeId"    (or (jstring body "envelopeId"    nil) ""))))))
+           (region (make-region-from-json
+                    (or (and mapping (jget mapping "region"))
+                        (obj "offset" 4200 "length" (length numbers)))))
+           (ttl-ms (or (and mapping (jnumber mapping "ttlMs" nil)) 300000))
+           (name (or (jstring body "name" nil)
+                     (and mapping (jstring mapping "name" nil))
+                     (format nil "agent:~a/~a/completion" provider agent)))
+           (source (commit-signal-source state sensor-id name region numbers ttl-ms))
+           (received-at (now-ms))
+           ;; Build a signal result matching the shape ingest-signal-body returns,
+           ;; so callers see "signal" not "source" — parity with CPP / AI.
+           (signal-result (obj "success" t
+                               "sensorId" sensor-id
+                               "source" (source-json source)
+                               "push" +json-null+
+                               "timestamp" received-at)))
+      (cons 200 (obj "success" t
+                     "completion" (obj "provider" provider
+                                       "agent" agent
+                                       "sensorId" sensor-id
+                                       "sourceMappingId" mapping-id
+                                       "correlationId" (or (jstring body "correlationId" nil) +json-null+)
+                                       "envelopeId"    (or (jstring body "envelopeId"    nil) +json-null+)
+                                       "completionId"  (or (jstring body "completionId" nil)
+                                                           (jstring body "id" nil)
+                                                           +json-null+)
+                                       "receivedAt" received-at)
+                     "signal" signal-result)))))
 
 (defun healthkit-status-json (state)
   (obj "bridgeId" (perception-state-healthkit-bridge-id state)
@@ -1072,10 +1098,12 @@ dispatch_triggers and TS Dispatcher.onStep: drop ops without governance
                                                   (json-response (actor-ask actor #'integrations-status-json))))
    (make-route "POST" "/api/integrations/completions" (lambda (_ body query)
                                                         (declare (ignore _ query))
-                                                        (json-response
-                                                         (actor-ask actor
-                                                                    (lambda (state)
-                                                                      (ingest-completion state body))))))
+                                                        (let ((result (actor-ask actor
+                                                                                 (lambda (state)
+                                                                                   (ingest-completion state body)))))
+                                                          (if (consp result)
+                                                              (json-response (cdr result) (car result))
+                                                              (json-response result)))))
    (make-route "GET" "/api/triggers/status" (lambda (_ body query)
                                               (declare (ignore _ body query))
                                               (json-response (actor-ask actor #'triggers-status-json))))
