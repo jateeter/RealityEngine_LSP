@@ -355,28 +355,57 @@ holding the client lock for any meaningful time."
   "Default broker target — points at the Lateral Edge sensor mesh that
 the live yuma demonstration runs against, so operators get a sensible
 default without configuration.  Setting MQTT_BROKER_HOST=\"\" (empty
-string) or MQTT_DISABLED=1 explicitly opts out.  Bridge still requires
-MQTT_MAPPINGS_FILE / MQTT_MAPPINGS_JSON before it actually boots.")
+string) or MQTT_BROKER_URL=\"\" or MQTT_DISABLED=1 explicitly opts out.
+Bridge still requires MQTT_MAPPINGS_FILE / MQTT_MAPPINGS_JSON before it
+actually boots.")
+
+(defun parse-mqtt-broker-url (url)
+  "Parse an mqtt:// or mqtts:// URL into (values host port).
+Returns (values nil nil) on parse failure."
+  (let ((stripped
+         (cond
+           ((and (>= (length url) 7) (string= (subseq url 0 7) "mqtt://"))
+            (subseq url 7))
+           ((and (>= (length url) 8) (string= (subseq url 0 8) "mqtts://"))
+            (subseq url 8))
+           (t nil))))
+    (if (null stripped)
+        (values nil nil)
+        (let ((colon (position #\: stripped :from-end t)))
+          (if colon
+              (let ((host (subseq stripped 0 colon))
+                    (port-str (subseq stripped (1+ colon))))
+                (handler-case
+                    (values host (parse-integer port-str))
+                  (error () (values host 1883))))
+              (values stripped 1883))))))
 
 (defun make-mqtt-client-from-env ()
   "Convenience: build an mqtt-client-config from the canonical MQTT_* env
 vars.  Returns NIL when the operator has explicitly opted out
-(MQTT_BROKER_HOST='' or MQTT_DISABLED=1).  Otherwise defaults to the
-shared yuma.lateraledge.cloud broker."
+(MQTT_BROKER_URL='', MQTT_BROKER_HOST='', or MQTT_DISABLED=1).
+MQTT_BROKER_URL (mqtt://host:port) takes priority over MQTT_BROKER_HOST +
+MQTT_BROKER_PORT.  Otherwise defaults to the shared yuma broker.
+MQTT_RECONNECT_MS controls the reconnect delay (default 2000 ms)."
   (let ((disabled (env "MQTT_DISABLED" "0")))
     (when (member disabled '("1" "true" "TRUE" "yes") :test #'string=)
       (return-from make-mqtt-client-from-env nil)))
-  (let ((host-env (uiop:getenv "MQTT_BROKER_HOST")))
-    (cond
-      ((and host-env (string= host-env ""))
-       nil)
-      (t
-       (let ((host (or host-env +default-mqtt-broker-host+)))
-         (make-mqtt-client-config
-          :broker-host host
-          :broker-port (env-int "MQTT_BROKER_PORT" 1883)
-          :client-id (env "MQTT_CLIENT_ID" "reality-engine-pe-lsp")
-          :username (env "MQTT_USERNAME" nil)
-          :password (env "MQTT_PASSWORD" nil)
-          :keepalive-sec (env-int "MQTT_KEEPALIVE" 60)
-          :clean-session-p t))))))
+  (let ((url-env (uiop:getenv "MQTT_BROKER_URL")))
+    (when (and url-env (string= url-env ""))
+      (return-from make-mqtt-client-from-env nil))
+    (multiple-value-bind (url-host url-port)
+        (if url-env (parse-mqtt-broker-url url-env) (values nil nil))
+      (let ((host-env (uiop:getenv "MQTT_BROKER_HOST")))
+        (when (and (null url-host) host-env (string= host-env ""))
+          (return-from make-mqtt-client-from-env nil))
+        (let ((host (or url-host host-env +default-mqtt-broker-host+))
+              (port (or url-port (env-int "MQTT_BROKER_PORT" 1883))))
+          (make-mqtt-client-config
+           :broker-host host
+           :broker-port port
+           :client-id (env "MQTT_CLIENT_ID" "reality-engine-pe-lsp")
+           :username (env "MQTT_USERNAME" nil)
+           :password (env "MQTT_PASSWORD" nil)
+           :keepalive-sec (env-int "MQTT_KEEPALIVE" 60)
+           :reconnect-delay-ms (env-int "MQTT_RECONNECT_MS" 2000)
+           :clean-session-p t))))))

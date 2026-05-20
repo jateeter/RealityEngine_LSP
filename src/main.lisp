@@ -1,8 +1,12 @@
 (in-package #:reality-engine-lsp)
 
 (defun main ()
-  (let ((mode (or (first uiop:*command-line-arguments*) "both")))
+  (let* ((args uiop:*command-line-arguments*)
+         (mode (or (first args) "both")))
     (cond
+      ;; CLI shim: pe <command> [flags] — mirrors reality_engine_cli pe in _CPP.
+      ((string= mode "pe")
+       (cli-main (rest args)))
       ((string= mode "reality")
        (start-reality-from-environment)
        (loop (sleep 3600)))

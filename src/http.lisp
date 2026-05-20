@@ -69,13 +69,14 @@
         (cons route grouped-routes)
         route)))
 
-(defun start-http-server (port routes &key (name "reality-engine-lsp"))
+(defun start-http-server (port routes &key (name "reality-engine-lsp") extra-dispatchers)
   (declare (ignore name))
   (setf routes (flatten-routes routes))
   (setf hunchentoot:*dispatch-table*
-        (list (hunchentoot:create-prefix-dispatcher
-               "/"
-               (lambda () (dispatch-route routes)))))
+        (append extra-dispatchers
+                (list (hunchentoot:create-prefix-dispatcher
+                       "/"
+                       (lambda () (dispatch-route routes))))))
   (let ((acceptor (make-instance 'hunchentoot:easy-acceptor :port port)))
     (hunchentoot:start acceptor)
     acceptor))

@@ -6,7 +6,8 @@
   sensor-id last-value last-updated ttl-ms)
 
 (defstruct perception-engine
-  dimension sources match-algorithm last-push auto-running-p auto-interval-ms)
+  dimension sources match-algorithm last-push auto-running-p auto-interval-ms
+  persistent-vector global-step)
 
 (defun make-perception-engine-state (dimension)
   (make-perception-engine :dimension dimension
@@ -14,7 +15,9 @@
                           :match-algorithm "gte"
                           :last-push nil
                           :auto-running-p nil
-                          :auto-interval-ms 1000))
+                          :auto-interval-ms 1000
+                          :persistent-vector (make-list dimension :initial-element 0.0d0)
+                          :global-step 0))
 
 (defun sensor-stale-p (source &optional (now (now-ms)))
   "Return true when a sensor source's last-updated timestamp is older than
@@ -136,9 +139,16 @@ machines downstream don't keep reading a value that was supposed to expire."
                 do (setf (nth i values) value))))
     values))
 
+(defun update-from-perceptual-space (engine ps)
+  (let ((pv (perception-engine-persistent-vector engine))
+        (dim (perception-engine-dimension engine)))
+    (loop for i from 0 below dim do
+      (setf (nth i pv) (coerce (or (nth i ps) 0) 'double-float)))))
+
 (defun assemble-perception-vector (engine)
   (let* ((dimension (perception-engine-dimension engine))
-         (assembled (make-list dimension :initial-element 0.0d0)))
+         (assembled (copy-list (or (perception-engine-persistent-vector engine)
+                                   (make-list dimension :initial-element 0.0d0)))))
     (maphash
      (lambda (_ source)
        (declare (ignore _))
@@ -153,6 +163,7 @@ machines downstream don't keep reading a value that was supposed to expire."
 (defun perception-state-json (engine)
   (obj "dimension" (perception-engine-dimension engine)
        "matchAlgorithm" (perception-engine-match-algorithm engine)
+       "globalStep" (or (perception-engine-global-step engine) 0)
        "sources" (vectorize (mapcar #'source-json (object-values (perception-engine-sources engine))))
        "lastPush" (or (perception-engine-last-push engine) +json-null+)
        "autoRunning" (json-bool (perception-engine-auto-running-p engine))

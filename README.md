@@ -104,6 +104,7 @@ Implemented endpoints intentionally mirror the AI and CPP services:
 - Perceptual simulation state/history/step/reset
 - Perception service health/state/source CRUD/sensor update/push/auto controls
 - localAI bridge status/catalog/invoke/bootstrap/signal endpoints
+- ACP/OpenClaw xACP status and no-wait dispatch handoff endpoints
 - **MQTT bridge** — `/api/mqtt/status`, `/api/mqtt/mappings` (GET + PUT)
 - **Cross-runtime Prometheus** — `/api/metrics` text exposition stamped
   with `runtime="lsp"` on every line
@@ -132,6 +133,11 @@ flags):
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible Responses API base URL |
 | `OPENAI_MODEL` | `gpt-5` | Default OpenAI model for PE-controlled dispatch |
 | `OPENAI_COMPLETION_SOURCE_MAPPING_ID` | `agent-completion-risk` | Default source mapping for OpenAI completion commits |
+| `ACP_ENABLED` | `false` | Enable ACP/OpenClaw adapter metadata in PE status |
+| `ACP_COMMAND` / `OPENCLAW_ACP_COMMAND` | `openclaw acp` | External OpenClaw ACP command recorded in no-wait handoff receipts |
+| `ACP_GATEWAY_URL` / `OPENCLAW_GATEWAY_URL` | `ws://127.0.0.1:18789` | OpenClaw Gateway URL recorded for xACP handoff |
+| `ACP_SESSION_KEY` / `OPENCLAW_ACP_SESSION` | `agent:main:main` | OpenClaw Gateway session key for example xACP handoff |
+| `ACP_COMPLETION_SOURCE_MAPPING_ID` | `agent-completion-risk` | Default source mapping for ACP/OpenClaw completion commits |
 | `HEALTHKIT_BRIDGE_ID` | `healthkit-ios-bridge` | Expected Apple-platform HealthKit bridge identity |
 | `HEALTHKIT_DEFAULT_SOURCE_MAPPING_ID` | `healthkit-activity` | Default source mapping for HealthKit bridge ingest |
 | `HEALTHKIT_BRIDGE_TOKEN` | unset | Optional shared token required in HealthKit bridge ingest payloads |
@@ -145,7 +151,7 @@ flags):
 | `MQTT_MAPPINGS_JSON` | unset | Inline registry JSON |
 | `MQTT_ALLOW_REGION_OVERLAP` | `0` | Suppress overlap warnings when `1` |
 | `TRIGGERS_ENABLED` | `false` | Enable PE trigger envelope recording from RE `mergeBatch` results |
-| `TRIGGER_DISPATCH_MODE` | `dry-run` | Label for trigger dispatch target (`dry-run`, `graphql`, `openai`, `ollama`, `mcp`) |
+| `TRIGGER_DISPATCH_MODE` | `dry-run` | Label for trigger dispatch target (`dry-run`, `graphql`, `openai`, `ollama`, `acp`, `mcp`) |
 | `TRIGGER_GRAPHQL_URL` | `${LOCAL_AI_API_URL}/graphql` | localAIStack GraphQL target metadata for trigger envelopes |
 
 ## Compatibility Notes
