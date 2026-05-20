@@ -5,6 +5,7 @@
   integrations-config-path integrations-loaded-p integrations-load-error integrations source-mappings
   triggers-enabled-p trigger-dispatch-mode trigger-graphql-url envelopes-created dispatch-errors
   dropped-no-governance dropped-no-dispatch
+  machine-catalog machine-catalog-lock machine-catalog-refreshed-at
   dispatch-ledger dispatch-ledger-limit
   ollama-base-url ollama-model ollama-completion-source-mapping-id
   openai-base-url openai-model openai-completion-source-mapping-id openai-api-key
@@ -34,6 +35,9 @@
    :dispatch-errors 0
    :dropped-no-governance 0
    :dropped-no-dispatch 0
+   :machine-catalog (make-hash-table :test #'equal)
+   :machine-catalog-lock (bt:make-lock "machine-catalog")
+   :machine-catalog-refreshed-at 0
    :dispatch-ledger nil
    :dispatch-ledger-limit (env-int "TRIGGER_DISPATCH_LEDGER_LIMIT" 100)
    :ollama-base-url (trim-trailing-slashes (env "OLLAMA_BASE_URL" "http://localhost:11434"))
@@ -455,14 +459,18 @@ Per-sequence boundaries live in metadata.segments for UI display."
        "carekit" (carekit-status-json state)))
 
 (defun triggers-status-json (state)
-  (obj "enabled" (json-bool (perception-state-triggers-enabled-p state))
-       "mode" (perception-state-trigger-dispatch-mode state)
-       "graphqlUrl" (perception-state-trigger-graphql-url state)
-       "envelopesCreated" (perception-state-envelopes-created state)
-       "dispatchErrors" (perception-state-dispatch-errors state)
-       "droppedNoGovernance" (perception-state-dropped-no-governance state)
-       "droppedNoDispatch" (perception-state-dropped-no-dispatch state)
-       "ledgerSize" (length (perception-state-dispatch-ledger state))))
+  (let ((catalog-size (bt:with-lock-held ((perception-state-machine-catalog-lock state))
+                        (hash-table-count (perception-state-machine-catalog state)))))
+    (obj "enabled" (json-bool (perception-state-triggers-enabled-p state))
+         "mode" (perception-state-trigger-dispatch-mode state)
+         "graphqlUrl" (perception-state-trigger-graphql-url state)
+         "envelopesCreated" (perception-state-envelopes-created state)
+         "dispatchErrors" (perception-state-dispatch-errors state)
+         "droppedNoGovernance" (perception-state-dropped-no-governance state)
+         "droppedNoDispatch" (perception-state-dropped-no-dispatch state)
+         "machineCatalogSize" catalog-size
+         "machineCatalogRefreshedAt" (perception-state-machine-catalog-refreshed-at state)
+         "ledgerSize" (length (perception-state-dispatch-ledger state)))))
 
 (defun dispatch-record-json (record)
   record)
@@ -495,16 +503,55 @@ Per-sequence boundaries live in metadata.segments for UI display."
 ;;    TypeScript Dispatcher.onStep.  Drop rules and full envelope shape
 ;;    match both reference implementations exactly. ───────────────────────────
 
-(defun fetch-machine-for-dispatch (state machine-id)
-  "Fetch the full machine object from RE by id. Returns NIL on error or when
-the machine is absent — the caller treats NIL as a drop-no-dispatch signal."
+;; ── Machine catalog cache ─────────────────────────────────────────────────────
+;; Mirrors CPP machine_catalog_snapshot / TS machineCatalog + refreshMachineCatalog.
+;; The catalog is populated by a background thread; dispatch lookups are O(1)
+;; and never block the actor (push cycle) on a RE HTTP round-trip.
+
+(defun refresh-machine-catalog (state)
+  "Fetch /api/machines from RE and atomically replace the local catalog.
+Intended to be called from the background refresher thread only — never
+from the actor thread.  Soft-fails: existing catalog is preserved on error."
   (handler-case
-      (let* ((response (http-get-json (format nil "~a/api/machines/~a"
-                                              (perception-state-reality-url state)
-                                              machine-id)))
-             (machine (jget response "machine")))
-        (if (jobject-p machine) machine nil))
-    (error () nil)))
+      (let* ((response (http-get-json (format nil "~a/api/machines"
+                                              (perception-state-reality-url state))))
+             (machines (jarray-list (or (jget response "machines") (arr))))
+             (new-catalog (make-hash-table :test #'equal)))
+        (dolist (machine machines)
+          (let ((id (jstring machine "id" nil)))
+            (when (and id (not (string= id "")))
+              (setf (gethash id new-catalog) machine))))
+        (bt:with-lock-held ((perception-state-machine-catalog-lock state))
+          (setf (perception-state-machine-catalog state) new-catalog
+                (perception-state-machine-catalog-refreshed-at state) (now-ms)))
+        (length machines))
+    (error (condition)
+      (format *error-output* "~&[dispatch] machine catalog refresh failed: ~a~%" condition)
+      nil)))
+
+(defun get-cached-machine (state machine-id)
+  "O(1) thread-safe lookup of a machine from the local catalog.
+Returns NIL when the machine is absent or the catalog is still warming up."
+  (bt:with-lock-held ((perception-state-machine-catalog-lock state))
+    (gethash machine-id (perception-state-machine-catalog state))))
+
+(defun start-machine-catalog-refresher (state)
+  "Spawn a background thread that refreshes the machine catalog every 60 s.
+Fires an immediate best-effort fetch on startup so the catalog is warm before
+the first push cycle completes — mirrors TS: void refreshMachineCatalog();
+setInterval(refreshMachineCatalog, 60_000)."
+  (bt:make-thread
+   (lambda ()
+     (loop
+       (refresh-machine-catalog state)
+       (sleep 60)))
+   :name "machine-catalog-refresher"))
+
+(defun fetch-machine-for-dispatch (state machine-id)
+  "Return the cached machine record for machine-id, or NIL when absent.
+Never performs a blocking RE call — the catalog is maintained by the
+background refresher thread."
+  (get-cached-machine state machine-id))
 
 (defun ces-semantics-from-values (values)
   "Build outputVector.semantics: [{index, label}…] matching CPP / TS helpers."
@@ -1350,6 +1397,9 @@ startup — the PE still serves HTTP signals as a pure REST engine."
                                                    :localai-machine-dir localai-machine-dir))
          (actor (state-actor "perception-service" state)))
     (load-integrations-config state)
+    ;; Background machine catalog refresher — best-effort initial fetch + 60 s loop.
+    ;; Starts before HTTP so the catalog is warm before the first push cycle.
+    (start-machine-catalog-refresher state)
     ;; Boot the bridge after the actor is alive so the ingest closure can
     ;; tell-into it safely.  The bridge boot is fire-and-forget — if MQTT
     ;; isn't configured the PE still serves HTTP signals normally.
