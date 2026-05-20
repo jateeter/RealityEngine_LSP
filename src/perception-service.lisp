@@ -4,6 +4,7 @@
   engine reality-url localai-url localai-machine-dir push-records started-at
   integrations-config-path integrations-loaded-p integrations-load-error integrations source-mappings
   triggers-enabled-p trigger-dispatch-mode trigger-graphql-url envelopes-created dispatch-errors
+  dropped-no-governance dropped-no-dispatch
   dispatch-ledger dispatch-ledger-limit
   ollama-base-url ollama-model ollama-completion-source-mapping-id
   openai-base-url openai-model openai-completion-source-mapping-id openai-api-key
@@ -31,6 +32,8 @@
    :trigger-graphql-url (env "TRIGGER_GRAPHQL_URL" (format nil "~a/graphql" localai-url))
    :envelopes-created 0
    :dispatch-errors 0
+   :dropped-no-governance 0
+   :dropped-no-dispatch 0
    :dispatch-ledger nil
    :dispatch-ledger-limit (env-int "TRIGGER_DISPATCH_LEDGER_LIMIT" 100)
    :ollama-base-url (trim-trailing-slashes (env "OLLAMA_BASE_URL" "http://localhost:11434"))
@@ -457,6 +460,8 @@ Per-sequence boundaries live in metadata.segments for UI display."
        "graphqlUrl" (perception-state-trigger-graphql-url state)
        "envelopesCreated" (perception-state-envelopes-created state)
        "dispatchErrors" (perception-state-dispatch-errors state)
+       "droppedNoGovernance" (perception-state-dropped-no-governance state)
+       "droppedNoDispatch" (perception-state-dropped-no-dispatch state)
        "ledgerSize" (length (perception-state-dispatch-ledger state))))
 
 (defun dispatch-record-json (record)
@@ -486,68 +491,167 @@ Per-sequence boundaries live in metadata.segments for UI display."
     (setf (jget record "updatedAt") (now-ms))
     record))
 
-(defun operation-dispatch-target (operation metadata)
-  (or (and (jobject-p metadata) (jstring metadata "dispatchableAgent" nil))
-      (jstring (jget operation "governance") "ownerTeam" nil)
-      (jstring operation "machineId" "")))
+;; ── Dispatch helpers — wire-compatible with CPP dispatch_triggers /
+;;    TypeScript Dispatcher.onStep.  Drop rules and full envelope shape
+;;    match both reference implementations exactly. ───────────────────────────
 
-(defun operation-ai-trigger (operation metadata)
-  (or (and (jobject-p metadata) (jstring metadata "aiTrigger" nil))
-      (jstring operation "sequenceId" "")))
-
-(defun machine-metadata-for-operation (state operation)
+(defun fetch-machine-for-dispatch (state machine-id)
+  "Fetch the full machine object from RE by id. Returns NIL on error or when
+the machine is absent — the caller treats NIL as a drop-no-dispatch signal."
   (handler-case
-      (let* ((machine-id (jstring operation "machineId" ""))
-             (response (http-get-json (format nil "~a/api/machines/~a"
+      (let* ((response (http-get-json (format nil "~a/api/machines/~a"
                                               (perception-state-reality-url state)
                                               machine-id)))
              (machine (jget response "machine")))
-        (if (jobject-p machine) (or (jget machine "metadata") (obj)) (obj)))
-    (error () (obj))))
+        (if (jobject-p machine) machine nil))
+    (error () nil)))
 
-(defun record-dispatch-envelope (state operation &optional metadata-override)
-  (let* ((metadata (or metadata-override (machine-metadata-for-operation state operation)))
-         (target (operation-dispatch-target operation metadata))
-         (trigger (operation-ai-trigger operation metadata))
-         (record (obj "id" (make-id "dispatch")
-                      "dispatchId" nil
-                      "status" "recorded"
-                      "mode" (perception-state-trigger-dispatch-mode state)
-                      "target" target
-                      "adapter" +json-null+
-                      "provider" +json-null+
-                      "externalRunId" +json-null+
-                      "attempts" 0
-                      "createdAt" (now-ms)
-                      "updatedAt" (now-ms)
-                      "envelope" (obj "machineId" (jstring operation "machineId" "")
-                                      "sequenceId" (jstring operation "sequenceId" "")
-                                      "aiTrigger" trigger
-                                      "dispatchableAgent" target
-                                      "governance" (or (jget operation "governance") (obj))
-                                      "values" (or (jget operation "values") (arr))
-                                      "region" (or (jget operation "region") (obj))
-                                      "operation" operation))))
-    (setf (jget record "dispatchId") (jstring record "id"))
-    (push record (perception-state-dispatch-ledger state))
-    (when (> (length (perception-state-dispatch-ledger state))
-             (perception-state-dispatch-ledger-limit state))
-      (setf (perception-state-dispatch-ledger state)
-            (subseq (perception-state-dispatch-ledger state)
-                    0
-                    (perception-state-dispatch-ledger-limit state))))
-    (incf (perception-state-envelopes-created state))
-    record))
+(defun ces-semantics-from-values (values)
+  "Build outputVector.semantics: [{index, label}…] matching CPP / TS helpers."
+  (let ((cells nil) (i 0))
+    (dolist (v (if (jarray-p values) (jarray-list values) nil))
+      (declare (ignore v))
+      (push (obj "index" i "label" (format nil "cell_~a" i)) cells)
+      (incf i))
+    (vectorize (nreverse cells))))
+
+(defun ces-asserted-label (values)
+  "Build assertedLabel: 'cell_i+cell_j' for non-zero cells, or 'none'."
+  (let ((labels nil) (i 0))
+    (dolist (v (if (jarray-p values) (jarray-list values) nil))
+      (when (and (numberp v) (/= v 0))
+        (push (format nil "cell_~a" i) labels))
+      (incf i))
+    (if labels (format nil "~{~a~^+~}" (nreverse labels)) "none")))
+
+(defun ces-first-agent-action (metadata)
+  "Return the first string in metadata.agentActions, or empty string."
+  (let ((actions (jget metadata "agentActions")))
+    (if (and (jarray-p actions) (jarray-list actions))
+        (let ((first-elem (first (jarray-list actions))))
+          (if (stringp first-elem) first-elem ""))
+        "")))
+
+(defun ces-copy-string-array (value)
+  "Return a JSON array containing only the string elements of value."
+  (if (jarray-p value)
+      (vectorize (remove-if-not #'stringp (jarray-list value)))
+      (arr)))
+
+(defun build-ces-envelope (op machine envelope-id correlation-id state)
+  "Build a full ces.terminal.event envelope.
+Wire-compatible with CPP build_trigger_envelope and TS buildTriggerEnvelope."
+  (let* ((md (or (jget machine "metadata") (obj)))
+         (values (or (jget op "values") (arr)))
+         (sequence-id (jstring op "sequenceId" ""))
+         (machine-id (jstring op "machineId" ""))
+         (mode (perception-state-trigger-dispatch-mode state))
+         (graphql-p (string= mode "graphql")))
+    (obj "schemaVersion" "1.0.0"
+         "envelopeType" "ces.terminal.event"
+         "envelopeId" envelope-id
+         "correlationId" correlation-id
+         "emittedAtMs" (now-ms)
+         "source" (obj "engine" "PE"
+                       "observedEngine" "RE"
+                       "endpoint" (perception-state-reality-url state))
+         "ces" (obj "machineId" machine-id
+                    "machineName" (or (jstring machine "name" nil) machine-id)
+                    "machineCode" (jstring md "machineCode" "")
+                    "sequenceId" sequence-id
+                    "sequenceName" sequence-id
+                    "outputIndex" (or (jnumber op "outputIndex" nil) 0)
+                    "stepNumber" 0
+                    "perceptualMapping" (obj "output" (or (jget op "region") +json-null+))
+                    "provenance" (if (jarray-p (jget op "provenance"))
+                                     (jget op "provenance") (arr))
+                    "deprecation" (or (jget op "deprecation") +json-null+))
+         "outputVector" (obj "values" values
+                             "encoding" "vector"
+                             "semantics" (ces-semantics-from-values values)
+                             "assertedLabel" (ces-asserted-label values))
+         "projection" +json-null+
+         "governance" (or (jget op "governance") +json-null+)
+         "dispatch" (obj "agent" (jstring md "dispatchableAgent" "")
+                         "action" (ces-first-agent-action md)
+                         "agentActionsCatalog" (ces-copy-string-array (jget md "agentActions"))
+                         "trigger" (jstring md "aiTrigger" "")
+                         "endpoint" (obj "kind" mode
+                                         "url" (if graphql-p
+                                                   (perception-state-trigger-graphql-url state)
+                                                   "")
+                                         "mutation" (if graphql-p "updateProcessState" "")
+                                         "schemaRef" (if graphql-p
+                                                         "localAIStack/services/api/routers/graphql_endpoint.py"
+                                                         ""))))))
+
+(defun record-dispatch-envelope (state operation)
+  "Build and ledger one dispatch record for a merge operation.
+Returns the record on success, or NIL when the machine lacks
+dispatchableAgent / aiTrigger — the drop-no-dispatch signal to the caller.
+Wire-compatible with CPP DispatchRecord and TS Dispatcher.recordFromEnvelope."
+  (let* ((machine-id (jstring operation "machineId" ""))
+         (machine (fetch-machine-for-dispatch state machine-id))
+         (md (and machine (jget machine "metadata")))
+         (agent (and md (jstring md "dispatchableAgent" nil)))
+         (trigger (and md (jstring md "aiTrigger" nil))))
+    ;; Drop — no dispatchableAgent or no aiTrigger (matches CPP line 2175-2179).
+    (when (or (null machine)
+              (null agent) (string= agent "")
+              (null trigger) (string= trigger ""))
+      (return-from record-dispatch-envelope nil))
+    (let* ((envelope-id (make-id "trigger-envelope"))
+           (correlation-id (make-id "trigger-correlation"))
+           (dispatch-id (make-id "dispatch"))
+           (governance (or (jget operation "governance") (obj)))
+           (now (now-ms))
+           (envelope (build-ces-envelope operation machine envelope-id correlation-id state))
+           (record (obj "id" dispatch-id
+                        "envelopeId" envelope-id
+                        "correlationId" correlation-id
+                        "status" "recorded"
+                        "mode" (perception-state-trigger-dispatch-mode state)
+                        "target" agent
+                        "machineId" machine-id
+                        "sequenceId" (jstring operation "sequenceId" "")
+                        "ragStatusCode" (jstring governance "ragStatusCode" "")
+                        "processStatus" (jstring governance "processStatus" "")
+                        "adapter" +json-null+
+                        "provider" +json-null+
+                        "externalRunId" +json-null+
+                        "lastError" +json-null+
+                        "attempts" 0
+                        "createdAt" now
+                        "updatedAt" now
+                        "envelope" envelope)))
+      (push record (perception-state-dispatch-ledger state))
+      (when (> (length (perception-state-dispatch-ledger state))
+               (perception-state-dispatch-ledger-limit state))
+        (setf (perception-state-dispatch-ledger state)
+              (subseq (perception-state-dispatch-ledger state)
+                      0
+                      (perception-state-dispatch-ledger-limit state))))
+      (incf (perception-state-envelopes-created state))
+      record)))
 
 (defun record-dispatch-envelopes-from-step (state step)
+  "Process mergeBatch from a RE step, applying the same drop rules as CPP
+dispatch_triggers and TS Dispatcher.onStep: drop ops without governance
+(droppedNoGovernance) or without dispatchableAgent+aiTrigger (droppedNoDispatch)."
   (when (perception-state-triggers-enabled-p state)
     (let ((records nil))
       (dolist (operation (jarray-list (or (jget step "mergeBatch") (arr))))
-        (when (jobject-p (jget operation "governance"))
-          (handler-case
-              (push (record-dispatch-envelope state operation) records)
-            (error ()
-              (incf (perception-state-dispatch-errors state))))))
+        (cond
+          ((not (jobject-p (jget operation "governance")))
+           (incf (perception-state-dropped-no-governance state)))
+          (t
+           (handler-case
+               (let ((record (record-dispatch-envelope state operation)))
+                 (if record
+                     (push record records)
+                     (incf (perception-state-dropped-no-dispatch state))))
+             (error ()
+               (incf (perception-state-dispatch-errors state)))))))
       (vectorize (nreverse records)))))
 
 (defun completion-values-from-content (content)
