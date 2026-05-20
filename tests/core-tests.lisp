@@ -263,6 +263,102 @@
     (list :machines machines :sequences sequences :outputs outputs :envelopes envelopes
           :failures (nreverse failures))))
 
+(defun merge-operation-for-pe-dispatch (machine sequence-id values)
+  (let ((governance (reality-engine-lsp::resolve-governance machine sequence-id values)))
+    (when governance
+      (reality-engine-lsp::obj
+       "region" (reality-engine-lsp::region-json
+                 (reality-engine-lsp::mapping-output
+                  (reality-engine-lsp::machine-mapping machine)))
+       "machineId" (reality-engine-lsp::machine-id machine)
+       "sequenceId" sequence-id
+       "outputIndex" 0
+       "values" (reality-engine-lsp::vectorize values)
+       "governance" governance))))
+
+(defun pe-record-for (state machine sequence-id values)
+  (let ((operation (merge-operation-for-pe-dispatch machine sequence-id values)))
+    (when operation
+      (reality-engine-lsp::record-dispatch-envelope
+       state
+       operation
+       (reality-engine-lsp::machine-metadata machine)))))
+
+(defun walk-corpus-through-pe-dispatch (machine-dir)
+  "Replay the AI corpus through the LSP PE dispatch-ledger path.
+This tests PE-owned bridge behavior: RE-style merge operations enter PE,
+and PE records async dispatch envelopes without requiring live RE HTTP."
+  (let ((state (reality-engine-lsp::make-perception-state-from-config
+                :dimension 768
+                :reality-url "http://localhost:3299"
+                :localai-url "http://localhost:8000"
+                :localai-machine-dir "../localAIStack/data/machines"))
+        (machines 0) (sequences 0) (outputs 0) (records 0) (failures nil))
+    (setf (reality-engine-lsp::perception-state-dispatch-ledger-limit state) 5000)
+    (dolist (path (sort (uiop:directory-files machine-dir "*.json") #'string< :key #'namestring))
+      (let* ((raw (reality-engine-lsp::safe-read-file (namestring path)))
+             (root (handler-case (reality-engine-lsp::parse-json raw)
+                     (error (c) (push (format nil "~a: parse failed — ~a" (file-namestring path) c) failures)
+                            nil))))
+        (unless root (return))
+        (let* ((machine-obj (reality-engine-lsp::jget root "machine"))
+               (md (reality-engine-lsp::jget machine-obj "metadata"))
+               (tc (reality-engine-lsp::jget md "triggerConfig"))
+               (rules (and (reality-engine-lsp::jobject-p tc) (reality-engine-lsp::jget tc "rules"))))
+          (when (and (reality-engine-lsp::jarray-p rules)
+                     (> (length (reality-engine-lsp::jarray-list rules)) 0)
+                     (> (length (reality-engine-lsp::jstring md "dispatchableAgent" "")) 0)
+                     (> (length (reality-engine-lsp::jstring md "aiTrigger" "")) 0))
+            (incf machines)
+            (let ((machine (handler-case (reality-engine-lsp::load-machine-from-file path)
+                             (error (c) (push (format nil "~a: load failed — ~a" (file-namestring path) c) failures)
+                                    nil))))
+              (when machine
+                (let ((input-seqs (reality-engine-lsp::jget machine-obj "inputSequences")))
+                  (when (reality-engine-lsp::jarray-p input-seqs)
+                    (dolist (seq-json (reality-engine-lsp::jarray-list input-seqs))
+                      (reset-machine machine)
+                      (incf sequences)
+                      (let* ((seq-meta (reality-engine-lsp::jget seq-json "metadata"))
+                             (expected-count (reality-engine-lsp::jnumber seq-meta "expectedOutputCount" nil))
+                             (vectors-json (reality-engine-lsp::jget seq-json "vectors")))
+                        (cond
+                          ((eql expected-count 0) nil)
+                          ((not (reality-engine-lsp::jarray-p vectors-json))
+                           (push (format nil "~a: missing input vectors" (file-namestring path)) failures))
+                          (t
+                           (let ((fired nil))
+                             (dolist (vec-json (reality-engine-lsp::jarray-list vectors-json))
+                               (let* ((input (reality-engine-lsp::numbers-from-json vec-json))
+                                      (tr (reality-engine-lsp::process-machine-input machine input)))
+                                 (maphash
+                                  (lambda (sid outs)
+                                    (dolist (ov outs)
+                                      (push (cons sid (reality-engine-lsp::output-vector-vector ov)) fired)
+                                      (incf outputs)))
+                                  (reality-engine-lsp::transition-result-sequence-outputs tr))))
+                             (dolist (pair fired)
+                               (let ((record (pe-record-for state machine (car pair) (cdr pair))))
+                                 (when record
+                                   (incf records)
+                                   (let* ((envelope (reality-engine-lsp::jget record "envelope"))
+                                          (governance (reality-engine-lsp::jget envelope "governance"))
+                                          (target (reality-engine-lsp::jstring envelope "dispatchableAgent" ""))
+                                          (trigger (reality-engine-lsp::jstring envelope "aiTrigger" ""))
+                                          (rag (reality-engine-lsp::jstring governance "ragStatusCode" "")))
+                                     (when (zerop (length target))
+                                       (push (format nil "~a: PE dispatch target empty" (file-namestring path)) failures))
+                                     (when (zerop (length trigger))
+                                       (push (format nil "~a: PE aiTrigger empty" (file-namestring path)) failures))
+                                     (unless (member rag '("RED" "AMBER" "GREEN") :test #'string=)
+                                       (push (format nil "~a: PE ragStatusCode invalid" (file-namestring path)) failures)))))))))))))))))))
+    (list :state state
+          :machines machines
+          :sequences sequences
+          :outputs outputs
+          :records records
+          :failures (nreverse failures))))
+
 ;; Yuma tier-1 input patterns lifted from each AGX051-054 inputSequences[]
 ;; block — same constants the AI + C++ cascade tests use.
 (defparameter +tier1-normal-input+ '(1 1 0 1))
@@ -627,6 +723,105 @@
                            (reality-engine-lsp::reality-routes nil)))))
     (assert-true (find "/api/metrics" patterns :test #'string=)
                  "Reality routes should expose /api/metrics Prometheus endpoint"))
+  (let ((patterns (mapcar #'reality-engine-lsp::route-pattern
+                          (reality-engine-lsp::flatten-routes
+                           (reality-engine-lsp::perception-routes nil)))))
+    (dolist (pattern '("/api/integrations/status"
+                       "/api/integrations/completions"
+                       "/api/triggers/status"
+                       "/api/dispatch/ledger"
+                       "/api/dispatch/records/:id"
+                       "/api/integrations/ollama/status"
+                       "/api/integrations/ollama/dispatch"
+                       "/api/integrations/openai/status"
+                       "/api/integrations/openai/dispatch"
+                       "/api/integrations/healthkit/status"
+                       "/api/integrations/healthkit/ingest"
+                       "/api/integrations/carekit/status"
+                       "/api/integrations/carekit/ingest"))
+      (assert-true (find pattern patterns :test #'string=)
+                   (format nil "Perception routes should expose ~a" pattern))))
+  (let* ((state (reality-engine-lsp::make-perception-state-from-config
+                 :dimension 5000
+                 :reality-url "http://localhost:3299"
+                 :localai-url "http://localhost:8000"
+                 :localai-machine-dir "../localAIStack/data/machines"))
+         (completion (reality-engine-lsp::ingest-completion
+                      state
+                      (reality-engine-lsp::obj
+                       "provider" "e2e"
+                       "agent" "e2e"
+                       "sourceMappingId" "agent-completion-risk"
+                       "values" (reality-engine-lsp::vectorize (list 1 0 0.75 0)))))
+         (source (reality-engine-lsp::jget completion "source")))
+    (assert-equal "agent.e2e.completion"
+                  (reality-engine-lsp::jstring source "sensorId" "")
+                  "completion ingest should commit through PE source mapping")
+    (assert-equal 4200
+                  (reality-engine-lsp::jnumber (reality-engine-lsp::jget source "region") "offset" nil)
+                  "completion source should use configured mapping offset"))
+  (let* ((state (reality-engine-lsp::make-perception-state-from-config
+                 :dimension 5000
+                 :reality-url "http://localhost:3299"
+                 :localai-url "http://localhost:8000"
+                 :localai-machine-dir "../localAIStack/data/machines"))
+         (healthkit (reality-engine-lsp::ingest-healthkit
+                     state
+                     (reality-engine-lsp::obj
+                      "sampleType" "step-count"
+                      "sourceMappingId" "healthkit-activity"
+                      "values" (reality-engine-lsp::vectorize (list 1 0 0.9 0)))))
+         (result (aref (reality-engine-lsp::jget healthkit "results") 0)))
+    (assert-equal "healthkit.step-count"
+                  (reality-engine-lsp::jstring result "sensorId" "")
+                  "HealthKit ingest should commit through PE source mapping")
+    (assert-equal "healthkit-activity"
+                  (reality-engine-lsp::jstring result "sourceMappingId" "")
+                  "HealthKit ingest should preserve mapping id"))
+  (let* ((state (reality-engine-lsp::make-perception-state-from-config
+                 :dimension 5000
+                 :reality-url "http://localhost:3299"
+                 :localai-url "http://localhost:8000"
+                 :localai-machine-dir "../localAIStack/data/machines"))
+         (carekit (reality-engine-lsp::ingest-carekit
+                   state
+                   (reality-engine-lsp::obj
+                    "sampleType" "task-adherence"
+                    "taskId" "morning-medication"
+                    "carePlanId" "care-plan-a"
+                    "sourceMappingId" "carekit-task"
+                    "values" (reality-engine-lsp::vectorize (list 1 0 0.8 0.95)))))
+         (result (aref (reality-engine-lsp::jget carekit "results") 0)))
+    (assert-equal "carekit.task-adherence"
+                  (reality-engine-lsp::jstring result "sensorId" "")
+                  "CareKit ingest should commit through PE source mapping")
+    (assert-equal "carekit-task"
+                  (reality-engine-lsp::jstring result "sourceMappingId" "")
+                  "CareKit ingest should preserve mapping id")
+    (assert-equal 4310
+                  (reality-engine-lsp::jnumber (reality-engine-lsp::jget (reality-engine-lsp::jget result "source") "region") "offset" nil)
+                  "CareKit source should use configured mapping offset"))
+  (let* ((state (reality-engine-lsp::make-perception-state-from-config
+                 :dimension 16
+                 :reality-url "http://localhost:3299"
+                 :localai-url "http://localhost:8000"
+                 :localai-machine-dir "../localAIStack/data/machines"))
+         (record (reality-engine-lsp::record-dispatch-envelope
+                  state
+                  (reality-engine-lsp::obj
+                   "machineId" "machine-e2e"
+                   "sequenceId" "seq-e2e"
+                   "values" (reality-engine-lsp::vectorize (list 1 0))
+                   "region" (reality-engine-lsp::obj "offset" 4 "length" 2)
+                   "governance" (reality-engine-lsp::obj "ownerTeam" "e2e-team"
+                                                         "ragStatusCode" "RED"
+                                                         "processStatus" "error")))))
+    (assert-equal "recorded"
+                  (reality-engine-lsp::jstring record "status" "")
+                  "dispatch envelope should be PE-owned ledger record")
+    (assert-equal 1
+                  (length (reality-engine-lsp::perception-state-dispatch-ledger state))
+                  "dispatch ledger should retain PE-owned record"))
   (let* ((state (make-test-state 8))
          (text (reality-engine-lsp::prometheus-text-of state "lsp")))
     (assert-true (search "runtime=\"lsp\"" text)
@@ -850,6 +1045,31 @@
        (assert-equal 3586 outputs   "AiTriggerDispatch parity — outputsProduced    != 3586 (AI/CPP value)")
        (assert-equal 3586 envelopes "AiTriggerDispatch parity — envelopesResolved  != 3586 (AI/CPP value)"))
 
+     ;; PE dispatch parity — same corpus and counts, but exercised through the
+     ;; PE-owned dispatch ledger path that records async bridge envelopes after
+     ;; RE returns a mergeBatch.
+     (let* ((pe-result (walk-corpus-through-pe-dispatch +ai-machines-dir+))
+            (pe-state (getf pe-result :state))
+            (machines  (getf pe-result :machines))
+            (sequences (getf pe-result :sequences))
+            (outputs   (getf pe-result :outputs))
+            (records   (getf pe-result :records))
+            (failures  (getf pe-result :failures)))
+       (when failures
+         (format *error-output* "~&[parity] PE dispatch failures (first 10):~%")
+         (dolist (f (subseq failures 0 (min 10 (length failures))))
+           (format *error-output* "  - ~a~%" f)))
+       (format t "~&[parity] LSP PE dispatch corpus: machines=~a sequences=~a outputs=~a records=~a (CPP target: 895/4480/3586/3586)~%"
+               machines sequences outputs records)
+       (assert-equal nil failures "PE dispatch parity — corpus walk must produce no failures")
+       (assert-equal 895  machines  "PE dispatch parity — machinesWithTriggers != 895 (CPP value)")
+       (assert-equal 4480 sequences "PE dispatch parity — inputSequencesRun  != 4480 (CPP value)")
+       (assert-equal 3586 outputs   "PE dispatch parity — outputsProduced    != 3586 (CPP value)")
+       (assert-equal 3586 records   "PE dispatch parity — ledger records      != 3586 (CPP envelopesResolved)")
+       (assert-equal 3586
+                     (reality-engine-lsp::perception-state-envelopes-created pe-state)
+                     "PE dispatch parity — envelopesCreated counter drifted"))
+
      ;; AGX051 pin — urgent_maint resolves to aquaculture_predictive_maintenance_agent / RED / sla=900.
      (let* ((m (reality-engine-lsp::load-machine-from-file
                 (merge-pathnames "AGX051_yuma-aqua-maintenance-forecaster.json" +ai-machines-dir+)))
@@ -863,7 +1083,21 @@
        (assert-equal 900                                                                (reality-engine-lsp::jget env "slaSeconds")             "AGX051 urgent_maint: slaSeconds != 900")
        (let ((green (envelope-for m "agx-051-normal" '(0 0 0 1))))
          (assert-true green                                                             "AGX051 normal: envelope unresolved")
-         (assert-equal "GREEN" (reality-engine-lsp::jstring green "ragStatusCode" "")   "AGX051 normal: ragStatusCode")))
+         (assert-equal "GREEN" (reality-engine-lsp::jstring green "ragStatusCode" "")   "AGX051 normal: ragStatusCode"))
+       (let* ((pe-state (reality-engine-lsp::make-perception-state-from-config
+                         :dimension 768
+                         :reality-url "http://localhost:3299"
+                         :localai-url "http://localhost:8000"
+                         :localai-machine-dir "../localAIStack/data/machines"))
+              (record (pe-record-for pe-state m "agx-051-urgent-maint" '(1 0 0 0)))
+              (pe-env (reality-engine-lsp::jget record "envelope"))
+              (gov (reality-engine-lsp::jget pe-env "governance")))
+         (assert-true record "AGX051 PE urgent_maint: dispatch record unresolved")
+         (assert-equal "aquaculture_predictive_maintenance_agent" (reality-engine-lsp::jstring pe-env "dispatchableAgent" "") "AGX051 PE urgent_maint: dispatch agent")
+         (assert-equal "agriculture-yuma-aqua-maintenance-forecaster-maintenance" (reality-engine-lsp::jstring pe-env "aiTrigger" "") "AGX051 PE urgent_maint: aiTrigger")
+         (assert-equal "RED" (reality-engine-lsp::jstring gov "ragStatusCode" "") "AGX051 PE urgent_maint: ragStatusCode")
+         (assert-equal "error" (reality-engine-lsp::jstring gov "processStatus" "") "AGX051 PE urgent_maint: processStatus")
+         (assert-equal 900 (reality-engine-lsp::jget gov "slaSeconds") "AGX051 PE urgent_maint: slaSeconds != 900")))
 
      ;; AGX055 pin — five sequences route to agriculture_yield_optimization_ai with matching RAG.
      (let ((m (reality-engine-lsp::load-machine-from-file
@@ -878,7 +1112,19 @@
            (assert-equal "agriculture_yield_optimization_ai"        (reality-engine-lsp::jstring env "dispatchableAgent" "") (format nil "AGX055 ~a: dispatchableAgent" (first case)))
            (assert-equal "ag-yield-optimization-ai-yuma-facility-bridge" (reality-engine-lsp::jstring env "aiTrigger" "")     (format nil "AGX055 ~a: aiTrigger" (first case)))
            (assert-equal (third case)                                (reality-engine-lsp::jstring env "ragStatusCode" "")     (format nil "AGX055 ~a: ragStatusCode" (first case)))
-           (assert-equal "agriculture-operations"                   (reality-engine-lsp::jstring env "ownerTeam" "")         (format nil "AGX055 ~a: ownerTeam" (first case))))))
+           (assert-equal "agriculture-operations"                   (reality-engine-lsp::jstring env "ownerTeam" "")         (format nil "AGX055 ~a: ownerTeam" (first case)))
+         (let* ((pe-state (reality-engine-lsp::make-perception-state-from-config
+                           :dimension 768
+                           :reality-url "http://localhost:3299"
+                           :localai-url "http://localhost:8000"
+                           :localai-machine-dir "../localAIStack/data/machines"))
+                (record (pe-record-for pe-state m (first case) (second case)))
+                (pe-env (reality-engine-lsp::jget record "envelope"))
+                (gov (reality-engine-lsp::jget pe-env "governance")))
+           (assert-true record (format nil "AGX055 PE ~a: dispatch record unresolved" (first case)))
+           (assert-equal "agriculture_yield_optimization_ai" (reality-engine-lsp::jstring pe-env "dispatchableAgent" "") (format nil "AGX055 PE ~a: dispatchableAgent" (first case)))
+           (assert-equal "ag-yield-optimization-ai-yuma-facility-bridge" (reality-engine-lsp::jstring pe-env "aiTrigger" "") (format nil "AGX055 PE ~a: aiTrigger" (first case)))
+           (assert-equal (third case) (reality-engine-lsp::jstring gov "ragStatusCode" "") (format nil "AGX055 PE ~a: ragStatusCode" (first case)))))))
 
      ;; Bridge perceptual contract — AGX055.output == AgYieldOptimizationAI.input == length 12.
      (let* ((bridge-root (reality-engine-lsp::parse-json (reality-engine-lsp::safe-read-file (namestring (merge-pathnames "AGX055_yuma-facility-ai-synthesis-bridge.json" +ai-machines-dir+)))))

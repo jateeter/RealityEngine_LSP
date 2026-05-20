@@ -88,3 +88,12 @@
                                    :method :post
                                    :content (json-stringify payload)
                                    :content-type "application/json")))
+
+(defun http-request-json (url &key (method :get) payload headers)
+  (let ((args (list url :method method)))
+    (when payload
+      (setf args (append args (list :content (json-stringify payload)
+                                    :content-type "application/json"))))
+    (when headers
+      (setf args (append args (list :additional-headers headers))))
+    (parse-json (apply #'drakma:http-request args))))

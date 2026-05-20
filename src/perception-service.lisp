@@ -2,6 +2,13 @@
 
 (defstruct perception-state
   engine reality-url localai-url localai-machine-dir push-records started-at
+  integrations-config-path integrations-loaded-p integrations-load-error integrations source-mappings
+  triggers-enabled-p trigger-dispatch-mode trigger-graphql-url envelopes-created dispatch-errors
+  dispatch-ledger dispatch-ledger-limit
+  ollama-base-url ollama-model ollama-completion-source-mapping-id
+  openai-base-url openai-model openai-completion-source-mapping-id openai-api-key
+  healthkit-bridge-id healthkit-default-source-mapping-id healthkit-bridge-token
+  carekit-bridge-id carekit-default-source-mapping-id carekit-bridge-token
   ;; MQTT bridge — NIL when the bridge isn't configured (no MQTT_BROKER_HOST).
   ;; When non-NIL, owned by the perception service and torn down on stop.
   mqtt-bridge)
@@ -14,7 +21,63 @@
    :localai-machine-dir localai-machine-dir
    :push-records (make-hash-table :test #'equal)
    :started-at (now-ms)
+   :integrations-config-path nil
+   :integrations-loaded-p nil
+   :integrations-load-error nil
+   :integrations (arr)
+   :source-mappings (make-default-source-mappings)
+   :triggers-enabled-p (env-bool "TRIGGERS_ENABLED" nil)
+   :trigger-dispatch-mode (env "TRIGGER_DISPATCH_MODE" "dry-run")
+   :trigger-graphql-url (env "TRIGGER_GRAPHQL_URL" (format nil "~a/graphql" localai-url))
+   :envelopes-created 0
+   :dispatch-errors 0
+   :dispatch-ledger nil
+   :dispatch-ledger-limit (env-int "TRIGGER_DISPATCH_LEDGER_LIMIT" 100)
+   :ollama-base-url (trim-trailing-slashes (env "OLLAMA_BASE_URL" "http://localhost:11434"))
+   :ollama-model (env "OLLAMA_MODEL" "gpt-oss:20b")
+   :ollama-completion-source-mapping-id (env "OLLAMA_COMPLETION_SOURCE_MAPPING_ID" "agent-completion-risk")
+   :openai-base-url (trim-trailing-slashes (env "OPENAI_BASE_URL" "https://api.openai.com/v1"))
+   :openai-model (env "OPENAI_MODEL" "gpt-5")
+   :openai-completion-source-mapping-id (env "OPENAI_COMPLETION_SOURCE_MAPPING_ID" "agent-completion-risk")
+   :openai-api-key (or (env "OPENAI_API_KEY" nil) "")
+   :healthkit-bridge-id (env "HEALTHKIT_BRIDGE_ID" "healthkit-ios-bridge")
+   :healthkit-default-source-mapping-id (env "HEALTHKIT_DEFAULT_SOURCE_MAPPING_ID" "healthkit-activity")
+   :healthkit-bridge-token (env "HEALTHKIT_BRIDGE_TOKEN" nil)
+   :carekit-bridge-id (env "CAREKIT_BRIDGE_ID" "carekit-ios-bridge")
+   :carekit-default-source-mapping-id (env "CAREKIT_DEFAULT_SOURCE_MAPPING_ID" "carekit-task")
+   :carekit-bridge-token (env "CAREKIT_BRIDGE_TOKEN" nil)
    :mqtt-bridge nil))
+
+(defun trim-trailing-slashes (value)
+  (let ((end (length value)))
+    (loop while (and (> end 0) (char= (char value (1- end)) #\/))
+          do (decf end))
+    (subseq value 0 end)))
+
+(defun make-default-source-mappings ()
+  (let ((mappings (make-hash-table :test #'equal)))
+    (setf (gethash "agent-completion-risk" mappings)
+          (obj "id" "agent-completion-risk"
+               "sensorIdTemplate" "agent.{agent}.completion"
+               "region" (obj "offset" 4200 "length" 4)
+               "ttlMs" 300000
+               "pushMode" "debounced"
+               "debounceMs" 250)
+          (gethash "healthkit-activity" mappings)
+          (obj "id" "healthkit-activity"
+               "sensorIdTemplate" "healthkit.{sampleType}"
+               "region" (obj "offset" 4300 "length" 4)
+               "ttlMs" 900000
+               "pushMode" "debounced"
+               "debounceMs" 250)
+          (gethash "carekit-task" mappings)
+          (obj "id" "carekit-task"
+               "sensorIdTemplate" "carekit.{sampleType}"
+               "region" (obj "offset" 4310 "length" 4)
+               "ttlMs" 900000
+               "pushMode" "debounced"
+               "debounceMs" 250))
+    mappings))
 
 (defun localai-sensor-specs ()
   (list (list "localai_rag_retrieval" "localai/rag_retrieval" 52 4 30000)
@@ -235,6 +298,555 @@ Per-sequence boundaries live in metadata.segments for UI display."
       (error (condition)
         (obj "success" +json-false+ "endpoint" endpoint "method" method "error" (princ-to-string condition))))))
 
+(defun load-integrations-config (state)
+  (let* ((configured (env "INTEGRATIONS_CONFIG" nil))
+         (default (probe-file "config/integrations.json"))
+         (path (or configured (and default (namestring default)))))
+    (when path
+      (setf (perception-state-integrations-config-path state) path)
+      (handler-case
+          (let* ((root (parse-json (safe-read-file path)))
+                 (integrations (or (jget root "integrations") (arr)))
+                 (source-mappings (or (jget root "sourceMappings") (arr))))
+            (when (jarray-p source-mappings)
+              (dolist (mapping (jarray-list source-mappings))
+                (let ((id (jstring mapping "id" nil)))
+                  (when id
+                    (setf (gethash id (perception-state-source-mappings state)) mapping)))))
+            (when (jarray-p integrations)
+              (dolist (item (jarray-list integrations))
+                (let ((kind (jstring item "kind" "")))
+                  (cond
+                    ((string= kind "ollama")
+                     (when (jstring item "baseUrl" nil)
+                       (setf (perception-state-ollama-base-url state)
+                             (trim-trailing-slashes (jstring item "baseUrl"))))
+                     (when (jstring item "model" nil)
+                       (setf (perception-state-ollama-model state) (jstring item "model")))
+                     (when (jstring item "completionSourceMappingId" nil)
+                       (setf (perception-state-ollama-completion-source-mapping-id state)
+                             (jstring item "completionSourceMappingId"))))
+                    ((string= kind "openai")
+                     (when (jstring item "baseUrl" nil)
+                       (setf (perception-state-openai-base-url state)
+                             (trim-trailing-slashes (jstring item "baseUrl"))))
+                     (when (jstring item "model" nil)
+                       (setf (perception-state-openai-model state) (jstring item "model")))
+                     (when (jstring item "completionSourceMappingId" nil)
+                       (setf (perception-state-openai-completion-source-mapping-id state)
+                             (jstring item "completionSourceMappingId"))))
+                    ((string= kind "healthkit")
+                     (when (jstring item "bridgeId" nil)
+                       (setf (perception-state-healthkit-bridge-id state) (jstring item "bridgeId")))
+                     (when (jstring item "defaultSourceMappingId" nil)
+                       (setf (perception-state-healthkit-default-source-mapping-id state)
+                              (jstring item "defaultSourceMappingId"))))
+                    ((string= kind "carekit")
+                     (when (jstring item "bridgeId" nil)
+                       (setf (perception-state-carekit-bridge-id state) (jstring item "bridgeId")))
+                     (when (jstring item "defaultSourceMappingId" nil)
+                       (setf (perception-state-carekit-default-source-mapping-id state)
+                              (jstring item "defaultSourceMappingId"))))))))
+            (setf (perception-state-integrations state) integrations
+                  (perception-state-integrations-loaded-p state) t
+                  (perception-state-integrations-load-error state) nil))
+        (error (condition)
+          (setf (perception-state-integrations-loaded-p state) nil
+                (perception-state-integrations-load-error state) (princ-to-string condition))))))
+  state)
+
+(defun source-mapping-by-id (state id)
+  (or (and id (gethash id (perception-state-source-mappings state)))
+      (gethash "agent-completion-risk" (perception-state-source-mappings state))))
+
+(defun replace-all-substrings (value token replacement)
+  (let ((out value)
+        (start 0))
+    (loop for pos = (search token out :start2 start)
+          while pos
+          do (setf out (concatenate 'string
+                                    (subseq out 0 pos)
+                                    replacement
+                                    (subseq out (+ pos (length token)))))
+             (setf start (+ pos (length replacement))))
+    out))
+
+(defun source-id-part (value)
+  (let ((text (or value "unknown")))
+    (with-output-to-string (out)
+      (loop for ch across text
+            do (write-char (if (or (alphanumericp ch) (member ch '(#\- #\_) :test #'char=))
+                               (char-downcase ch)
+                               #\-)
+                           out)))))
+
+(defun render-sensor-template (template bindings)
+  (let ((out template))
+    (dolist (binding bindings)
+      (setf out (replace-all-substrings out
+                                        (format nil "{~a}" (car binding))
+                                        (source-id-part (cdr binding)))))
+    out))
+
+(defun commit-signal-source (state sensor-id name region values ttl-ms)
+  (let* ((engine (perception-state-engine state))
+         (source (sensor-exists-p engine sensor-id)))
+    (unless source
+      (setf source (ensure-source-id
+                    engine
+                    (make-source :id sensor-id
+                                 :kind "sensor"
+                                 :name name
+                                 :active-p t
+                                 :region region
+                                 :sensor-id sensor-id
+                                 :last-value nil
+                                 :last-updated 0
+                                 :ttl-ms ttl-ms))))
+    (setf (source-name source) name
+          (source-region source) region
+          (source-ttl-ms source) ttl-ms
+          (source-last-value source) values
+          (source-last-updated source) (now-ms))
+    source))
+
+(defun signal-body-region (body values)
+  (if (jobject-p (jget body "region"))
+      (make-region-from-json (jget body "region"))
+      (make-region :offset 0 :length (length values))))
+
+(defun ingest-signal-body (state body &key default-sensor-id default-name default-region default-ttl-ms)
+  (let* ((values (numbers-from-json (or (jget body "values") (jget body "vector") (arr))))
+         (sensor-id (or (jstring body "sensorId" nil)
+                        (jstring body "id" nil)
+                        default-sensor-id
+                        "localai_agent_activity"))
+         (name (or (jstring body "name" nil) default-name sensor-id))
+         (region (or default-region (signal-body-region body values)))
+         (ttl-ms (or (jnumber body "ttlMs" nil) default-ttl-ms 30000))
+         (source (commit-signal-source state sensor-id name region values ttl-ms))
+         (push-result +json-null+))
+    (when (jbool body "triggerPush" nil)
+      (setf push-result (push-perception state (not (jbool body "compactPush" nil)))))
+    (obj "success" t
+         "sensorId" sensor-id
+         "source" (source-json source)
+         "push" push-result
+         "timestamp" (now-ms))))
+
+(defun integrations-status-json (state)
+  (obj "loaded" (json-bool (perception-state-integrations-loaded-p state))
+       "path" (or (perception-state-integrations-config-path state) +json-null+)
+       "error" (or (perception-state-integrations-load-error state) +json-null+)
+       "integrationCount" (if (jarray-p (perception-state-integrations state))
+                              (length (jarray-list (perception-state-integrations state)))
+                              0)
+       "integrations" (perception-state-integrations state)
+       "sourceMappings" (vectorize (mapcar (lambda (id)
+                                             (gethash id (perception-state-source-mappings state)))
+                                           (object-keys-sorted (perception-state-source-mappings state))))
+       "completionEndpoint" "/api/integrations/completions"
+       "ollama" (ollama-status-json state nil)
+       "openai" (openai-status-json state nil)
+       "healthkit" (healthkit-status-json state)
+       "carekit" (carekit-status-json state)))
+
+(defun triggers-status-json (state)
+  (obj "enabled" (json-bool (perception-state-triggers-enabled-p state))
+       "mode" (perception-state-trigger-dispatch-mode state)
+       "graphqlUrl" (perception-state-trigger-graphql-url state)
+       "envelopesCreated" (perception-state-envelopes-created state)
+       "dispatchErrors" (perception-state-dispatch-errors state)
+       "ledgerSize" (length (perception-state-dispatch-ledger state))))
+
+(defun dispatch-record-json (record)
+  record)
+
+(defun ledger-json (state)
+  (obj "records" (vectorize (mapcar #'dispatch-record-json (perception-state-dispatch-ledger state)))
+       "count" (length (perception-state-dispatch-ledger state))
+       "triggers" (triggers-status-json state)))
+
+(defun lookup-dispatch-record (state id)
+  (find id (perception-state-dispatch-ledger state)
+        :test #'string=
+        :key (lambda (record) (jstring record "id" ""))))
+
+(defun update-dispatch-record (state id body)
+  (let ((record (lookup-dispatch-record state id)))
+    (unless record
+      (return-from update-dispatch-record nil))
+    (dolist (field '("status" "adapter" "provider" "externalRunId" "lastError"))
+      (when (jstring body field nil)
+        (setf (jget record field) (jstring body field))))
+    (when (jobject-p (jget body "metadata"))
+      (setf (jget record "metadata") (jget body "metadata")))
+    (when (jbool body "incrementAttempts" nil)
+      (setf (jget record "attempts") (1+ (or (jnumber record "attempts" nil) 0))))
+    (setf (jget record "updatedAt") (now-ms))
+    record))
+
+(defun operation-dispatch-target (operation metadata)
+  (or (and (jobject-p metadata) (jstring metadata "dispatchableAgent" nil))
+      (jstring (jget operation "governance") "ownerTeam" nil)
+      (jstring operation "machineId" "")))
+
+(defun operation-ai-trigger (operation metadata)
+  (or (and (jobject-p metadata) (jstring metadata "aiTrigger" nil))
+      (jstring operation "sequenceId" "")))
+
+(defun machine-metadata-for-operation (state operation)
+  (handler-case
+      (let* ((machine-id (jstring operation "machineId" ""))
+             (response (http-get-json (format nil "~a/api/machines/~a"
+                                              (perception-state-reality-url state)
+                                              machine-id)))
+             (machine (jget response "machine")))
+        (if (jobject-p machine) (or (jget machine "metadata") (obj)) (obj)))
+    (error () (obj))))
+
+(defun record-dispatch-envelope (state operation &optional metadata-override)
+  (let* ((metadata (or metadata-override (machine-metadata-for-operation state operation)))
+         (target (operation-dispatch-target operation metadata))
+         (trigger (operation-ai-trigger operation metadata))
+         (record (obj "id" (make-id "dispatch")
+                      "dispatchId" nil
+                      "status" "recorded"
+                      "mode" (perception-state-trigger-dispatch-mode state)
+                      "target" target
+                      "adapter" +json-null+
+                      "provider" +json-null+
+                      "externalRunId" +json-null+
+                      "attempts" 0
+                      "createdAt" (now-ms)
+                      "updatedAt" (now-ms)
+                      "envelope" (obj "machineId" (jstring operation "machineId" "")
+                                      "sequenceId" (jstring operation "sequenceId" "")
+                                      "aiTrigger" trigger
+                                      "dispatchableAgent" target
+                                      "governance" (or (jget operation "governance") (obj))
+                                      "values" (or (jget operation "values") (arr))
+                                      "region" (or (jget operation "region") (obj))
+                                      "operation" operation))))
+    (setf (jget record "dispatchId") (jstring record "id"))
+    (push record (perception-state-dispatch-ledger state))
+    (when (> (length (perception-state-dispatch-ledger state))
+             (perception-state-dispatch-ledger-limit state))
+      (setf (perception-state-dispatch-ledger state)
+            (subseq (perception-state-dispatch-ledger state)
+                    0
+                    (perception-state-dispatch-ledger-limit state))))
+    (incf (perception-state-envelopes-created state))
+    record))
+
+(defun record-dispatch-envelopes-from-step (state step)
+  (when (perception-state-triggers-enabled-p state)
+    (let ((records nil))
+      (dolist (operation (jarray-list (or (jget step "mergeBatch") (arr))))
+        (when (jobject-p (jget operation "governance"))
+          (handler-case
+              (push (record-dispatch-envelope state operation) records)
+            (error ()
+              (incf (perception-state-dispatch-errors state))))))
+      (vectorize (nreverse records)))))
+
+(defun completion-values-from-content (content)
+  (handler-case
+      (let ((parsed (parse-json content)))
+        (cond
+          ((jarray-p (jget parsed "values")) (jget parsed "values"))
+          ((and (jobject-p (jget parsed "completion"))
+                (jarray-p (jget (jget parsed "completion") "values")))
+           (jget (jget parsed "completion") "values"))
+          (t nil)))
+    (error () nil)))
+
+(defun ingest-completion (state body)
+  (let* ((provider (or (jstring body "provider" nil) "agent"))
+         (agent (or (jstring body "agent" nil) provider))
+         (mapping-id (or (jstring body "sourceMappingId" nil) "agent-completion-risk"))
+         (mapping (source-mapping-by-id state mapping-id))
+         (values (or (jget body "values")
+                     (jget body "vector")
+                     (and (jobject-p (jget body "completion"))
+                          (jget (jget body "completion") "values"))))
+         (numbers (numbers-from-json values))
+         (template (or (jstring mapping "sensorIdTemplate" nil) "agent.{agent}.completion"))
+         (sensor-id (or (jstring body "sensorId" nil)
+                        (render-sensor-template template
+                                                (list (cons "provider" provider)
+                                                      (cons "agent" agent)))))
+         (region (make-region-from-json (or (jget mapping "region")
+                                            (obj "offset" 4200 "length" (length numbers)))))
+         (ttl-ms (or (jnumber mapping "ttlMs" nil) 300000))
+         (source (commit-signal-source state
+                                       sensor-id
+                                       (or (jstring body "name" nil)
+                                           (format nil "agent:~a/~a/completion" provider agent))
+                                       region
+                                       numbers
+                                       ttl-ms)))
+    (obj "success" t
+         "completion" (obj "provider" provider
+                           "agent" agent
+                           "sourceMappingId" mapping-id
+                           "completionId" (or (jstring body "completionId" nil)
+                                              (jstring body "id" nil)
+                                              +json-null+)
+                           "correlationId" (or (jstring body "correlationId" nil) +json-null+))
+         "source" (source-json source)
+         "timestamp" (now-ms))))
+
+(defun healthkit-status-json (state)
+  (obj "bridgeId" (perception-state-healthkit-bridge-id state)
+       "defaultSourceMappingId" (perception-state-healthkit-default-source-mapping-id state)
+       "tokenRequired" (json-bool (perception-state-healthkit-bridge-token state))
+       "statusEndpoint" "/api/integrations/healthkit/status"
+       "ingestEndpoint" "/api/integrations/healthkit/ingest"))
+
+(defun ingest-healthkit-one (state body)
+  (let* ((sample-type (or (jstring body "sampleType" nil) "sample"))
+         (mapping-id (or (jstring body "sourceMappingId" nil)
+                         (perception-state-healthkit-default-source-mapping-id state)))
+         (mapping (source-mapping-by-id state mapping-id))
+         (values (numbers-from-json (or (jget body "values") (jget body "vector") (arr))))
+         (sensor-id (or (jstring body "sensorId" nil)
+                        (render-sensor-template
+                         (or (jstring mapping "sensorIdTemplate" nil) "healthkit.{sampleType}")
+                         (list (cons "sampleType" sample-type)))))
+         (region (make-region-from-json (or (jget mapping "region")
+                                            (obj "offset" 4300 "length" (length values)))))
+         (ttl-ms (or (jnumber mapping "ttlMs" nil) 900000))
+         (source (commit-signal-source state
+                                       sensor-id
+                                       (or (jstring body "name" nil) (format nil "healthkit:~a" sample-type))
+                                       region
+                                       values
+                                       ttl-ms)))
+    (obj "sourceMappingId" mapping-id
+         "sampleType" sample-type
+         "sensorId" sensor-id
+         "source" (source-json source))))
+
+(defun ingest-healthkit (state body)
+  (let ((required-token (perception-state-healthkit-bridge-token state)))
+    (when (and required-token
+               (not (string= required-token (or (jstring body "token" nil)
+                                                (jstring body "bridgeToken" nil)
+                                                ""))))
+      (return-from ingest-healthkit (obj "success" +json-false+ "error" "invalid HealthKit bridge token"))))
+  (let ((results nil))
+    (if (and (not (eq (jget body "samples" :missing) :missing))
+             (jarray-p (jget body "samples")))
+        (dolist (sample (jarray-list (jget body "samples")))
+          (push (ingest-healthkit-one state sample) results))
+        (push (ingest-healthkit-one state body) results))
+    (obj "success" t
+         "bridgeId" (perception-state-healthkit-bridge-id state)
+         "results" (vectorize (nreverse results))
+         "timestamp" (now-ms))))
+
+(defun carekit-status-json (state)
+  (obj "bridgeId" (perception-state-carekit-bridge-id state)
+       "defaultSourceMappingId" (perception-state-carekit-default-source-mapping-id state)
+       "tokenRequired" (json-bool (perception-state-carekit-bridge-token state))
+       "statusEndpoint" "/api/integrations/carekit/status"
+       "ingestEndpoint" "/api/integrations/carekit/ingest"))
+
+(defun ingest-carekit-one (state body)
+  (let* ((sample-type (or (jstring body "sampleType" nil) "task-event"))
+         (mapping-id (or (jstring body "sourceMappingId" nil)
+                         (perception-state-carekit-default-source-mapping-id state)))
+         (mapping (source-mapping-by-id state mapping-id))
+         (values (numbers-from-json (or (jget body "values") (jget body "vector") (arr))))
+         (sensor-id (or (jstring body "sensorId" nil)
+                        (render-sensor-template
+                         (or (jstring mapping "sensorIdTemplate" nil) "carekit.{sampleType}")
+                         (list (cons "sampleType" sample-type)
+                               (cons "taskId" (or (jstring body "taskId" nil) sample-type))
+                               (cons "carePlanId" (or (jstring body "carePlanId" nil) "care-plan"))))))
+         (region (make-region-from-json (or (jget mapping "region")
+                                            (obj "offset" 4310 "length" (length values)))))
+         (ttl-ms (or (jnumber mapping "ttlMs" nil) 900000))
+         (source (commit-signal-source state
+                                       sensor-id
+                                       (or (jstring body "name" nil) (format nil "carekit:~a" sample-type))
+                                       region
+                                       values
+                                       ttl-ms)))
+    (obj "sourceMappingId" mapping-id
+         "sampleType" sample-type
+         "taskId" (or (jstring body "taskId" nil) +json-null+)
+         "carePlanId" (or (jstring body "carePlanId" nil) +json-null+)
+         "sensorId" sensor-id
+         "source" (source-json source))))
+
+(defun ingest-carekit (state body)
+  (let ((required-token (perception-state-carekit-bridge-token state)))
+    (when (and required-token
+               (not (string= required-token (or (jstring body "token" nil)
+                                                (jstring body "bridgeToken" nil)
+                                                ""))))
+      (return-from ingest-carekit (obj "success" +json-false+ "error" "invalid CareKit bridge token"))))
+  (let ((results nil))
+    (if (and (not (eq (jget body "samples" :missing) :missing))
+             (jarray-p (jget body "samples")))
+        (dolist (sample (jarray-list (jget body "samples")))
+          (push (ingest-carekit-one state sample) results))
+        (push (ingest-carekit-one state body) results))
+    (obj "success" t
+         "bridgeId" (perception-state-carekit-bridge-id state)
+         "results" (vectorize (nreverse results))
+         "timestamp" (now-ms))))
+
+(defun ollama-status-json (state &optional (probe t))
+  (let ((reachable nil)
+        (tags +json-null+)
+        (error +json-null+))
+    (when probe
+      (handler-case
+          (progn
+            (setf tags (http-get-json (format nil "~a/api/tags" (perception-state-ollama-base-url state))))
+            (setf reachable t))
+        (error (condition)
+          (setf error (princ-to-string condition)))))
+    (obj "baseUrl" (perception-state-ollama-base-url state)
+         "model" (perception-state-ollama-model state)
+         "completionSourceMappingId" (perception-state-ollama-completion-source-mapping-id state)
+         "reachable" (json-bool reachable)
+         "tags" tags
+         "error" error
+         "statusEndpoint" "/api/integrations/ollama/status"
+         "dispatchEndpoint" "/api/integrations/ollama/dispatch")))
+
+(defun openai-status-json (state &optional (probe t))
+  (let ((reachable nil)
+        (models +json-null+)
+        (error +json-null+))
+    (when (and probe (> (length (or (perception-state-openai-api-key state) "")) 0))
+      (handler-case
+          (progn
+            (setf models (http-request-json
+                          (format nil "~a/models" (perception-state-openai-base-url state))
+                          :method :get
+                          :headers (list (cons "Authorization"
+                                               (format nil "Bearer ~a" (perception-state-openai-api-key state))))))
+            (setf reachable t))
+        (error (condition)
+          (setf error (princ-to-string condition)))))
+    (obj "baseUrl" (perception-state-openai-base-url state)
+         "model" (perception-state-openai-model state)
+         "hasApiKey" (json-bool (> (length (or (perception-state-openai-api-key state) "")) 0))
+         "completionSourceMappingId" (perception-state-openai-completion-source-mapping-id state)
+         "reachable" (json-bool reachable)
+         "models" models
+         "error" error
+         "statusEndpoint" "/api/integrations/openai/status"
+         "dispatchEndpoint" "/api/integrations/openai/dispatch")))
+
+(defun dispatch-record-prompt (record)
+  (json-stringify (or (jget record "envelope") record)))
+
+(defun dispatch-ollama (state body)
+  (let* ((id (or (jstring body "dispatchId" nil) (jstring body "id" nil)))
+         (record (and id (lookup-dispatch-record state id))))
+    (unless record
+      (return-from dispatch-ollama (obj "success" +json-false+ "error" "dispatch record not found")))
+    (update-dispatch-record state id (obj "status" "delivering" "adapter" "ollama" "provider" "ollama" "incrementAttempts" t))
+    (handler-case
+        (let* ((model (or (jstring body "model" nil) (perception-state-ollama-model state)))
+               (mapping-id (or (jstring body "sourceMappingId" nil)
+                               (perception-state-ollama-completion-source-mapping-id state)))
+               (payload (obj "model" model
+                             "stream" +json-false+
+                             "messages" (vectorize
+                                         (list (obj "role" "system"
+                                                    "content" "Return concise JSON. If committing a PE completion, include numeric values.")
+                                               (obj "role" "user"
+                                                    "content" (dispatch-record-prompt record))))))
+               (response (http-request-json (format nil "~a/api/chat" (perception-state-ollama-base-url state))
+                                            :method :post
+                                            :payload payload))
+               (content (or (jstring (jget response "message") "content" nil) ""))
+               (values (completion-values-from-content content))
+               (completion +json-null+))
+          (when values
+            (setf completion (ingest-completion
+                              state
+                              (obj "provider" "ollama"
+                                   "agent" (jstring record "target" "ollama")
+                                   "sourceMappingId" mapping-id
+                                   "correlationId" id
+                                   "values" values))))
+          (update-dispatch-record state id (obj "status" "delivered"
+                                                "adapter" "ollama"
+                                                "provider" "ollama"
+                                                "externalRunId" (or (jstring response "created_at" nil)
+                                                                    (make-id "ollama-run"))))
+          (obj "success" t "provider" "ollama" "response" response "completion" completion))
+      (error (condition)
+        (update-dispatch-record state id (obj "status" "failed"
+                                              "adapter" "ollama"
+                                              "provider" "ollama"
+                                              "lastError" (princ-to-string condition)))
+        (obj "success" +json-false+ "provider" "ollama" "error" (princ-to-string condition))))))
+
+(defun openai-response-text (response)
+  (or (jstring response "output_text" nil)
+      (let ((out nil))
+        (dolist (item (jarray-list (or (jget response "output") (arr))))
+          (dolist (content (jarray-list (or (jget item "content") (arr))))
+            (when (and (null out) (jstring content "text" nil))
+              (setf out (jstring content "text")))))
+        out)
+      ""))
+
+(defun dispatch-openai (state body)
+  (let* ((id (or (jstring body "dispatchId" nil) (jstring body "id" nil)))
+         (record (and id (lookup-dispatch-record state id))))
+    (unless record
+      (return-from dispatch-openai (obj "success" +json-false+ "error" "dispatch record not found")))
+    (when (zerop (length (or (perception-state-openai-api-key state) "")))
+      (return-from dispatch-openai (obj "success" +json-false+ "error" "OPENAI_API_KEY is not configured")))
+    (update-dispatch-record state id (obj "status" "delivering" "adapter" "openai" "provider" "openai" "incrementAttempts" t))
+    (handler-case
+        (let* ((model (or (jstring body "model" nil) (perception-state-openai-model state)))
+               (mapping-id (or (jstring body "sourceMappingId" nil)
+                               (perception-state-openai-completion-source-mapping-id state)))
+               (payload (obj "model" model
+                             "instructions" "Return concise JSON. If committing a PE completion, include numeric values."
+                             "input" (dispatch-record-prompt record)))
+               (response (http-request-json
+                          (format nil "~a/responses" (perception-state-openai-base-url state))
+                          :method :post
+                          :payload payload
+                          :headers (list (cons "Authorization"
+                                               (format nil "Bearer ~a" (perception-state-openai-api-key state))))))
+               (content (openai-response-text response))
+               (values (completion-values-from-content content))
+               (completion +json-null+))
+          (when values
+            (setf completion (ingest-completion
+                              state
+                              (obj "provider" "openai"
+                                   "agent" (jstring record "target" "openai")
+                                   "sourceMappingId" mapping-id
+                                   "correlationId" id
+                                   "completionId" (or (jstring response "id" nil) +json-null+)
+                                   "values" values))))
+          (update-dispatch-record state id (obj "status" "delivered"
+                                                "adapter" "openai"
+                                                "provider" "openai"
+                                                "externalRunId" (or (jstring response "id" nil)
+                                                                    (make-id "openai-run"))))
+          (obj "success" t "provider" "openai" "response" response "completion" completion))
+      (error (condition)
+        (update-dispatch-record state id (obj "status" "failed"
+                                              "adapter" "openai"
+                                              "provider" "openai"
+                                              "lastError" (princ-to-string condition)))
+        (obj "success" +json-false+ "provider" "openai" "error" (princ-to-string condition))))))
+
 (defun push-perception (state include-machine-results)
   (let* ((engine (perception-state-engine state))
          (vector (assemble-perception-vector engine))
@@ -244,6 +856,7 @@ Per-sequence boundaries live in metadata.segments for UI display."
     (handler-case
         (let ((response (http-post-json (format nil "~a/api/perceive" (perception-state-reality-url state))
                                         payload)))
+          (record-dispatch-envelopes-from-step state response)
           (setf (perception-engine-last-push engine) response)
           (obj "success" t
                "vector" (vectorize vector)
@@ -264,6 +877,73 @@ Per-sequence boundaries live in metadata.segments for UI display."
                                     (declare (ignore _ body query))
                                     (json-response (actor-ask actor (lambda (state)
                                                                       (perception-state-json (perception-state-engine state)))))))
+   (make-route "GET" "/api/integrations/status" (lambda (_ body query)
+                                                  (declare (ignore _ body query))
+                                                  (json-response (actor-ask actor #'integrations-status-json))))
+   (make-route "POST" "/api/integrations/completions" (lambda (_ body query)
+                                                        (declare (ignore _ query))
+                                                        (json-response
+                                                         (actor-ask actor
+                                                                    (lambda (state)
+                                                                      (ingest-completion state body))))))
+   (make-route "GET" "/api/triggers/status" (lambda (_ body query)
+                                              (declare (ignore _ body query))
+                                              (json-response (actor-ask actor #'triggers-status-json))))
+   (make-route "GET" "/api/dispatch/ledger" (lambda (_ body query)
+                                              (declare (ignore _ body query))
+                                              (json-response (actor-ask actor #'ledger-json))))
+   (make-route "GET" "/api/dispatch/records/:id" (lambda (params body query)
+                                                   (declare (ignore body query))
+                                                   (let ((record (actor-ask actor
+                                                                            (lambda (state)
+                                                                              (lookup-dispatch-record state (gethash "id" params))))))
+                                                     (if record
+                                                         (json-response record)
+                                                         (error-response "Dispatch record not found" 404)))))
+   (make-route "PATCH" "/api/dispatch/records/:id" (lambda (params body query)
+                                                     (declare (ignore query))
+                                                     (let ((record (actor-ask actor
+                                                                              (lambda (state)
+                                                                                (update-dispatch-record state (gethash "id" params) body)))))
+                                                       (if record
+                                                           (json-response record)
+                                                           (error-response "Dispatch record not found" 404)))))
+   (make-route "GET" "/api/integrations/ollama/status" (lambda (_ body query)
+                                                         (declare (ignore _ body query))
+                                                         (json-response (actor-ask actor #'ollama-status-json))))
+   (make-route "POST" "/api/integrations/ollama/dispatch" (lambda (_ body query)
+                                                            (declare (ignore _ query))
+                                                            (json-response
+                                                             (actor-ask actor
+                                                                        (lambda (state)
+                                                                          (dispatch-ollama state body))))))
+   (make-route "GET" "/api/integrations/openai/status" (lambda (_ body query)
+                                                         (declare (ignore _ body query))
+                                                         (json-response (actor-ask actor #'openai-status-json))))
+   (make-route "POST" "/api/integrations/openai/dispatch" (lambda (_ body query)
+                                                            (declare (ignore _ query))
+                                                            (json-response
+                                                             (actor-ask actor
+                                                                        (lambda (state)
+                                                                          (dispatch-openai state body))))))
+   (make-route "GET" "/api/integrations/healthkit/status" (lambda (_ body query)
+                                                            (declare (ignore _ body query))
+                                                            (json-response (actor-ask actor #'healthkit-status-json))))
+   (make-route "POST" "/api/integrations/healthkit/ingest" (lambda (_ body query)
+                                                             (declare (ignore _ query))
+                                                             (json-response
+                                                              (actor-ask actor
+                                                                         (lambda (state)
+                                                                           (ingest-healthkit state body))))))
+   (make-route "GET" "/api/integrations/carekit/status" (lambda (_ body query)
+                                                          (declare (ignore _ body query))
+                                                          (json-response (actor-ask actor #'carekit-status-json))))
+   (make-route "POST" "/api/integrations/carekit/ingest" (lambda (_ body query)
+                                                           (declare (ignore _ query))
+                                                           (json-response
+                                                            (actor-ask actor
+                                                                       (lambda (state)
+                                                                         (ingest-carekit state body))))))
    (make-route "GET" "/api/integrations/localai/status" (lambda (_ body query)
                                                          (declare (ignore _ body query))
                                                          (json-response (actor-ask actor #'localai-status-json))))
@@ -281,26 +961,11 @@ Per-sequence boundaries live in metadata.segments for UI display."
                                       (json-response
                                        (actor-ask actor
                                                   (lambda (state)
-                                                    (let* ((sensor-id (or (jstring body "sensorId" nil)
-                                                                         (jstring body "id" nil)
-                                                                         "localai_agent_activity"))
-                                                           (values (numbers-from-json (or (jget body "values")
-                                                                                          (jget body "vector")
-                                                                                          (arr))))
-                                                           (engine (perception-state-engine state))
-                                                           (source (sensor-exists-p engine sensor-id)))
-                                                      (unless source
-                                                        (setf source (ensure-source-id
-                                                                      engine
-                                                                      (make-source :id sensor-id
-                                                                                   :kind "sensor"
-                                                                                   :name sensor-id
-                                                                                   :active-p t
-                                                                                   :region (make-region :offset 0 :length (length values))
-                                                                                   :sensor-id sensor-id))))
-                                                      (setf (source-last-value source) values
-                                                            (source-last-updated source) (now-ms))
-                                                      (obj "success" t "sensorId" sensor-id "timestamp" (now-ms))))))))
+                                                    (ingest-signal-body
+                                                     state body
+                                                     :default-sensor-id "localai_agent_activity"
+                                                     :default-name "localai_agent_activity"
+                                                     :default-ttl-ms 30000))))))
    (make-route "POST" "/api/push" (lambda (_ body query)
                                    (declare (ignore _ query))
                                    (json-response
@@ -466,9 +1131,9 @@ Per-sequence boundaries live in metadata.segments for UI display."
                  (let ((result (actor-ask actor
                                           (lambda (state)
                                             (mqtt-reload-bridge state body)))))
-                   (cond
-                     ((stringp result) (error-response result 400))
-                     (t (json-response result))))))))
+	                   (cond
+	                     ((stringp result) (error-response result 400))
+	                     (t (json-response result))))))))
 
 ;; ── MQTT ingest path ────────────────────────────────────────────────────────
 ;;
@@ -580,6 +1245,7 @@ startup — the PE still serves HTTP signals as a pure REST engine."
                                                    :localai-url localai-url
                                                    :localai-machine-dir localai-machine-dir))
          (actor (state-actor "perception-service" state)))
+    (load-integrations-config state)
     ;; Boot the bridge after the actor is alive so the ingest closure can
     ;; tell-into it safely.  The bridge boot is fire-and-forget — if MQTT
     ;; isn't configured the PE still serves HTTP signals normally.

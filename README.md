@@ -108,7 +108,7 @@ Implemented endpoints intentionally mirror the AI and CPP services:
 - **Cross-runtime Prometheus** — `/api/metrics` text exposition stamped
   with `runtime="lsp"` on every line
 
-See [docs/API_EQUIVALENCE.md](docs/API_EQUIVALENCE.md),
+See [docs/INTEGRATION_ARCHITECTURE.md](docs/INTEGRATION_ARCHITECTURE.md), [docs/API_EQUIVALENCE.md](docs/API_EQUIVALENCE.md),
 [docs/CONTEXT_EQUIVALENCE.md](docs/CONTEXT_EQUIVALENCE.md), and
 [docs/CONFIGURATION_EQUIVALENCE.md](docs/CONFIGURATION_EQUIVALENCE.md).
 
@@ -124,12 +124,29 @@ flags):
 | `VECTOR_DIMENSION` | `768` | Perceptual-space dimension floor |
 | `MACHINES_DIR` | `../RealityEngine_AI/examples/machines` | Source of startup machines |
 | `LOCAL_AI_API_URL` | `http://localhost:8000` | localAIStack integration target |
+| `INTEGRATIONS_CONFIG` | `config/integrations.json` when present | Provider-neutral startup registry for source mappings |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Local Ollama adapter base URL |
+| `OLLAMA_MODEL` | `gpt-oss:20b` | Default Ollama model for PE-controlled dispatch |
+| `OLLAMA_COMPLETION_SOURCE_MAPPING_ID` | `agent-completion-risk` | Default source mapping for Ollama completion commits |
+| `OPENAI_API_KEY` | unset | API key for caller-driven OpenAI Responses dispatch |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible Responses API base URL |
+| `OPENAI_MODEL` | `gpt-5` | Default OpenAI model for PE-controlled dispatch |
+| `OPENAI_COMPLETION_SOURCE_MAPPING_ID` | `agent-completion-risk` | Default source mapping for OpenAI completion commits |
+| `HEALTHKIT_BRIDGE_ID` | `healthkit-ios-bridge` | Expected Apple-platform HealthKit bridge identity |
+| `HEALTHKIT_DEFAULT_SOURCE_MAPPING_ID` | `healthkit-activity` | Default source mapping for HealthKit bridge ingest |
+| `HEALTHKIT_BRIDGE_TOKEN` | unset | Optional shared token required in HealthKit bridge ingest payloads |
+| `CAREKIT_BRIDGE_ID` | `carekit-ios-bridge` | Expected Apple-platform CareKit bridge identity |
+| `CAREKIT_DEFAULT_SOURCE_MAPPING_ID` | `carekit-task` | Default source mapping for CareKit bridge ingest |
+| `CAREKIT_BRIDGE_TOKEN` | unset | Optional shared token required in CareKit bridge ingest payloads |
 | `MQTT_BROKER_HOST` | unset | Set to enable the MQTT bridge |
 | `MQTT_BROKER_PORT` | `1883` | Broker port |
 | `MQTT_CLIENT_ID` | `reality-engine-pe-lsp` | Client identifier |
 | `MQTT_MAPPINGS_FILE` | unset | Path to the registry JSON |
 | `MQTT_MAPPINGS_JSON` | unset | Inline registry JSON |
 | `MQTT_ALLOW_REGION_OVERLAP` | `0` | Suppress overlap warnings when `1` |
+| `TRIGGERS_ENABLED` | `false` | Enable PE trigger envelope recording from RE `mergeBatch` results |
+| `TRIGGER_DISPATCH_MODE` | `dry-run` | Label for trigger dispatch target (`dry-run`, `graphql`, `openai`, `ollama`, `mcp`) |
+| `TRIGGER_GRAPHQL_URL` | `${LOCAL_AI_API_URL}/graphql` | localAIStack GraphQL target metadata for trigger envelopes |
 
 ## Compatibility Notes
 
