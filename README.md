@@ -57,7 +57,7 @@ Defaults match the sibling implementations:
 - Reality Engine: `http://localhost:3299`
 - Perception Engine: `http://localhost:3300`
 - Machine directory: `../RealityEngine_AI/examples/machines`
-- Vector dimension: `768`
+- Vector dimension: `768` (configurable floor; grows elastically to span all machine mappings)
 
 ## MQTT Integration
 
