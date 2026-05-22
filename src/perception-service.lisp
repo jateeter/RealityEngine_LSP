@@ -1755,7 +1755,10 @@ startup — the PE still serves HTTP signals as a pure REST engine."
                        (append
                         (list (hunchentoot:create-prefix-dispatcher
                                "/api/events"
-                               #'sse-events-handler))
+                               #'sse-events-handler)
+                              (hunchentoot:create-prefix-dispatcher
+                               "/ws"
+                               #'ws-handler))
                         (make-mcp-dispatchers actor)))))
 
 (defun start-perception-from-environment ()

@@ -7,6 +7,7 @@
   :depends-on (#:alexandria
                #:babel
                #:bordeaux-threads
+               #:cl-base64
                #:hunchentoot
                #:drakma
                #:usocket

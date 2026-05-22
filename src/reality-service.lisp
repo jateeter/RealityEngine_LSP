@@ -7,7 +7,11 @@
   ;; CES coverage counters — mirror RealityEngine_AI/CesCoverageRegistry and
   ;; RealityEngine_CPP/CesCoverageRegistry so the same Prometheus scrape
   ;; config covers all three runtimes.  Keyed by tab-joined identifiers.
-  cov-matched cov-activated cov-outputs cov-steps cov-paging cov-deprecated)
+  cov-matched cov-activated cov-outputs cov-steps cov-paging cov-deprecated
+  checkpoints
+  match-threshold
+  sampler-running-p sampler-strategy sampler-interval-ms sampler-sample-count
+  sim-buffer sim-buffered-region sim-buffered-delay)
 
 (defun compose-key (producer-machine-id producer-sequence-id)
   (format nil "~a|~a" producer-machine-id producer-sequence-id))
@@ -102,7 +106,16 @@
            :cov-outputs    (make-hash-table :test #'equal)
            :cov-steps      (make-hash-table :test #'equal)
            :cov-paging     (make-hash-table :test #'equal)
-           :cov-deprecated (make-hash-table :test #'equal))))
+           :cov-deprecated (make-hash-table :test #'equal)
+           :checkpoints    (make-hash-table :test #'equal)
+           :match-threshold 0.5d0
+           :sampler-running-p nil
+           :sampler-strategy "manual"
+           :sampler-interval-ms 0
+           :sampler-sample-count 0
+           :sim-buffer nil
+           :sim-buffered-region nil
+           :sim-buffered-delay 100)))
     (dolist (machine (load-machines-from-directory machine-dir))
       (put-machine state machine))
     state))
@@ -1222,6 +1235,48 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                                                                          (compact-query-p query)))
                                                            (obj "error" "Provide exactly one of: vector, sparseVector, domainVectors"))))))))))
 
+(defun demo-machine-response (state target-name file-name display-name)
+  "Compute the demo response for the machine named TARGET-NAME.
+  Returns the result hash-table on success, or a cons (:error . message) on failure."
+  (let ((machine nil))
+    (maphash (lambda (_ m)
+               (declare (ignore _))
+               (when (string= (machine-name m) target-name)
+                 (setf machine m)))
+             (reality-state-machines state))
+    (cond
+      ((null machine)
+       (cons :error
+             (format nil "~a machine not found. Please ensure ~a is loaded."
+                     display-name file-name)))
+      (t
+       (let* ((seqs (object-values-sorted (machine-sequences machine)))
+              (seq-names (mapcar #'sequence-name seqs))
+              (seq-count (length seqs))
+              (metadata (or (machine-metadata machine) (obj)))
+              (input-seqs-list (jarray-list (or (jget metadata "inputSequences") #())))
+              (first-seq (first input-seqs-list))
+              (input-vector-count
+               (if first-seq
+                   (length (jarray-list (or (jget first-seq "vectors") #())))
+                   0))
+              (meta-response
+               (let ((result (make-hash-table :test #'equal)))
+                 (when (hash-table-p* metadata)
+                   (maphash (lambda (k v) (setf (gethash k result) v)) metadata))
+                 (setf (gethash "name" result)              (machine-name machine)
+                       (gethash "description" result)       (or (machine-description machine) "")
+                       (gethash "machineId" result)         (machine-id machine)
+                       (gethash "totalSequences" result)    seq-count
+                       (gethash "sequenceNames" result)     (vectorize seq-names)
+                       (gethash "totalInputVectors" result) input-vector-count)
+                 result)))
+         (obj "success"            t
+              "machine"            (machine-json machine :full t)
+              "metadata"           meta-response
+              "sequencesLoaded"    seq-count
+              "inputVectorsLoaded" input-vector-count))))))
+
 (defun reality-routes (actor)
   (labels ((state-json (fn)
              (json-response (actor-ask actor fn))))
@@ -1242,6 +1297,22 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                                                           "matchThreshold" 0.5d0
                                                           "qdrantUrl" (reality-state-qdrant-url state)
                                                           "collectionName" (reality-state-collection-name state))))))
+     (make-route "PUT" "/api/config/dimension" (lambda (_ body query)
+                                                 (declare (ignore _ body))
+                                                 (state-json (lambda (state)
+                                                               (let ((dim (parse-integer (or (gethash "dimension" query)
+                                                                                             (write-to-string (reality-state-dimension state)))
+                                                                                         :junk-allowed t)))
+                                                                 (setf (reality-state-dimension state) dim)
+                                                                 (obj "success" t "dimension" dim))))))
+     (make-route "PUT" "/api/config/threshold" (lambda (_ body query)
+                                                 (declare (ignore _ body))
+                                                 (state-json (lambda (state)
+                                                               (let ((threshold (or (ignore-errors
+                                                                                     (read-from-string (or (gethash "threshold" query) "")))
+                                                                                    0.5d0)))
+                                                                 (setf (reality-state-match-threshold state) threshold)
+                                                                 (obj "success" t "threshold" threshold))))))
      (make-route "GET" "/api/engine/stats" (lambda (_ body query)
                                              (declare (ignore _ body query))
                                              (state-json (lambda (state) (obj "stats" (stats-json state))))))
@@ -1267,6 +1338,18 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                                                               (obj "historyLimit" (reality-state-history-limit state)
                                                                    "includeMachineResults" (json-bool (reality-state-include-machine-results-p state))
                                                                    "includePerceptualSpace" (json-bool (reality-state-include-perceptual-space-p state)))))))
+     (make-route "PATCH" "/api/runtime/options" (lambda (_ body query)
+                                                   (declare (ignore _ query))
+                                                   (state-json (lambda (state)
+                                                                 (when (jnumber body "historyLimit" nil)
+                                                                   (setf (reality-state-history-limit state) (truncate (jnumber body "historyLimit"))))
+                                                                 (when (not (eq (jget body "includeMachineResults" :missing) :missing))
+                                                                   (setf (reality-state-include-machine-results-p state) (jbool body "includeMachineResults" t)))
+                                                                 (when (not (eq (jget body "includePerceptualSpace" :missing) :missing))
+                                                                   (setf (reality-state-include-perceptual-space-p state) (jbool body "includePerceptualSpace" t)))
+                                                                 (obj "historyLimit" (reality-state-history-limit state)
+                                                                      "includeMachineResults" (json-bool (reality-state-include-machine-results-p state))
+                                                                      "includePerceptualSpace" (json-bool (reality-state-include-perceptual-space-p state)))))))
      (make-route "GET" "/api/runtime/vector-space" (lambda (_ body query)
                                                      (declare (ignore _ body query))
                                                      (state-json (lambda (state)
@@ -1307,6 +1390,22 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
      (make-route "POST" "/api/engine/reset" (lambda (_ body query)
                                               (declare (ignore _ body query))
                                               (state-json (lambda (state) (reset-reality-state state) (obj "success" t)))))
+     (make-route "POST" "/api/engine/process" (lambda (_ body query)
+                                                (declare (ignore _ query))
+                                                (state-json (lambda (state)
+                                                              (let ((input (numbers-from-json (jget body "vector")))
+                                                                    (outputs nil))
+                                                                (maphash (lambda (_ machine)
+                                                                           (declare (ignore _))
+                                                                           (let ((result (process-machine-input machine input)))
+                                                                             (when (transition-result-machine-output result)
+                                                                               (push (output-vector-json (transition-result-machine-output result)) outputs))))
+                                                                         (reality-state-machines state))
+                                                                (let ((result (obj "inputVector" (vectorize input)
+                                                                                   "timestamp" (now-ms)
+                                                                                   "outputs" (vectorize (nreverse outputs)))))
+                                                                  (record-history state (obj "type" "engine-process" "result" result))
+                                                                  (obj "result" result)))))))
      (make-route "GET" "/api/engine/history" (lambda (_ body query)
                                                (declare (ignore _ body query))
                                                (state-json (lambda (state) (obj "history" (vectorize (reality-state-history state)))))))
@@ -1333,6 +1432,227 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                                                         (let ((machine (machine-from-json body)))
                                                           (put-machine state machine)
                                                           (obj "success" t "machine" (machine-json machine :full t)))))))
+     (make-route "PUT" "/api/machines/:id" (lambda (params body query)
+                                             (declare (ignore query))
+                                             (state-json (lambda (state)
+                                                           (let ((machine (machine-from-json body (gethash "id" params))))
+                                                             (put-machine state machine)
+                                                             (obj "success" t "machine" (machine-json machine :full t)))))))
+     (make-route "PATCH" "/api/machines/:id" (lambda (params body query)
+                                               (declare (ignore query))
+                                               (let ((result (actor-ask actor
+                                                                        (lambda (state)
+                                                                          (let ((machine (gethash (gethash "id" params)
+                                                                                                  (reality-state-machines state))))
+                                                                            (when machine
+                                                                              (when (jstring body "name" nil)
+                                                                                (setf (machine-name machine) (jstring body "name" nil)))
+                                                                              (when (jstring body "description" nil)
+                                                                                (setf (machine-description machine) (jstring body "description" nil)))
+                                                                              (when (jobject-p (jget body "metadata"))
+                                                                                (let ((existing (or (machine-metadata machine) (obj))))
+                                                                                  (maphash (lambda (k v) (setf (gethash k existing) v))
+                                                                                           (jget body "metadata"))
+                                                                                  (setf (machine-metadata machine) existing)))
+                                                                              (put-machine state machine)
+                                                                              (obj "success" t "machine" (machine-json machine :full t))))))))
+                                                 (if result (json-response result) (error-response "Machine not found" 404)))))
+     (make-route "DELETE" "/api/machines/:id" (lambda (params body query)
+                                               (declare (ignore body query))
+                                               (state-json (lambda (state)
+                                                             (unregister-compose-subscriptions state (gethash "id" params))
+                                                             (let ((removed (remhash (gethash "id" params)
+                                                                                     (reality-state-machines state))))
+                                                               (when removed
+                                                                 (incf (reality-state-mapping-version state)))
+                                                               (obj "success" (json-bool removed)))))))
+     (make-route "POST" "/api/machines/:id/process-universal" (lambda (params body query)
+                                                               (declare (ignore query))
+                                                               (let ((result (actor-ask actor
+                                                                                        (lambda (state)
+                                                                                          (let ((machine (gethash (gethash "id" params)
+                                                                                                                  (reality-state-machines state))))
+                                                                                            (when (and machine (machine-mapping machine))
+                                                                                              (transition-result-json
+                                                                                               (process-machine-input machine
+                                                                                                                      (extract-region
+                                                                                                                       (numbers-from-json (jget body "universalInputSpace"))
+                                                                                                                       (mapping-input (machine-mapping machine)))))))))))
+                                                                 (if result (json-response result) (error-response "Machine not found" 404)))))
+     (make-route "POST" "/api/machines/process-universal/all" (lambda (_ body query)
+                                                               (declare (ignore _ query))
+                                                               (state-json (lambda (state)
+                                                                             (let ((universal (numbers-from-json (jget body "universalInputSpace")))
+                                                                                   (results (make-hash-table :test #'equal)))
+                                                                               (maphash (lambda (id machine)
+                                                                                          (when (machine-mapping machine)
+                                                                                            (setf (gethash id results)
+                                                                                                  (transition-result-json
+                                                                                                   (process-machine-input machine
+                                                                                                                          (extract-region universal
+                                                                                                                                          (mapping-input (machine-mapping machine))))))))
+                                                                                        (reality-state-machines state))
+                                                                               (obj "results" results))))))
+     (make-route "POST" "/api/machines/:id/whatif" (lambda (params body query)
+                                                    (declare (ignore query))
+                                                    (let ((result (actor-ask actor
+                                                                             (lambda (state)
+                                                                               (let ((machine (gethash (gethash "id" params)
+                                                                                                       (reality-state-machines state))))
+                                                                                 (when machine
+                                                                                   (transition-result-json
+                                                                                    (process-machine-input
+                                                                                     (machine-from-json (machine-json machine :full t))
+                                                                                     (numbers-from-json (jget body "inputVector"))))))))))
+                                                      (if result (json-response result) (error-response "Machine not found" 404)))))
+     (make-route "POST" "/api/machines/:id/whatif-universal" (lambda (params body query)
+                                                              (declare (ignore query))
+                                                              (let ((result (actor-ask actor
+                                                                                       (lambda (state)
+                                                                                         (let ((machine (gethash (gethash "id" params)
+                                                                                                                 (reality-state-machines state))))
+                                                                                           (when (and machine (machine-mapping machine))
+                                                                                             (let* ((copy (machine-from-json (machine-json machine :full t)))
+                                                                                                    (input (extract-region
+                                                                                                            (numbers-from-json (jget body "universalInputSpace"))
+                                                                                                            (mapping-input (machine-mapping copy)))))
+                                                                                               (transition-result-json (process-machine-input copy input)))))))))
+                                                                (if result (json-response result) (error-response "Machine not found" 404)))))
+     (make-route "GET" "/api/machines/json/list" (lambda (_ body query)
+                                                  (declare (ignore _ body query))
+                                                  (state-json (lambda (state)
+                                                                (let ((rows nil)
+                                                                      (dir (uiop:ensure-directory-pathname (reality-state-machine-dir state))))
+                                                                  (when (uiop:directory-exists-p dir)
+                                                                    (dolist (path (uiop:directory-files dir "*.json"))
+                                                                      (push (obj "filename" (file-namestring path)
+                                                                                 "name" (pathname-name path)
+                                                                                 "description" ""
+                                                                                 "version" "1.0.0"
+                                                                                 "metadata" (obj)
+                                                                                 "sequenceCount" 0)
+                                                                            rows)))
+                                                                  (obj "machines" (vectorize (nreverse rows))))))))
+     (make-route "GET" "/api/machines/json/:name" (lambda (params body query)
+                                                   (declare (ignore body query))
+                                                   (handler-case
+                                                       (state-json (lambda (state)
+                                                                     (let* ((name (gethash "name" params))
+                                                                            (filename (if (uiop:string-suffix-p ".json" name)
+                                                                                          name
+                                                                                          (format nil "~a.json" name)))
+                                                                            (path (merge-pathnames
+                                                                                   filename
+                                                                                   (uiop:ensure-directory-pathname (reality-state-machine-dir state))))
+                                                                            (machine (load-machine-from-file path)))
+                                                                       (put-machine state machine)
+                                                                       (obj "success" t "machine" (machine-json machine :full t)
+                                                                            "message" "Machine loaded successfully"))))
+                                                     (error (c) (error-response (princ-to-string c) 404)))))
+     (make-route "POST" "/api/machines/json/import" (lambda (_ body query)
+                                                     (declare (ignore _ query))
+                                                     (state-json (lambda (state)
+                                                                   (let ((machine (machine-from-json body)))
+                                                                     (put-machine state machine)
+                                                                     (obj "success" t "machine" (machine-json machine :full t)))))))
+     (make-route "GET" "/api/machines/:id/export" (lambda (params body query)
+                                                   (declare (ignore body query))
+                                                   (let ((machine (actor-ask actor
+                                                                             (lambda (state)
+                                                                               (gethash (gethash "id" params)
+                                                                                        (reality-state-machines state))))))
+                                                     (if machine
+                                                         (json-response (obj "version" "1.0.0"
+                                                                             "machine" (machine-json machine :full t)))
+                                                         (error-response "Machine not found" 404)))))
+     (make-route "GET" "/api/machines/:id/checkpoints" (lambda (params body query)
+                                                         (declare (ignore body query))
+                                                         (state-json (lambda (state)
+                                                                       (let* ((mid (gethash "id" params))
+                                                                              (sub (gethash mid (reality-state-checkpoints state))))
+                                                                         (obj "checkpoints"
+                                                                              (vectorize
+                                                                               (let (rows)
+                                                                                 (when sub
+                                                                                   (maphash (lambda (_ cp)
+                                                                                              (declare (ignore _))
+                                                                                              (push (obj "id" (gethash "id" cp)
+                                                                                                         "label" (gethash "label" cp)
+                                                                                                         "timestamp" (gethash "timestamp" cp))
+                                                                                                    rows))
+                                                                                            sub))
+                                                                                 (nreverse rows)))))))))
+     (make-route "POST" "/api/machines/:id/checkpoints" (lambda (params body query)
+                                                          (declare (ignore query))
+                                                          (let ((result (actor-ask actor
+                                                                                   (lambda (state)
+                                                                                     (let* ((mid (gethash "id" params))
+                                                                                            (machine (gethash mid (reality-state-machines state))))
+                                                                                       (when machine
+                                                                                         (let* ((cp-id (make-id "checkpoint"))
+                                                                                                (label (or (jstring body "label" nil) "checkpoint"))
+                                                                                                (clone (machine-from-json (machine-json machine :full t)))
+                                                                                                (cp (obj "id" cp-id "label" label
+                                                                                                         "timestamp" (now-ms) "machine" clone))
+                                                                                                (cps (reality-state-checkpoints state))
+                                                                                                (sub (or (gethash mid cps)
+                                                                                                         (setf (gethash mid cps)
+                                                                                                               (make-hash-table :test #'equal)))))
+                                                                                           (setf (gethash cp-id sub) cp)
+                                                                                           (obj "success" t "checkpointId" cp-id))))))))
+                                                            (if result (json-response result) (error-response "Machine not found" 404)))))
+     (make-route "POST" "/api/machines/:machineId/checkpoints/:cpId/restore" (lambda (params body query)
+                                                                               (declare (ignore body query))
+                                                                               (let ((result (actor-ask actor
+                                                                                                        (lambda (state)
+                                                                                                          (let* ((mid (gethash "machineId" params))
+                                                                                                                 (cp-id (gethash "cpId" params))
+                                                                                                                 (sub (gethash mid (reality-state-checkpoints state)))
+                                                                                                                 (cp (when sub (gethash cp-id sub))))
+                                                                                                            (when cp
+                                                                                                              (unregister-compose-subscriptions state mid)
+                                                                                                              (remhash mid (reality-state-machines state))
+                                                                                                              (put-machine state (gethash "machine" cp))
+                                                                                                              (obj "success" t))))))))
+                                                                                 (if result (json-response result) (error-response "Checkpoint not found" 404)))))
+     (make-route "DELETE" "/api/machines/:machineId/checkpoints/:cpId" (lambda (params body query)
+                                                                         (declare (ignore body query))
+                                                                         (state-json (lambda (state)
+                                                                                       (let* ((mid (gethash "machineId" params))
+                                                                                              (cp-id (gethash "cpId" params))
+                                                                                              (sub (gethash mid (reality-state-checkpoints state)))
+                                                                                              (removed (when sub (remhash cp-id sub))))
+                                                                                         (obj "success" (json-bool removed)))))))
+     (make-route "DELETE" "/api/sequences/:id" (lambda (params body query)
+                                                 (declare (ignore body query))
+                                                 (let ((result (actor-ask actor
+                                                                          (lambda (state)
+                                                                            (let ((sid (gethash "id" params)))
+                                                                              (when (gethash sid (reality-state-sequences state))
+                                                                                (remhash sid (reality-state-sequences state))
+                                                                                t))))))
+                                                   (if result (json-response (obj "success" t)) (error-response "Sequence not found" 404)))))
+     (make-route "POST" "/api/sequences/:id/reset" (lambda (params body query)
+                                                     (declare (ignore body query))
+                                                     (let ((result (actor-ask actor
+                                                                              (lambda (state)
+                                                                                (let ((seq (gethash (gethash "id" params)
+                                                                                                    (reality-state-sequences state))))
+                                                                                  (when seq (reset-sequence seq) t))))))
+                                                       (if result (json-response (obj "success" t)) (error-response "Sequence not found" 404)))))
+     (make-route "POST" "/api/sequences/:id/vectors" (lambda (params body query)
+                                                       (declare (ignore query))
+                                                       (let ((result (actor-ask actor
+                                                                                (lambda (state)
+                                                                                  (let ((seq (gethash (gethash "id" params)
+                                                                                                      (reality-state-sequences state))))
+                                                                                    (when seq
+                                                                                      (let ((vector (parse-reality-vector body)))
+                                                                                        (setf (gethash (reality-vector-id vector)
+                                                                                                       (sequence-vectors seq))
+                                                                                              vector)
+                                                                                        (obj "success" t "vector" (reality-vector-json vector)))))))))
+                                                         (if result (json-response result) (error-response "Sequence not found" 404)))))
      (make-route "POST" "/api/machines/:id/process" (lambda (params body query)
                                                       (declare (ignore query))
                                                       (let ((result (actor-ask actor
@@ -1346,29 +1666,157 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
      (make-route "GET" "/api/machine-graph" (lambda (_ body query)
                                               (declare (ignore _ body query))
                                               (state-json #'machine-graph-json)))
+     ;; ── Perceptual simulation ─────────────────────────────────────────────────
+     (make-route "POST" "/api/perceptual-simulation/step" (lambda (_ body query)
+                                                            (declare (ignore _ body query))
+                                                            (state-json (lambda (state)
+                                                                          (let ((step (process-perceptual-input state (reality-state-perceptual-space state)
+                                                                                                                :include-machine-results t
+                                                                                                                :include-perceptual-space t)))
+                                                                            (obj "success" t "step" step))))))
+     (make-route "POST" "/api/perceptual-simulation/reset" (lambda (_ body query)
+                                                             (declare (ignore _ body query))
+                                                             (state-json (lambda (state) (reset-reality-state state) (obj "success" t)))))
+     (make-route "POST" "/api/perceptual-simulation/start" (lambda (_ body query)
+                                                             (declare (ignore _ body query))
+                                                             (json-response (obj "success" t))))
+     (make-route "POST" "/api/perceptual-simulation/stop" (lambda (_ body query)
+                                                            (declare (ignore _ body query))
+                                                            (json-response (obj "success" t))))
+     (make-route "GET" "/api/perceptual-simulation/state" (lambda (_ body query)
+                                                            (declare (ignore _ body query))
+                                                            (state-json (lambda (state)
+                                                                          (obj "running" +json-false+
+                                                                               "dimension" (reality-state-dimension state)
+                                                                               "perceptualSpace" (vectorize (reality-state-perceptual-space state)))))))
+     (make-route "GET" "/api/perceptual-simulation/history" (lambda (_ body query)
+                                                              (declare (ignore _ body query))
+                                                              (state-json (lambda (state)
+                                                                            (obj "history" (vectorize (reality-state-history state)))))))
+     (make-route "POST" "/api/perceptual-simulation/configure/chunk" (lambda (_ body query)
+                                                                       (declare (ignore _ query))
+                                                                       (state-json (lambda (state)
+                                                                                     (when (jbool body "reset" nil)
+                                                                                       (setf (reality-state-sim-buffer state) nil))
+                                                                                     (dolist (v (jarray-list (or (jget body "vectors") (arr))))
+                                                                                       (push (numbers-from-json v) (reality-state-sim-buffer state)))
+                                                                                     (let ((cfg (or (and (jobject-p (jget body "config")) (jget body "config")) body)))
+                                                                                       (when (jobject-p (jget cfg "inputRegion"))
+                                                                                         (setf (reality-state-sim-buffered-region state)
+                                                                                               (make-region-from-json (jget cfg "inputRegion"))))
+                                                                                       (when (jnumber cfg "stepDelayMs" nil)
+                                                                                         (setf (reality-state-sim-buffered-delay state)
+                                                                                               (truncate (jnumber cfg "stepDelayMs" 100)))))
+                                                                                     (obj "success" t "bufferedVectors" (length (reality-state-sim-buffer state)))))))
+     (make-route "POST" "/api/perceptual-simulation/configure/commit" (lambda (_ body query)
+                                                                        (declare (ignore _ body query))
+                                                                        (state-json (lambda (state)
+                                                                                      (setf (reality-state-sim-buffer state) nil)
+                                                                                      (obj "success" t)))))
+     ;; ── Sampler ───────────────────────────────────────────────────────────────
+     (make-route "POST" "/api/sampler/start" (lambda (_ body query)
+                                               (declare (ignore _ query))
+                                               (state-json (lambda (state)
+                                                             (setf (reality-state-sampler-running-p state) t
+                                                                   (reality-state-sampler-strategy state)    (or (jstring body "strategy" nil) "manual")
+                                                                   (reality-state-sampler-interval-ms state) (truncate (or (jnumber body "intervalMs" 0) 0)))
+                                                             (obj "success" t
+                                                                  "stats" (obj "isRunning" +json-true+
+                                                                               "sampleCount" (reality-state-sampler-sample-count state)
+                                                                               "strategy" (reality-state-sampler-strategy state)
+                                                                               "intervalMs" (reality-state-sampler-interval-ms state)))))))
+     (make-route "POST" "/api/sampler/stop" (lambda (_ body query)
+                                              (declare (ignore _ body query))
+                                              (state-json (lambda (state)
+                                                            (setf (reality-state-sampler-running-p state) nil)
+                                                            (obj "success" t)))))
+     (make-route "POST" "/api/sampler/sample" (lambda (_ body query)
+                                                (declare (ignore _ query))
+                                                (state-json (lambda (state)
+                                                              (incf (reality-state-sampler-sample-count state))
+                                                              (let ((result (obj "inputVector" (vectorize (numbers-from-json (jget body "data")))
+                                                                                 "processingTimestamp" (now-ms))))
+                                                                (obj "success" t "result" result))))))
+     (make-route "GET" "/api/sampler/stats" (lambda (_ body query)
+                                              (declare (ignore _ body query))
+                                              (state-json (lambda (state)
+                                                            (obj "stats" (obj "isRunning" (json-bool (reality-state-sampler-running-p state))
+                                                                              "sampleCount" (reality-state-sampler-sample-count state)
+                                                                              "lastSampleTimestamp" +json-null+
+                                                                              "strategy" (or (reality-state-sampler-strategy state) "manual")
+                                                                              "intervalMs" (or (reality-state-sampler-interval-ms state) 0)))))))
+     ;; ── Perception ────────────────────────────────────────────────────────────
+     (make-route "POST" "/api/perception/observe" (lambda (_ body query)
+                                                    (declare (ignore _ query))
+                                                    (let ((data (numbers-from-json (jget body "data"))))
+                                                      (json-response (obj "success" t
+                                                                          "inputVector" (vectorize data)
+                                                                          "transformations" (arr)
+                                                                          "processingTimestamp" (now-ms))))))
+     (make-route "POST" "/api/perception/diagnostic" (lambda (_ body query)
+                                                       (declare (ignore _ query))
+                                                       (json-response (obj "universalInputSpace" (jget body "universalInputSpace")
+                                                                           "resolvedInputs" (obj)))))
+     ;; ── Demos ────────────────────────────────────────────────────────────────
+     (make-route "GET" "/api/demo/multi-step" (lambda (_ body query)
+       (declare (ignore _ body query))
+       (let ((r (actor-ask actor (lambda (state)
+                                   (demo-machine-response state
+                                     "Multi-Step State Machine"
+                                     "MultiStep.json"
+                                     "Multi-Step State Machine")))))
+         (if (and (consp r) (eq (car r) :error))
+             (error-response (cdr r) 404)
+             (json-response r)))))
+     (make-route "GET" "/api/demo/data-center" (lambda (_ body query)
+       (declare (ignore _ body query))
+       (let ((r (actor-ask actor (lambda (state)
+                                   (demo-machine-response state
+                                     "Data Center Monitoring"
+                                     "DataCenterMonitoring.json"
+                                     "Data Center Monitoring")))))
+         (if (and (consp r) (eq (car r) :error))
+             (error-response (cdr r) 404)
+             (json-response r)))))
+     (make-route "GET" "/api/demo/kleene-star" (lambda (_ body query)
+       (declare (ignore _ body query))
+       (let ((r (actor-ask actor (lambda (state)
+                                   (demo-machine-response state
+                                     "Kleene Star Operator"
+                                     "KleeneStar.json"
+                                     "Kleene Star Operator")))))
+         (if (and (consp r) (eq (car r) :error))
+             (error-response (cdr r) 404)
+             (json-response r)))))
      (make-route "POST" "/api/perceive" (lambda (_ body query)
                                           (declare (ignore _))
                                           (state-json (lambda (state)
                                                         (let ((input (assemble-input-vector state body)))
                                                           (if input
-                                                              (process-perceptual-input
-                                                               state input
-                                                               :override (or (jstring body "matchAlgorithmOverride" nil)
-                                                                             (jstring body "matchAlgorithm" nil))
-                                                               :include-machine-results (jbool body "includeMachineResults"
-                                                                                               (if (jbool body "compact" nil)
-                                                                                                   nil
-                                                                                                   (reality-state-include-machine-results-p state)))
-                                                               :include-perceptual-space (jbool body "includePerceptualSpace"
-                                                                                                (reality-state-include-perceptual-space-p state))
-                                                               :compact (or (jbool body "compact" nil)
-                                                                            (compact-query-p query)))
+                                                              (let ((step (process-perceptual-input
+                                                                           state input
+                                                                           :override (or (jstring body "matchAlgorithmOverride" nil)
+                                                                                         (jstring body "matchAlgorithm" nil))
+                                                                           :include-machine-results (jbool body "includeMachineResults"
+                                                                                                           (if (jbool body "compact" nil)
+                                                                                                               nil
+                                                                                                               (reality-state-include-machine-results-p state)))
+                                                                           :include-perceptual-space (jbool body "includePerceptualSpace"
+                                                                                                            (reality-state-include-perceptual-space-p state))
+                                                                           :compact (or (jbool body "compact" nil)
+                                                                                        (compact-query-p query)))))
+                                                                (re-broadcast (obj "type" "step-result" "step" step))
+                                                                step)
                                                               (obj "error" "Provide exactly one of: vector, sparseVector, domainVectors")))))))))))
 
 (defun start-reality-service (&key (port 3299) (machine-dir "../RealityEngine_AI/examples/machines") (dimension 768))
   (let* ((state (make-reality-state-from-config :machine-dir machine-dir :dimension dimension))
          (actor (state-actor "reality-service" state)))
-    (start-http-server port (reality-routes actor) :name "reality-engine-lsp")))
+    (start-http-server port (reality-routes actor) :name "reality-engine-lsp"
+                       :extra-dispatchers
+                       (list (hunchentoot:create-prefix-dispatcher
+                              "/api/engine/stream"
+                              #'re-sse-stream-handler)))))
 
 (defun start-reality-from-environment ()
   (start-reality-service :port (env-int "REALITY_ENGINE_PORT" 3299)
