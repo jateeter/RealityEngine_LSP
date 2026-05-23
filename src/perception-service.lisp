@@ -689,13 +689,15 @@ Wire-compatible with CPP build_trigger_envelope and TS buildTriggerEnvelope."
                                                          "localAIStack/services/api/routers/graphql_endpoint.py"
                                                          ""))))))
 
-(defun record-dispatch-envelope (state operation)
+(defun record-dispatch-envelope (state operation &optional machine-json-override)
   "Build and ledger one dispatch record for a merge operation.
 Returns the record on success, or NIL when the machine lacks
 dispatchableAgent / aiTrigger — the drop-no-dispatch signal to the caller.
-Wire-compatible with CPP DispatchRecord and TS Dispatcher.recordFromEnvelope."
+Wire-compatible with CPP DispatchRecord and TS Dispatcher.recordFromEnvelope.
+Optional MACHINE-JSON-OVERRIDE bypasses the catalog lookup (used in tests and
+corpus-walk helpers that already hold the loaded machine object)."
   (let* ((machine-id (jstring operation "machineId" ""))
-         (machine (fetch-machine-for-dispatch state machine-id))
+         (machine (or machine-json-override (fetch-machine-for-dispatch state machine-id)))
          (md (and machine (jget machine "metadata")))
          (agent (and md (jstring md "dispatchableAgent" nil)))
          (trigger (and md (jstring md "aiTrigger" nil))))
@@ -966,7 +968,7 @@ Callers accumulate results into resolved/unmapped lists."
       (return-from ingest-healthkit
         (cons 401 (obj "success" +json-false+ "error" "invalid HealthKit bridge token")))))
   (let ((resolved nil) (unmapped nil))
-    (if (jarray-p (jget body "samples"))
+    (if (jget body "samples")
         (dolist (sample (jarray-list (jget body "samples")))
           (let ((r (ingest-healthkit-one state sample)))
             (if (jget r "resolved") (push r resolved) (push r unmapped))))

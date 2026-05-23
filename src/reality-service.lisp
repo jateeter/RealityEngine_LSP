@@ -1865,7 +1865,7 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                                                                                         (compact-query-p query)))))
                                                                 (re-broadcast (obj "type" "step-result" "step" step))
                                                                 step)
-                                                              (obj "error" "Provide exactly one of: vector, sparseVector, domainVectors")))))))))))
+                                                              (obj "error" "Provide exactly one of: vector, sparseVector, domainVectors"))))))))))
 
 (defun start-reality-service (&key (port 3299) (machine-dir "../RealityEngine_AI/examples/machines") (dimension 768))
   (let* ((state (make-reality-state-from-config :machine-dir machine-dir :dimension dimension))

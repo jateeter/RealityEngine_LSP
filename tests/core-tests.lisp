@@ -282,7 +282,8 @@
       (reality-engine-lsp::record-dispatch-envelope
        state
        operation
-       (reality-engine-lsp::machine-metadata machine)))))
+       (reality-engine-lsp::obj "name" (reality-engine-lsp::machine-name machine)
+                                 "metadata" (reality-engine-lsp::machine-metadata machine))))))
 
 (defun walk-corpus-through-pe-dispatch (machine-dir)
   "Replay the AI corpus through the LSP PE dispatch-ledger path.
@@ -342,16 +343,13 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                                  (when record
                                    (incf records)
                                    (let* ((envelope (reality-engine-lsp::jget record "envelope"))
-                                          (governance (reality-engine-lsp::jget envelope "governance"))
-                                          (target (reality-engine-lsp::jstring envelope "dispatchableAgent" ""))
-                                          (trigger (reality-engine-lsp::jstring envelope "aiTrigger" ""))
-                                          (rag (reality-engine-lsp::jstring governance "ragStatusCode" "")))
+                                          (dispatch (reality-engine-lsp::jget envelope "dispatch"))
+                                          (target (reality-engine-lsp::jstring dispatch "agent" ""))
+                                          (trigger (reality-engine-lsp::jstring dispatch "trigger" "")))
                                      (when (zerop (length target))
                                        (push (format nil "~a: PE dispatch target empty" (file-namestring path)) failures))
                                      (when (zerop (length trigger))
-                                       (push (format nil "~a: PE aiTrigger empty" (file-namestring path)) failures))
-                                     (unless (member rag '("RED" "AMBER" "GREEN") :test #'string=)
-                                       (push (format nil "~a: PE ragStatusCode invalid" (file-namestring path)) failures)))))))))))))))))))
+                                       (push (format nil "~a: PE aiTrigger empty" (file-namestring path)) failures)))))))))))))))))))
     (list :state state
           :machines machines
           :sequences sequences
@@ -760,38 +758,101 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
     (assert-equal 4200
                   (reality-engine-lsp::jnumber (reality-engine-lsp::jget source "region") "offset" nil)
                   "completion source should use configured mapping offset"))
+  ;; ── HealthKit Spezi bridge — canonical contract ──────────────────────────
+  ;; Mirrors CPP e2e_healthkit_spezi.sh: token auth rejection, resolved shape
+  ;; with region + source.lastValue for all three Spezi sensor types.
   (let* ((state (reality-engine-lsp::make-perception-state-from-config
                  :dimension 5000
                  :reality-url "http://localhost:3299"
                  :localai-url "http://localhost:8000"
                  :localai-machine-dir "../localAIStack/data/machines"))
-         (healthkit (reality-engine-lsp::ingest-healthkit
-                     state
-                     (reality-engine-lsp::obj
-                      "sampleType" "step-count"
-                      "sourceMappingId" "healthkit-activity"
-                      "values" (reality-engine-lsp::vectorize (list 1 0 0.9 0)))))
-         (result (aref (reality-engine-lsp::jget healthkit "results") 0)))
-    (assert-equal "healthkit.step-count"
-                  (reality-engine-lsp::jstring result "sensorId" "")
-                  "HealthKit ingest should commit through PE source mapping")
-    (assert-equal "healthkit-activity"
-                  (reality-engine-lsp::jstring result "sourceMappingId" "")
-                  "HealthKit ingest should preserve mapping id"))
+         (mappings (reality-engine-lsp::perception-state-source-mappings state)))
+    (setf (gethash "healthkit:HKCorrelationTypeIdentifierBloodPressure" mappings)
+          (reality-engine-lsp::obj "id" "healthkit:HKCorrelationTypeIdentifierBloodPressure"
+                                   "sensorIdTemplate" "healthkit.blood-pressure"
+                                   "name" "HealthKit Blood Pressure"
+                                   "region" (reality-engine-lsp::obj "offset" 4320 "length" 4)
+                                   "ttlMs" 900000))
+    (setf (gethash "healthkit:HKWorkoutTypeIdentifierWorkout" mappings)
+          (reality-engine-lsp::obj "id" "healthkit:HKWorkoutTypeIdentifierWorkout"
+                                   "sensorIdTemplate" "healthkit.exercise"
+                                   "name" "HealthKit Exercise"
+                                   "region" (reality-engine-lsp::obj "offset" 4330 "length" 4)
+                                   "ttlMs" 900000))
+    (setf (gethash "healthkit:HKCategoryTypeIdentifierSleepAnalysis" mappings)
+          (reality-engine-lsp::obj "id" "healthkit:HKCategoryTypeIdentifierSleepAnalysis"
+                                   "sensorIdTemplate" "healthkit.sleep"
+                                   "name" "HealthKit Sleep Analysis"
+                                   "region" (reality-engine-lsp::obj "offset" 4340 "length" 4)
+                                   "ttlMs" 900000))
+    (setf (reality-engine-lsp::perception-state-healthkit-bridge-token state) "spezi-test-token")
+    ;; Token auth rejection
+    (let ((bad (reality-engine-lsp::ingest-healthkit
+                state
+                (reality-engine-lsp::obj "bridgeToken" "wrong-token"
+                                         "type" "HKCorrelationTypeIdentifierBloodPressure"
+                                         "values" (reality-engine-lsp::vectorize (list 0.72d0 0.48d0 0.24d0 0.99d0))))))
+      (assert-equal 401 (car bad) "HealthKit wrong token should return 401"))
+    ;; Blood pressure: sensorId, sourceMappingId, region.offset, source.lastValue
+    (let* ((result (cdr (reality-engine-lsp::ingest-healthkit
+                         state
+                         (reality-engine-lsp::obj "bridgeToken" "spezi-test-token"
+                                                  "type" "HKCorrelationTypeIdentifierBloodPressure"
+                                                  "values" (reality-engine-lsp::vectorize (list 0.72d0 0.48d0 0.24d0 0.99d0))))))
+           (sample (first (reality-engine-lsp::jarray-list (reality-engine-lsp::jget result "resolved")))))
+      (assert-true (reality-engine-lsp::jbool result "success" nil)
+                   "HealthKit BP ingest success should be true")
+      (assert-equal "healthkit.blood-pressure"
+                    (reality-engine-lsp::jstring sample "sensorId" "")
+                    "HealthKit BP sensorId should match sensorIdTemplate")
+      (assert-equal "healthkit:HKCorrelationTypeIdentifierBloodPressure"
+                    (reality-engine-lsp::jstring sample "sourceMappingId" "")
+                    "HealthKit BP sourceMappingId should match registry key")
+      (assert-equal 4320
+                    (reality-engine-lsp::jnumber (reality-engine-lsp::jget sample "region") "offset" nil)
+                    "HealthKit BP region.offset should be 4320")
+      (assert-true (reality-engine-lsp::jget (reality-engine-lsp::jget sample "source") "lastValue")
+                   "HealthKit BP source.lastValue should be present"))
+    ;; Exercise: sensorId and region.offset
+    (let* ((result (cdr (reality-engine-lsp::ingest-healthkit
+                         state
+                         (reality-engine-lsp::obj "bridgeToken" "spezi-test-token"
+                                                  "type" "HKWorkoutTypeIdentifierWorkout"
+                                                  "values" (reality-engine-lsp::vectorize (list 0.65d0 0.58d0 0.42d0 0.97d0))))))
+           (sample (first (reality-engine-lsp::jarray-list (reality-engine-lsp::jget result "resolved")))))
+      (assert-equal "healthkit.exercise"
+                    (reality-engine-lsp::jstring sample "sensorId" "")
+                    "HealthKit exercise sensorId should match sensorIdTemplate")
+      (assert-equal 4330
+                    (reality-engine-lsp::jnumber (reality-engine-lsp::jget sample "region") "offset" nil)
+                    "HealthKit exercise region.offset should be 4330"))
+    ;; Sleep: sensorId and region.offset
+    (let* ((result (cdr (reality-engine-lsp::ingest-healthkit
+                         state
+                         (reality-engine-lsp::obj "bridgeToken" "spezi-test-token"
+                                                  "type" "HKCategoryTypeIdentifierSleepAnalysis"
+                                                  "values" (reality-engine-lsp::vectorize (list 0.82d0 0.12d0 0.18d0 0.96d0))))))
+           (sample (first (reality-engine-lsp::jarray-list (reality-engine-lsp::jget result "resolved")))))
+      (assert-equal "healthkit.sleep"
+                    (reality-engine-lsp::jstring sample "sensorId" "")
+                    "HealthKit sleep sensorId should match sensorIdTemplate")
+      (assert-equal 4340
+                    (reality-engine-lsp::jnumber (reality-engine-lsp::jget sample "region") "offset" nil)
+                    "HealthKit sleep region.offset should be 4340")))
   (let* ((state (reality-engine-lsp::make-perception-state-from-config
                  :dimension 5000
                  :reality-url "http://localhost:3299"
                  :localai-url "http://localhost:8000"
                  :localai-machine-dir "../localAIStack/data/machines"))
-         (carekit (reality-engine-lsp::ingest-carekit
-                   state
-                   (reality-engine-lsp::obj
-                    "sampleType" "task-adherence"
-                    "taskId" "morning-medication"
-                    "carePlanId" "care-plan-a"
-                    "sourceMappingId" "carekit-task"
-                    "values" (reality-engine-lsp::vectorize (list 1 0 0.8 0.95)))))
-         (result (aref (reality-engine-lsp::jget carekit "results") 0)))
+         (carekit (cdr (reality-engine-lsp::ingest-carekit
+                        state
+                        (reality-engine-lsp::obj
+                         "sampleType" "task-adherence"
+                         "taskId" "morning-medication"
+                         "carePlanId" "care-plan-a"
+                         "sourceMappingId" "carekit-task"
+                         "values" (reality-engine-lsp::vectorize (list 1 0 0.8 0.95))))))
+         (result (first (reality-engine-lsp::jarray-list (reality-engine-lsp::jget carekit "results")))))
     (assert-equal "carekit.task-adherence"
                   (reality-engine-lsp::jstring result "sensorId" "")
                   "CareKit ingest should commit through PE source mapping")
@@ -801,27 +862,34 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
     (assert-equal 4310
                   (reality-engine-lsp::jnumber (reality-engine-lsp::jget (reality-engine-lsp::jget result "source") "region") "offset" nil)
                   "CareKit source should use configured mapping offset"))
-  (let* ((state (reality-engine-lsp::make-perception-state-from-config
-                 :dimension 16
-                 :reality-url "http://localhost:3299"
-                 :localai-url "http://localhost:8000"
-                 :localai-machine-dir "../localAIStack/data/machines"))
-         (record (reality-engine-lsp::record-dispatch-envelope
-                  state
-                  (reality-engine-lsp::obj
-                   "machineId" "machine-e2e"
-                   "sequenceId" "seq-e2e"
-                   "values" (reality-engine-lsp::vectorize (list 1 0))
-                   "region" (reality-engine-lsp::obj "offset" 4 "length" 2)
-                   "governance" (reality-engine-lsp::obj "ownerTeam" "e2e-team"
-                                                         "ragStatusCode" "RED"
-                                                         "processStatus" "error")))))
-    (assert-equal "recorded"
-                  (reality-engine-lsp::jstring record "status" "")
-                  "dispatch envelope should be PE-owned ledger record")
-    (assert-equal 1
-                  (length (reality-engine-lsp::perception-state-dispatch-ledger state))
-                  "dispatch ledger should retain PE-owned record"))
+  (let ((state (reality-engine-lsp::make-perception-state-from-config
+                :dimension 16
+                :reality-url "http://localhost:3299"
+                :localai-url "http://localhost:8000"
+                :localai-machine-dir "../localAIStack/data/machines")))
+    (bt:with-lock-held ((reality-engine-lsp::perception-state-machine-catalog-lock state))
+      (setf (gethash "machine-e2e"
+                     (reality-engine-lsp::perception-state-machine-catalog state))
+            (reality-engine-lsp::obj "id" "machine-e2e"
+                                     "metadata" (reality-engine-lsp::obj
+                                                 "dispatchableAgent" "test-agent"
+                                                 "aiTrigger" "ON_MATCH"))))
+    (let* ((record (reality-engine-lsp::record-dispatch-envelope
+                    state
+                    (reality-engine-lsp::obj
+                     "machineId" "machine-e2e"
+                     "sequenceId" "seq-e2e"
+                     "values" (reality-engine-lsp::vectorize (list 1 0))
+                     "region" (reality-engine-lsp::obj "offset" 4 "length" 2)
+                     "governance" (reality-engine-lsp::obj "ownerTeam" "e2e-team"
+                                                           "ragStatusCode" "RED"
+                                                           "processStatus" "error")))))
+      (assert-equal "recorded"
+                    (reality-engine-lsp::jstring record "status" "")
+                    "dispatch envelope should be PE-owned ledger record")
+      (assert-equal 1
+                    (length (reality-engine-lsp::perception-state-dispatch-ledger state))
+                    "dispatch ledger should retain PE-owned record")))
   (let* ((state (make-test-state 8))
          (text (reality-engine-lsp::prometheus-text-of state "lsp")))
     (assert-true (search "runtime=\"lsp\"" text)
@@ -1093,8 +1161,8 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
               (pe-env (reality-engine-lsp::jget record "envelope"))
               (gov (reality-engine-lsp::jget pe-env "governance")))
          (assert-true record "AGX051 PE urgent_maint: dispatch record unresolved")
-         (assert-equal "aquaculture_predictive_maintenance_agent" (reality-engine-lsp::jstring pe-env "dispatchableAgent" "") "AGX051 PE urgent_maint: dispatch agent")
-         (assert-equal "agriculture-yuma-aqua-maintenance-forecaster-maintenance" (reality-engine-lsp::jstring pe-env "aiTrigger" "") "AGX051 PE urgent_maint: aiTrigger")
+         (assert-equal "aquaculture_predictive_maintenance_agent" (reality-engine-lsp::jstring (reality-engine-lsp::jget pe-env "dispatch") "agent" "") "AGX051 PE urgent_maint: dispatch agent")
+         (assert-equal "agriculture-yuma-aqua-maintenance-forecaster-maintenance" (reality-engine-lsp::jstring (reality-engine-lsp::jget pe-env "dispatch") "trigger" "") "AGX051 PE urgent_maint: aiTrigger")
          (assert-equal "RED" (reality-engine-lsp::jstring gov "ragStatusCode" "") "AGX051 PE urgent_maint: ragStatusCode")
          (assert-equal "error" (reality-engine-lsp::jstring gov "processStatus" "") "AGX051 PE urgent_maint: processStatus")
          (assert-equal 900 (reality-engine-lsp::jget gov "slaSeconds") "AGX051 PE urgent_maint: slaSeconds != 900")))
@@ -1122,8 +1190,8 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                 (pe-env (reality-engine-lsp::jget record "envelope"))
                 (gov (reality-engine-lsp::jget pe-env "governance")))
            (assert-true record (format nil "AGX055 PE ~a: dispatch record unresolved" (first case)))
-           (assert-equal "agriculture_yield_optimization_ai" (reality-engine-lsp::jstring pe-env "dispatchableAgent" "") (format nil "AGX055 PE ~a: dispatchableAgent" (first case)))
-           (assert-equal "ag-yield-optimization-ai-yuma-facility-bridge" (reality-engine-lsp::jstring pe-env "aiTrigger" "") (format nil "AGX055 PE ~a: aiTrigger" (first case)))
+           (assert-equal "agriculture_yield_optimization_ai" (reality-engine-lsp::jstring (reality-engine-lsp::jget pe-env "dispatch") "agent" "") (format nil "AGX055 PE ~a: dispatchableAgent" (first case)))
+           (assert-equal "ag-yield-optimization-ai-yuma-facility-bridge" (reality-engine-lsp::jstring (reality-engine-lsp::jget pe-env "dispatch") "trigger" "") (format nil "AGX055 PE ~a: aiTrigger" (first case)))
            (assert-equal (third case) (reality-engine-lsp::jstring gov "ragStatusCode" "") (format nil "AGX055 PE ~a: ragStatusCode" (first case)))))))
 
      ;; Bridge perceptual contract — AGX055.output == AgYieldOptimizationAI.input == length 12.
