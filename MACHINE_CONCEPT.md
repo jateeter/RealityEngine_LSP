@@ -6,22 +6,25 @@ A **Machine** is the fundamental computational unit of the Reality Engine. It is
 
 ## 1. Finite-State Automaton Structure
 
-Each Machine is a collection of **CriticalEventSequences (CES)**. Each CES is an independent non-deterministic finite automaton whose alphabet is the set of quantized perceptual vectors.
+Each Machine is a **deterministic finite automaton (DFA)** whose alphabet is the set of quantized perceptual vectors. The machine's DFA state is the complete activation pattern across all RealityVectors in all CriticalEventSequences (CES) — the tuple of which vectors are currently active. Given that global activation pattern and an input symbol, the acceptance rules produce exactly one next activation pattern; there is no branching.
 
 ```
-Machine
- └─ CriticalEventSequence (FSA)
-     ├─ RealityVector (state q₀, initial)
-     │    elements: [(value, comparator), ...]   ← one symbol's acceptance condition
-     │    outputVectors: [...]                    ← emission on transition
-     │    nextVectorIds: [q₁, q₂, ...]           ← ε-closure targets
-     └─ RealityVector (state q₁)
-          ...
+Machine  ←  DFA state = activation pattern across ALL vectors in ALL CESs
+ └─ CriticalEventSequence (CES)   ← one recognizer component
+     ├─ RealityVector (contributes bits to the machine's DFA state)
+     │    elements: [(value, comparator), ...]   ← acceptance condition for one input symbol
+     │    outputVectors: [...]                    ← Mealy-style emission on acceptance
+     │    nextVectorIds: [q₁, q₂, ...]           ← successor vectors to activate
+     └─ RealityVector ...
 ```
 
-### States
+A single vector with multiple `nextVectorIds` activates all listed successors on acceptance — this is not non-deterministic choice but **powerset construction already baked in**: the runtime tracks the full *set* of active vectors, and the transition `(active-set, input) → next-active-set` is single-valued and total.
 
-A **RealityVector** is a state in the FSA. Each vector holds:
+### DFA State Representation
+
+The machine DFA state is the **activation pattern** — the set of RealityVectors currently marked active. Each RealityVector contributes one bit to this pattern. The start state has exactly the `isInitial` vectors active; all other vectors start inactive.
+
+Each individual RealityVector holds:
 
 | Field | Type | Role |
 |---|---|---|
@@ -32,7 +35,7 @@ A **RealityVector** is a state in the FSA. Each vector holds:
 | `nextVectorIds` | string[] | State transitions to activate on acceptance |
 | `matchAlgorithm` | string | Element-level comparator (`gte` or `equals`) |
 
-All initial vectors are **always active**. A vector transitions to its successors when its acceptance condition is met; successors are activated in the *next* cycle (deferred activation prevents same-cycle cascade).
+All initial vectors are **always active** (they are part of the fixed start state and remain active across cycles). A vector activates its successors when its acceptance condition is met; successors join the active set in the *next* cycle (deferred activation prevents same-cycle cascade). The resulting active set is the new DFA state.
 
 ### Transitions
 
@@ -46,17 +49,21 @@ A vector accepts an input symbol when every element's comparator is satisfied:
 
 Acceptance is checked per element, then ANDed across all elements. The machine-level `matchAlgorithm` sets the default; individual elements may override with their own `comparatorType`.
 
-### Sequences as Regular Languages
+### Recognized Languages are Regular
 
-Because each CES is a finite automaton, the set of input sequences that trigger its output is a **regular language**. The language recognized by a CES with vectors V and transitions T is:
+Because the machine is a DFA, the set of input sequences that drive it to an emitting activation pattern is a **regular language**. Each CES contributes a regular sub-language; the machine's overall recognized language is the union of those sub-languages filtered through the arbiter rule.
 
 ```
-L(CES) = { w ∈ Σ* : w drives the automaton from q₀ to some qᵢ ∈ F }
+L(machine) ⊆ { w ∈ Σ* : w drives the DFA to an activation pattern where the arbiter fires }
 ```
 
-where F is the set of vectors with non-empty `outputVectors`.
+Within a single CES, the contribution is:
 
-A single-vector CES with one `isInitial` vector recognizes **single-symbol patterns** — equivalent to the regular expression `{w : elements(w)}`. A chain of vectors `q₀ → q₁ → q₂` recognizes sequences matching `r₀ · r₁ · r₂` (concatenation of three symbol regexes). Branches in `nextVectorIds` create **union** (`r₀ | r₁`). Loops create **Kleene closure** (`r*`).
+```
+L(CES) = { w ∈ Σ* : w drives the CES component from its initial vectors to some emitting vector }
+```
+
+A single-vector CES with one `isInitial` vector recognizes **single-symbol patterns** — equivalent to the regular expression `{w : elements(w)}`. A chain of vectors `q₀ → q₁ → q₂` recognizes sequences matching `r₀ · r₁ · r₂` (concatenation of three symbol regexes). Branches in `nextVectorIds` (multiple successors) expand the active set — equivalent to **union** (`r₀ · (r₁ | r₂)`). Loops create **Kleene closure** (`r*`).
 
 ---
 
@@ -249,15 +256,17 @@ Latched event bits persist across cycles so the subscriber has at least one full
 
 ## 7. Regular-Expression Equivalences
 
-Because each CES is a finite automaton, standard FSA-to-regex constructions apply directly.
+Because the machine is a DFA, standard DFA-to-regex constructions apply directly. The table below describes how CES vector topologies map to regular expressions — read as contributions to the machine's overall recognized language.
 
-| CES structure | Equivalent regex |
-|---|---|
-| Single initial vector, no successors | `r₀` (one-symbol pattern) |
-| Chain: q₀ → q₁ → q₂ (output on q₂) | `r₀ · r₁ · r₂` |
-| Branch: q₀ → {q₁, q₂} | `r₀ · (r₁ \| r₂)` |
-| Loop: q₀ → q₁ → q₀ | `(r₀ · r₁)*` |
-| Multi-start (two initial vectors) | `r₀ \| r₁` |
+| CES vector topology | DFA activation-pattern behaviour | Equivalent regex |
+|---|---|---|
+| Single initial vector, no successors | Active set never grows beyond start | `r₀` (one-symbol pattern) |
+| Chain: q₀ → q₁ → q₂ (output on q₂) | Active set advances one step per matching symbol | `r₀ · r₁ · r₂` |
+| Branch: q₀ → {q₁, q₂} | Both successors join active set simultaneously | `r₀ · (r₁ \| r₂)` |
+| Loop: q₀ → q₁ → q₀ | Active set cycles back to initial vector | `(r₀ · r₁)*` |
+| Multi-start (two initial vectors) | Both initial vectors always active | `r₀ \| r₁` |
+
+The "branch" row (one vector activating multiple successors) is the key insight: it is **not** non-determinism — it is the DFA tracking multiple simultaneously active positions in the activation pattern, which is precisely the powerset construction expressed directly in the runtime data structure.
 
 ### Worked Example — `RSFlipFlopDeprecatedDemo.json`
 
@@ -266,7 +275,7 @@ SET sequence:   isInitial(s=1,r=0) → output(Q=1)
 RESET sequence: isInitial(s=0,r=1) → output(Q=0)   [deprecated 2026-02-01, replacedBy: SET]
 ```
 
-Each is a 1-state FSA recognizing a single symbol. The machine as a whole recognizes the union `{(1,0)} | {(0,1)}` — the set-reset alphabet — and emits the corresponding flip-flop output. This is the regular expression `(1,0) | (0,1)` over a 2-bit alphabet, provably non-cyclic (no Kleene closure) and therefore strongly STA-compliant.
+Each CES contributes one vector to the activation pattern. The machine DFA start state has both initial vectors active. On input `(1,0)` the SET vector accepts and emits `Q=1`; on input `(0,1)` the RESET vector accepts and emits `Q=0`. The recognized language is `{(1,0)} | {(0,1)}` — the regular expression `(1,0) | (0,1)` over a 2-bit alphabet, provably non-cyclic (no Kleene closure) and therefore strongly STA-compliant.
 
 ### STA (Single-Transition Assumption)
 
