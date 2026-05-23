@@ -220,8 +220,16 @@
     machine))
 
 (defun load-machine-from-file (path)
-  (machine-from-json (parse-json (safe-read-file path))
-                     (format nil "machine-~a" (pathname-name path))))
+  (let* ((json (parse-json (safe-read-file path)))
+         (ver  (jstring json "version" nil)))
+    (unless ver
+      (error "~a: missing required field: version" (file-namestring path)))
+    (let* ((dot   (position #\. ver))
+           (major (if dot (ignore-errors (parse-integer (subseq ver 0 dot))) 0)))
+      (unless (eql major 1)
+        (error "~a: incompatible machine JSON version: ~a (current: 1.0.0)"
+               (file-namestring path) ver)))
+    (machine-from-json json (format nil "machine-~a" (pathname-name path)))))
 
 (defun load-machines-from-directory (directory)
   (let ((dir (uiop:ensure-directory-pathname directory))
