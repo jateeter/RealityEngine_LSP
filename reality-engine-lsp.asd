@@ -25,6 +25,7 @@
                  (:file "http")
                  (:file "ws")           ; SSE broadcast surface (GET /api/events)
                  (:file "reality-service")
+                 (:file "vector-aggregator") ; PE machine output aggregator
                  (:file "perception-service")
                  (:file "cli")          ; CLI shim (pe <command> mirrors _CPP reality_engine_cli)
                  (:file "mcp")          ; MCP JSON-RPC shim (POST/GET/DELETE /mcp)

@@ -842,10 +842,13 @@ dispatch_triggers and TS Dispatcher.onStep: drop ops without governance
 
 (defun healthkit-status-json (state)
   (obj "bridgeId" (perception-state-healthkit-bridge-id state)
-       "tokenRequired" (json-bool (perception-state-healthkit-bridge-token state))
+       "enabled" t
+       "tokenConfigured" (json-bool (perception-state-healthkit-bridge-token state))
+       "nativeAppRequired" t
+       "nativeWorkOutsideRepo" t
+       "registryKey" "healthkit:<typeIdentifier>"
        "statusEndpoint" "/api/integrations/healthkit/status"
        "ingestEndpoint" "/api/integrations/healthkit/ingest"
-       "registryKey" "healthkit:<typeIdentifier>"
        "contract" (obj "transport" "https"
                        "singleSample" (arr "type" "value" "sourceName")
                        "batchSamples" (arr "bridgeId" "samples[]")
@@ -989,11 +992,12 @@ Callers accumulate results into resolved/unmapped lists."
 (defun carekit-status-json (state)
   (let ((token-set (perception-state-carekit-bridge-token state)))
     (obj "bridgeId" (perception-state-carekit-bridge-id state)
+         "enabled" t
          "defaultSourceMappingId" (perception-state-carekit-default-source-mapping-id state)
          "tokenConfigured" (json-bool token-set)
-         "tokenRequired" (json-bool token-set)
          "nativeAppRequired" t
          "nativeWorkOutsideRepo" t
+         "registryKey" "carekit:<sampleType>"
          "statusEndpoint" "/api/integrations/carekit/status"
          "ingestEndpoint" "/api/integrations/carekit/ingest"
          "contract" (obj "transport" "https"
@@ -1309,12 +1313,13 @@ Callers accumulate results into resolved/unmapped lists."
                        "includeMachineResults" (json-bool include-machine-results)
                        "includePerceptualSpace" t)))
     (handler-case
-        (let* ((step (http-post-json (format nil "~a/api/perceive" (perception-state-reality-url state))
-                                     payload))
-               (returned-ps (numbers-from-json (or (jget step "perceptualSpace") (arr))))
-               (ts (now-ms)))
-          (when (>= (length returned-ps) (perception-engine-dimension engine))
-            (update-from-perceptual-space engine returned-ps))
+        (let* ((step      (http-post-json (format nil "~a/api/perceive" (perception-state-reality-url state))
+                                          payload))
+               (raw-ps    (numbers-from-json (or (jget step "perceptualSpace") (arr))))
+               (next-ps   (aggregate-machine-outputs raw-ps (jget step "machineResults")))
+               (ts        (now-ms)))
+          (when (>= (length next-ps) (perception-engine-dimension engine))
+            (update-from-perceptual-space engine next-ps))
           (incf (perception-engine-global-step engine))
           (record-dispatch-envelopes-from-step state step)
           (setf (perception-engine-last-push engine) step)
