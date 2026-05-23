@@ -109,6 +109,8 @@ Implemented endpoints intentionally mirror the AI and CPP services:
 - **Cross-runtime Prometheus** — `/api/metrics` text exposition stamped
   with `runtime="lsp"` on every line
 
+See [MACHINE_CONCEPT.md](MACHINE_CONCEPT.md) for the canonical machine model (DFA theory, JSON schema, perceptual mapping, regex equivalences, STA).
+
 See [docs/INTEGRATION_ARCHITECTURE.md](docs/INTEGRATION_ARCHITECTURE.md), [docs/API_EQUIVALENCE.md](docs/API_EQUIVALENCE.md),
 [docs/CONTEXT_EQUIVALENCE.md](docs/CONTEXT_EQUIVALENCE.md), and
 [docs/CONFIGURATION_EQUIVALENCE.md](docs/CONFIGURATION_EQUIVALENCE.md).
