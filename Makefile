@@ -1,7 +1,7 @@
 LISP ?= sbcl
 QUICKLISP ?= $(CURDIR)/quicklisp/setup.lisp
 
-.PHONY: deps-check test build reality perception clean
+.PHONY: deps-check test build reality perception e2e-healthkit-spezi clean
 
 deps-check:
 	@test -x "$$(command -v $(LISP))" || (echo "Missing Common Lisp runtime: $(LISP)" >&2; exit 1)
@@ -39,6 +39,9 @@ perception: deps-check
 	  --eval '(ql:quickload :reality-engine-lsp :force t)' \
 	  --eval '(reality-engine-lsp:start-perception-from-environment)' \
 	  --eval '(loop (sleep 3600))'
+
+e2e-healthkit-spezi: build
+	tests/e2e_healthkit_spezi.sh
 
 clean:
 	rm -rf bin logs run
