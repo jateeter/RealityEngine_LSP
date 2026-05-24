@@ -14,7 +14,7 @@ fi
 REALITY_ENGINE_PORT="${REALITY_ENGINE_PORT:-3299}"
 PERCEPTION_ENGINE_PORT="${PERCEPTION_ENGINE_PORT:-3300}"
 VECTOR_DIMENSION="${VECTOR_DIMENSION:-768}"
-MACHINES_DIR="${MACHINES_DIR:-../RealityEngine_AI/examples/machines}"
+MACHINES_DIR="${MACHINES_DIR:-../RealityEngine_Machines/machines}"
 LOCAL_AI_API_URL="${LOCAL_AI_API_URL:-http://localhost:8000}"
 LOCAL_AI_MACHINES_DIR="${LOCAL_AI_MACHINES_DIR:-../localAIStack/data/machines}"
 # MQTT bridge env passthrough — currently consumed by the mapping registry
@@ -24,6 +24,10 @@ MQTT_BROKER_HOST="${MQTT_BROKER_HOST:-}"
 MQTT_BROKER_PORT="${MQTT_BROKER_PORT:-1883}"
 MQTT_CLIENT_ID="${MQTT_CLIENT_ID:-reality-engine-pe-lsp}"
 MQTT_MAPPINGS_FILE="${MQTT_MAPPINGS_FILE:-}"
+# INSTANCE_ID — when set, PID files are suffixed so multiple LSP instances
+# can run from the same repo directory simultaneously.
+INSTANCE_ID="${INSTANCE_ID:-}"
+_INST="${INSTANCE_ID:+-${INSTANCE_ID}}"   # "" or "-<id>"
 
 mkdir -p logs run
 
@@ -51,19 +55,19 @@ sbcl --noinform --load "$QUICKLISP_SETUP" \
   --eval "(ql:register-local-projects)" \
   --eval "(ql:quickload :reality-engine-lsp :force t)" \
   --eval "(reality-engine-lsp:start-reality-from-environment)" \
-  --eval "(loop (sleep 3600))" > logs/reality-engine.log 2>&1 &
-echo "$!" > run/reality-engine.pid
+  --eval "(loop (sleep 3600))" > "logs/reality-engine${_INST}.log" 2>&1 &
+echo "$!" > "run/reality-engine${_INST}.pid"
 
 sbcl --noinform --load "$QUICKLISP_SETUP" \
   --eval "(pushnew (truename \".\") ql:*local-project-directories*)" \
   --eval "(ql:register-local-projects)" \
   --eval "(ql:quickload :reality-engine-lsp :force t)" \
   --eval "(reality-engine-lsp:start-perception-from-environment)" \
-  --eval "(loop (sleep 3600))" > logs/perception-engine.log 2>&1 &
-echo "$!" > run/perception-engine.pid
+  --eval "(loop (sleep 3600))" > "logs/perception-engine${_INST}.log" 2>&1 &
+echo "$!" > "run/perception-engine${_INST}.pid"
 
-echo "Reality Engine LSP     : http://localhost:${REALITY_ENGINE_PORT}"
-echo "Perception Engine LSP  : http://localhost:${PERCEPTION_ENGINE_PORT}"
+echo "Reality Engine LSP     : http://localhost:${REALITY_ENGINE_PORT}${INSTANCE_ID:+ [instance: $INSTANCE_ID]}"
+echo "Perception Engine LSP  : http://localhost:${PERCEPTION_ENGINE_PORT}${INSTANCE_ID:+ [instance: $INSTANCE_ID]}"
 echo "Machines               : ${MACHINES_DIR}"
 echo "Vector dimension       : ${VECTOR_DIMENSION}"
 [ -n "$MQTT_BROKER_HOST" ] && \
