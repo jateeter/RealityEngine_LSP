@@ -37,7 +37,7 @@ Core endpoints:
 | `GET` | `/api/machines/{id}/export` | Implemented |
 | `GET` | `/api/machine-graph` | Implemented |
 | `POST` | `/api/perceive` | Implemented |
-| `POST` | `/api/preception/diagnostic` | Implemented placeholder-compatible |
+| `POST` | `/api/perception/diagnostic` | Implemented placeholder-compatible |
 | `POST`, `GET` | `/api/perceptual-simulation/*` | Implemented synchronous subset |
 
 The `/api/perceive` input contract accepts exactly the same transport forms as

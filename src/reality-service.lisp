@@ -1210,7 +1210,7 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
    (make-route "GET" "/api/perceptual-simulation/history" (lambda (_ body query)
                                                            (declare (ignore _ body query))
                                                            (json-response (actor-ask actor (lambda (state) (obj "history" (vectorize (reality-state-history state))))))))
-   (make-route "POST" "/api/preception/diagnostic" (lambda (_ body query)
+   (make-route "POST" "/api/perception/diagnostic" (lambda (_ body query)
                                                     (declare (ignore _ query))
                                                     (json-response (obj "universalInputSpace" (jget body "universalInputSpace")
                                                                         "resolvedInputs" (obj)))))
