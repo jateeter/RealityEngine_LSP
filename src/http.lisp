@@ -81,14 +81,20 @@
     (hunchentoot:start acceptor)
     acceptor))
 
+(defun drakma-body-string (body)
+  (if (stringp body)
+      body
+      (sb-ext:octets-to-string body :external-format :utf-8)))
+
 (defun http-get-json (url)
-  (parse-json (drakma:http-request url :method :get)))
+  (parse-json (drakma-body-string (drakma:http-request url :method :get))))
 
 (defun http-post-json (url payload)
-  (parse-json (drakma:http-request url
-                                   :method :post
-                                   :content (json-stringify payload)
-                                   :content-type "application/json")))
+  (parse-json (drakma-body-string
+               (drakma:http-request url
+                                    :method :post
+                                    :content (json-stringify payload)
+                                    :content-type "application/json"))))
 
 (defun http-request-json (url &key (method :get) payload headers)
   (let ((args (list url :method method)))
@@ -97,4 +103,4 @@
                                     :content-type "application/json"))))
     (when headers
       (setf args (append args (list :additional-headers headers))))
-    (parse-json (apply #'drakma:http-request args))))
+    (parse-json (drakma-body-string (apply #'drakma:http-request args)))))

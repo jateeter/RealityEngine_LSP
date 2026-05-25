@@ -1770,7 +1770,8 @@ startup — the PE still serves HTTP signals as a pure REST engine."
 
 (defun start-perception-from-environment ()
   (start-perception-service :port (env-int "PERCEPTION_ENGINE_PORT" 3300)
-                            :reality-url (format nil "http://localhost:~a" (env-int "REALITY_ENGINE_PORT" 3299))
+                            :reality-url (or (env "REALITY_ENGINE_URL" nil)
+                                             (format nil "http://localhost:~a" (env-int "REALITY_ENGINE_PORT" 3299)))
                             :localai-url (env "LOCAL_AI_API_URL" "http://localhost:8000")
                             :localai-machine-dir (env "LOCAL_AI_MACHINES_DIR" "../localAIStack/data/machines")
                             :dimension (env-int "VECTOR_DIMENSION" 768)))

@@ -1,7 +1,7 @@
 (in-package #:reality-engine-lsp)
 
 (defun main ()
-  (let* ((args uiop:*command-line-arguments*)
+  (let* ((args (rest sb-ext:*posix-argv*))
          (mode (or (first args) "both")))
     (cond
       ;; CLI shim: pe <command> [flags] — mirrors reality_engine_cli pe in _CPP.
