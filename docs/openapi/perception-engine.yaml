@@ -5,15 +5,15 @@ info:
   description: |
     OpenAPI contract for the Common Lisp (SBCL) Perception Engine service.
 
-    The service defaults to `http://localhost:3300` and pushes assembled
-    vectors into the Reality Engine at `http://localhost:3299/api/perceive`.
+    The service defaults to `http://localhost:5600` and pushes assembled
+    vectors into the Reality Engine at `http://localhost:5601/api/perceive`.
     The MQTT bridge, when enabled (uses the hand-rolled MQTT v3.1.1
     client in `src/mqtt-client.lisp`), subscribes to a broker (default
     `mqtt://yuma.lateraledge.cloud:1883`) and projects sensor messages
     into perceptual-space regions via the mapping registry — same
     contract across AI / CPP / LSP.
 servers:
-  - url: http://localhost:3300
+  - url: http://localhost:5600
     description: Local Perception Engine default
 tags:
   - name: System

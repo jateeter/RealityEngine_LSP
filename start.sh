@@ -11,11 +11,11 @@ if [ -f .env ]; then
   set +a
 fi
 
-REALITY_ENGINE_PORT="${REALITY_ENGINE_PORT:-3299}"
-PERCEPTION_ENGINE_PORT="${PERCEPTION_ENGINE_PORT:-3300}"
-VECTOR_DIMENSION="${VECTOR_DIMENSION:-768}"
+REALITY_ENGINE_PORT="${REALITY_ENGINE_PORT:-5601}"
+PERCEPTION_ENGINE_PORT="${PERCEPTION_ENGINE_PORT:-5600}"
+VECTOR_DIMENSION="${VECTOR_DIMENSION:-7680}"
 MACHINES_DIR="${MACHINES_DIR:-../RealityEngine_Machines/machines}"
-LOCAL_AI_API_URL="${LOCAL_AI_API_URL:-http://localhost:8000}"
+LOCAL_AI_API_URL="${LOCAL_AI_API_URL:-http://localhost:4000}"
 LOCAL_AI_MACHINES_DIR="${LOCAL_AI_MACHINES_DIR:-../localAIStack/data/machines}"
 # MQTT bridge env passthrough — currently consumed by the mapping registry
 # only (the LSP MQTT client driver is deferred per the rollout plan).  Once

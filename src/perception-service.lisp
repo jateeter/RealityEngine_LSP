@@ -628,25 +628,61 @@ background refresher thread."
       (incf i))
     (if labels (format nil "~{~a~^+~}" (nreverse labels)) "none")))
 
-(defun ces-first-agent-action (metadata)
-  "Return the first string in metadata.agentActions, or empty string."
-  (let ((actions (jget metadata "agentActions")))
-    (if (and (jarray-p actions) (jarray-list actions))
-        (let ((first-elem (first (jarray-list actions))))
-          (if (stringp first-elem) first-elem ""))
-        "")))
-
 (defun ces-copy-string-array (value)
   "Return a JSON array containing only the string elements of value."
   (if (jarray-p value)
       (vectorize (remove-if-not #'stringp (jarray-list value)))
       (arr)))
 
+(defun ces-select-agent-action (actions values)
+  "Return the action aligned with the first non-zero output value, or first action."
+  (let ((action-list (and (jarray-p actions) (jarray-list actions))))
+    (if action-list
+        (progn
+          (when (jarray-p values)
+            (let ((index 0))
+              (dolist (value (jarray-list values))
+                (when (and (numberp value) (/= value 0) (< index (length action-list)))
+                  (let ((action (nth index action-list)))
+                    (return-from ces-select-agent-action
+                      (if (stringp action) action ""))))
+                (incf index))))
+          (let ((first-action (first action-list)))
+            (if (stringp first-action) first-action "")))
+        "")))
+
+(defun ces-dispatch-binding (metadata &optional values)
+  "Normalize first-class metadata.agentBinding with legacy dispatch fallback."
+  (let* ((binding (jget metadata "agentBinding"))
+         (binding-p (jobject-p binding))
+         (actions (if binding-p
+                      (ces-copy-string-array (jget binding "allowedActions"))
+                      (ces-copy-string-array (jget metadata "agentActions")))))
+    (when (and binding-p (zerop (length (jarray-list actions))))
+      (setf actions (ces-copy-string-array (jget metadata "agentActions"))))
+    (obj "agent" (if binding-p
+                     (or (jstring binding "agent" nil)
+                         (jstring metadata "dispatchableAgent" ""))
+                     (jstring metadata "dispatchableAgent" ""))
+         "trigger" (if binding-p
+                       (or (jstring binding "trigger" nil)
+                           (jstring metadata "aiTrigger" ""))
+                       (jstring metadata "aiTrigger" ""))
+         "action" (ces-select-agent-action actions values)
+         "agentActionsCatalog" actions
+         "autonomyMode" (if binding-p (jstring binding "mode" "") "")
+         "writeBack" (if binding-p
+                         (or (jget binding "writeBack") +json-null+)
+                         +json-null+))))
+
 (defun build-ces-envelope (op machine envelope-id correlation-id state)
   "Build a full ces.terminal.event envelope.
 Wire-compatible with CPP build_trigger_envelope and TS buildTriggerEnvelope."
   (let* ((md (or (jget machine "metadata") (obj)))
          (values (or (jget op "values") (arr)))
+         (trigger-config (or (jget md "triggerConfig") (obj)))
+         (trigger-dispatch (or (jget trigger-config "dispatch") (obj)))
+         (binding (ces-dispatch-binding md values))
          (sequence-id (jstring op "sequenceId" ""))
          (machine-id (jstring op "machineId" ""))
          (mode (perception-state-trigger-dispatch-mode state))
@@ -676,32 +712,42 @@ Wire-compatible with CPP build_trigger_envelope and TS buildTriggerEnvelope."
                              "assertedLabel" (ces-asserted-label values))
          "projection" +json-null+
          "governance" (or (jget op "governance") +json-null+)
-         "dispatch" (obj "agent" (jstring md "dispatchableAgent" "")
-                         "action" (ces-first-agent-action md)
-                         "agentActionsCatalog" (ces-copy-string-array (jget md "agentActions"))
-                         "trigger" (jstring md "aiTrigger" "")
+         "dispatch" (obj "processId" (jstring trigger-config "processId" "")
+                         "processName" (jstring trigger-config "processName" "")
+                         "agent" (jstring binding "agent" "")
+                         "action" (jstring binding "action" "")
+                         "agentActionsCatalog" (or (jget binding "agentActionsCatalog") (arr))
+                         "trigger" (jstring binding "trigger" "")
+                         "autonomyMode" (jstring binding "autonomyMode" "")
+                         "writeBack" (or (jget binding "writeBack") +json-null+)
                          "endpoint" (obj "kind" mode
                                          "url" (if graphql-p
-                                                   (perception-state-trigger-graphql-url state)
+                                                   (or (jstring trigger-config "endpoint" nil)
+                                                       (perception-state-trigger-graphql-url state))
                                                    "")
-                                         "mutation" (if graphql-p "updateProcessState" "")
+                                         "mutation" (if graphql-p
+                                                        (or (jstring trigger-dispatch "mutation" nil)
+                                                            "updateProcessState")
+                                                        "")
                                          "schemaRef" (if graphql-p
-                                                         "localAIStack/services/api/routers/graphql_endpoint.py"
+                                                         (or (jstring trigger-dispatch "schemaRef" nil)
+                                                             "localAIStack/services/api/routers/graphql_endpoint.py")
                                                          ""))))))
 
 (defun record-dispatch-envelope (state operation &optional machine-json-override)
   "Build and ledger one dispatch record for a merge operation.
-Returns the record on success, or NIL when the machine lacks
-dispatchableAgent / aiTrigger — the drop-no-dispatch signal to the caller.
+Returns the record on success, or NIL when the machine lacks a dispatch
+agent / trigger — the drop-no-dispatch signal to the caller.
 Wire-compatible with CPP DispatchRecord and TS Dispatcher.recordFromEnvelope.
 Optional MACHINE-JSON-OVERRIDE bypasses the catalog lookup (used in tests and
 corpus-walk helpers that already hold the loaded machine object)."
   (let* ((machine-id (jstring operation "machineId" ""))
          (machine (or machine-json-override (fetch-machine-for-dispatch state machine-id)))
          (md (and machine (jget machine "metadata")))
-         (agent (and md (jstring md "dispatchableAgent" nil)))
-         (trigger (and md (jstring md "aiTrigger" nil))))
-    ;; Drop — no dispatchableAgent or no aiTrigger (matches CPP line 2175-2179).
+         (binding (and md (ces-dispatch-binding md (jget operation "values"))))
+         (agent (and binding (jstring binding "agent" nil)))
+         (trigger (and binding (jstring binding "trigger" nil))))
+    ;; Drop — no dispatch agent or no trigger.
     (when (or (null machine)
               (null agent) (string= agent "")
               (null trigger) (string= trigger ""))
@@ -743,7 +789,7 @@ corpus-walk helpers that already hold the loaded machine object)."
 (defun record-dispatch-envelopes-from-step (state step)
   "Process mergeBatch from a RE step, applying the same drop rules as CPP
 dispatch_triggers and TS Dispatcher.onStep: drop ops without governance
-(droppedNoGovernance) or without dispatchableAgent+aiTrigger (droppedNoDispatch)."
+(droppedNoGovernance) or without dispatch binding (droppedNoDispatch)."
   (when (perception-state-triggers-enabled-p state)
     (let ((records nil))
       (dolist (operation (jarray-list (or (jget step "mergeBatch") (arr))))
@@ -829,7 +875,6 @@ dispatch_triggers and TS Dispatcher.onStep: drop ops without governance
                       "envelopeId" (or (jstring body "envelopeId" nil) +json-null+)
                       "timestamp" received-at))
       (obj "success" t
-           "source" (source-json source)
            "completion" (obj "provider" provider
                              "agent" agent
                              "sensorId" sensor-id

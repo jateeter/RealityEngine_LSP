@@ -139,7 +139,9 @@
 ;; same mergeBatch shapes both other runtimes already enforce.
 
 (defparameter +ai-machines-dir+
-  (or (probe-file "../RealityEngine_AI/examples/machines/")
+  (or (probe-file "../RealityEngine_Machines/machines/")
+      (probe-file "../../RealityEngine_Machines/machines/")
+      (probe-file "../RealityEngine_AI/examples/machines/")
       (probe-file "../../RealityEngine_AI/examples/machines/")))
 
 (defun reset-machine (machine)
@@ -163,10 +165,15 @@
   (let ((decision (reality-engine-lsp::resolve-governance machine sequence-id values)))
     (unless decision (return-from envelope-for nil))
     (let* ((md (reality-engine-lsp::machine-metadata machine))
+           (binding (reality-engine-lsp::ces-dispatch-binding
+                     md (reality-engine-lsp::vectorize values)))
+           (write-back (reality-engine-lsp::jget binding "writeBack"))
            (sla (reality-engine-lsp::jget decision "slaSeconds")))
       (reality-engine-lsp::obj
-       "dispatchableAgent" (reality-engine-lsp::jstring md "dispatchableAgent" "")
-       "aiTrigger"         (reality-engine-lsp::jstring md "aiTrigger" "")
+       "agent"             (reality-engine-lsp::jstring binding "agent" "")
+       "trigger"           (reality-engine-lsp::jstring binding "trigger" "")
+       "autonomyMode"      (reality-engine-lsp::jstring binding "autonomyMode" "")
+       "writeBackType"     (reality-engine-lsp::jstring write-back "type" "")
        "ragStatusCode"     (reality-engine-lsp::jstring decision "ragStatusCode" "")
        "processStatus"     (reality-engine-lsp::jstring decision "processStatus" "")
        "ownerTeam"         (reality-engine-lsp::jstring decision "ownerTeam" "")
@@ -176,7 +183,7 @@
   "Auto-discover machines, replay each inputSequences[] entry, return a plist
    of (:machines :sequences :outputs :envelopes :failures).  Same skip rules
    as the AI + C++ counterparts: bypass machines without triggerConfig+
-   dispatchableAgent+aiTrigger; skip baseline (expectedOutputCount=0) sequences;
+   agentBinding; skip baseline (expectedOutputCount=0) sequences;
    require SLA only for paging tiers (processStatus ∈ {error, warning})."
   (let ((machines 0) (sequences 0) (outputs 0) (envelopes 0) (failures nil))
     (dolist (path (sort (uiop:directory-files machine-dir "*.json") #'string< :key #'namestring))
@@ -188,13 +195,13 @@
         (let* ((machine-obj (reality-engine-lsp::jget root "machine"))
                (md (reality-engine-lsp::jget machine-obj "metadata"))
                (tc (reality-engine-lsp::jget md "triggerConfig"))
-               (rules (and (reality-engine-lsp::jobject-p tc) (reality-engine-lsp::jget tc "rules"))))
+               (rules (and (reality-engine-lsp::jobject-p tc) (reality-engine-lsp::jget tc "rules")))
+               (binding (reality-engine-lsp::ces-dispatch-binding md)))
           (when (and (reality-engine-lsp::jarray-p rules)
                      (> (length (reality-engine-lsp::jarray-list rules)) 0)
-                     (let ((da (reality-engine-lsp::jstring md "dispatchableAgent" "")))
-                       (> (length da) 0))
-                     (let ((at (reality-engine-lsp::jstring md "aiTrigger" "")))
-                       (> (length at) 0)))
+                     (reality-engine-lsp::jobject-p (reality-engine-lsp::jget md "agentBinding"))
+                     (> (length (reality-engine-lsp::jstring binding "agent" "")) 0)
+                     (> (length (reality-engine-lsp::jstring binding "trigger" "")) 0))
             (incf machines)
             (let ((machine (handler-case (reality-engine-lsp::load-machine-from-file path)
                              (error (c) (push (format nil "~a: load failed — ~a" (file-namestring path) c) failures)
@@ -243,11 +250,17 @@
                                         (ps (reality-engine-lsp::jstring env "processStatus" ""))
                                         (rs (reality-engine-lsp::jstring env "ragStatusCode" ""))
                                         (ot (reality-engine-lsp::jstring env "ownerTeam" ""))
-                                        (da (reality-engine-lsp::jstring env "dispatchableAgent" ""))
-                                        (at (reality-engine-lsp::jstring env "aiTrigger" ""))
+                                        (agent (reality-engine-lsp::jstring env "agent" ""))
+                                        (trigger (reality-engine-lsp::jstring env "trigger" ""))
+                                        (mode (reality-engine-lsp::jstring env "autonomyMode" ""))
+                                        (write-back-type (reality-engine-lsp::jstring env "writeBackType" ""))
                                         (sla (reality-engine-lsp::jget env "slaSeconds")))
-                                    (when (zerop (length da)) (push (format nil "~a: dispatchableAgent empty" where) failures))
-                                    (when (zerop (length at)) (push (format nil "~a: aiTrigger empty" where) failures))
+                                    (when (zerop (length agent)) (push (format nil "~a: agentBinding.agent empty" where) failures))
+                                    (when (zerop (length trigger)) (push (format nil "~a: agentBinding.trigger empty" where) failures))
+                                    (unless (member mode '("observe" "advise" "supervised-act" "automated-act") :test #'string=)
+                                      (push (format nil "~a: autonomyMode='~a' not in supported modes" where mode) failures))
+                                    (when (zerop (length write-back-type))
+                                      (push (format nil "~a: agentBinding.writeBack.type empty" where) failures))
                                     (unless (member rs '("RED" "AMBER" "GREEN") :test #'string=)
                                       (push (format nil "~a: ragStatusCode='~a' not in {RED,AMBER,GREEN}" where rs) failures))
                                     (unless (member ps '("error" "warning" "info" "ok") :test #'string=)
@@ -286,7 +299,7 @@
                                  "metadata" (reality-engine-lsp::machine-metadata machine))))))
 
 (defun walk-corpus-through-pe-dispatch (machine-dir)
-  "Replay the AI corpus through the LSP PE dispatch-ledger path.
+  "Replay the shared machine corpus through the LSP PE dispatch-ledger path.
 This tests PE-owned bridge behavior: RE-style merge operations enter PE,
 and PE records async dispatch envelopes without requiring live RE HTTP."
   (let ((state (reality-engine-lsp::make-perception-state-from-config
@@ -305,11 +318,13 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
         (let* ((machine-obj (reality-engine-lsp::jget root "machine"))
                (md (reality-engine-lsp::jget machine-obj "metadata"))
                (tc (reality-engine-lsp::jget md "triggerConfig"))
-               (rules (and (reality-engine-lsp::jobject-p tc) (reality-engine-lsp::jget tc "rules"))))
+               (rules (and (reality-engine-lsp::jobject-p tc) (reality-engine-lsp::jget tc "rules")))
+               (binding (reality-engine-lsp::ces-dispatch-binding md)))
           (when (and (reality-engine-lsp::jarray-p rules)
                      (> (length (reality-engine-lsp::jarray-list rules)) 0)
-                     (> (length (reality-engine-lsp::jstring md "dispatchableAgent" "")) 0)
-                     (> (length (reality-engine-lsp::jstring md "aiTrigger" "")) 0))
+                     (reality-engine-lsp::jobject-p (reality-engine-lsp::jget md "agentBinding"))
+                     (> (length (reality-engine-lsp::jstring binding "agent" "")) 0)
+                     (> (length (reality-engine-lsp::jstring binding "trigger" "")) 0))
             (incf machines)
             (let ((machine (handler-case (reality-engine-lsp::load-machine-from-file path)
                              (error (c) (push (format nil "~a: load failed — ~a" (file-namestring path) c) failures)
@@ -345,11 +360,18 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                                    (let* ((envelope (reality-engine-lsp::jget record "envelope"))
                                           (dispatch (reality-engine-lsp::jget envelope "dispatch"))
                                           (target (reality-engine-lsp::jstring dispatch "agent" ""))
-                                          (trigger (reality-engine-lsp::jstring dispatch "trigger" "")))
+                                          (trigger (reality-engine-lsp::jstring dispatch "trigger" ""))
+                                          (mode (reality-engine-lsp::jstring dispatch "autonomyMode" ""))
+                                          (write-back (reality-engine-lsp::jget dispatch "writeBack"))
+                                          (write-back-type (reality-engine-lsp::jstring write-back "type" "")))
                                      (when (zerop (length target))
                                        (push (format nil "~a: PE dispatch target empty" (file-namestring path)) failures))
                                      (when (zerop (length trigger))
-                                       (push (format nil "~a: PE aiTrigger empty" (file-namestring path)) failures)))))))))))))))))))
+                                       (push (format nil "~a: PE aiTrigger empty" (file-namestring path)) failures))
+                                     (unless (member mode '("observe" "advise" "supervised-act" "automated-act") :test #'string=)
+                                       (push (format nil "~a: PE autonomyMode invalid" (file-namestring path)) failures))
+                                     (when (zerop (length write-back-type))
+                                       (push (format nil "~a: PE writeBack.type empty" (file-namestring path)) failures)))))))))))))))))))
     (list :state state
           :machines machines
           :sequences sequences
@@ -751,13 +773,27 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                        "agent" "e2e"
                        "sourceMappingId" "agent-completion-risk"
                        "values" (reality-engine-lsp::vectorize (list 1 0 0.75 0)))))
-         (source (reality-engine-lsp::jget completion "source")))
+         (signal (reality-engine-lsp::jget completion "signal"))
+         (source (reality-engine-lsp::jget signal "source")))
     (assert-equal "agent.e2e.completion"
                   (reality-engine-lsp::jstring source "sensorId" "")
                   "completion ingest should commit through PE source mapping")
     (assert-equal 4200
                   (reality-engine-lsp::jnumber (reality-engine-lsp::jget source "region") "offset" nil)
-                  "completion source should use configured mapping offset"))
+                  "completion source should use configured mapping offset")
+    (assert-equal nil
+                  (reality-engine-lsp::jget completion "source")
+                  "completion response should not expose legacy top-level source")
+    (let ((missing (reality-engine-lsp::ingest-completion
+                    state
+                    (reality-engine-lsp::obj
+                     "sourceMappingId" "missing-completion-mapping"
+                     "values" (reality-engine-lsp::vectorize (list 1))))))
+      (assert-equal 404 (car missing)
+                    "unknown explicit completion sourceMappingId should return 404")
+      (assert-equal "Unknown sourceMappingId \"missing-completion-mapping\""
+                    (reality-engine-lsp::jstring (cdr missing) "error" "")
+                    "unknown completion mapping should match CPP/AI error text")))
   ;; ── HealthKit Spezi bridge — canonical contract ──────────────────────────
   ;; Mirrors CPP e2e_healthkit_spezi.sh: token auth rejection, resolved shape
   ;; with region + source.lastValue for all three Spezi sensor types.
@@ -1143,8 +1179,10 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                 (merge-pathnames "AGX051_yuma-aqua-maintenance-forecaster.json" +ai-machines-dir+)))
             (env (envelope-for m "agx-051-urgent-maint" '(1 0 0 0))))
        (assert-true env                                                                "AGX051 urgent_maint: envelope unresolved")
-       (assert-equal "aquaculture_predictive_maintenance_agent"                        (reality-engine-lsp::jstring env "dispatchableAgent" "") "AGX051 urgent_maint: dispatch agent")
-       (assert-equal "agriculture-yuma-aqua-maintenance-forecaster-maintenance"        (reality-engine-lsp::jstring env "aiTrigger" "")        "AGX051 urgent_maint: aiTrigger")
+       (assert-equal "aquaculture_predictive_maintenance_agent"                        (reality-engine-lsp::jstring env "agent" "")       "AGX051 urgent_maint: dispatch agent")
+       (assert-equal "agriculture-yuma-aqua-maintenance-forecaster-maintenance"        (reality-engine-lsp::jstring env "trigger" "")     "AGX051 urgent_maint: aiTrigger")
+       (assert-equal "advise"                                                          (reality-engine-lsp::jstring env "autonomyMode" "") "AGX051 urgent_maint: autonomyMode")
+       (assert-equal "pe-sensor"                                                       (reality-engine-lsp::jstring env "writeBackType" "") "AGX051 urgent_maint: writeBack.type")
        (assert-equal "RED"                                                              (reality-engine-lsp::jstring env "ragStatusCode" "")    "AGX051 urgent_maint: ragStatusCode")
        (assert-equal "error"                                                            (reality-engine-lsp::jstring env "processStatus" "")    "AGX051 urgent_maint: processStatus")
        (assert-equal "agriculture-operations"                                           (reality-engine-lsp::jstring env "ownerTeam" "")        "AGX051 urgent_maint: ownerTeam")
@@ -1163,6 +1201,8 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
          (assert-true record "AGX051 PE urgent_maint: dispatch record unresolved")
          (assert-equal "aquaculture_predictive_maintenance_agent" (reality-engine-lsp::jstring (reality-engine-lsp::jget pe-env "dispatch") "agent" "") "AGX051 PE urgent_maint: dispatch agent")
          (assert-equal "agriculture-yuma-aqua-maintenance-forecaster-maintenance" (reality-engine-lsp::jstring (reality-engine-lsp::jget pe-env "dispatch") "trigger" "") "AGX051 PE urgent_maint: aiTrigger")
+         (assert-equal "advise" (reality-engine-lsp::jstring (reality-engine-lsp::jget pe-env "dispatch") "autonomyMode" "") "AGX051 PE urgent_maint: autonomyMode")
+         (assert-equal "pe-sensor" (reality-engine-lsp::jstring (reality-engine-lsp::jget (reality-engine-lsp::jget pe-env "dispatch") "writeBack") "type" "") "AGX051 PE urgent_maint: writeBack.type")
          (assert-equal "RED" (reality-engine-lsp::jstring gov "ragStatusCode" "") "AGX051 PE urgent_maint: ragStatusCode")
          (assert-equal "error" (reality-engine-lsp::jstring gov "processStatus" "") "AGX051 PE urgent_maint: processStatus")
          (assert-equal 900 (reality-engine-lsp::jget gov "slaSeconds") "AGX051 PE urgent_maint: slaSeconds != 900")))
@@ -1175,11 +1215,13 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                        ("agx-055-climate-urgent"  (0 0 0 0 0 0 1 0 0 0 0 0) "RED")
                        ("agx-055-safety-urgent"   (0 0 0 0 0 0 0 0 0 1 0 0) "RED")
                        ("agx-055-facility-stable" (0 0 0 0 0 0 0 0 0 0 0 1) "GREEN")))
-         (let ((env (envelope-for m (first case) (second case))))
-           (assert-true env (format nil "AGX055 ~a: envelope unresolved" (first case)))
-           (assert-equal "agriculture_yield_optimization_ai"        (reality-engine-lsp::jstring env "dispatchableAgent" "") (format nil "AGX055 ~a: dispatchableAgent" (first case)))
-           (assert-equal "ag-yield-optimization-ai-yuma-facility-bridge" (reality-engine-lsp::jstring env "aiTrigger" "")     (format nil "AGX055 ~a: aiTrigger" (first case)))
-           (assert-equal (third case)                                (reality-engine-lsp::jstring env "ragStatusCode" "")     (format nil "AGX055 ~a: ragStatusCode" (first case)))
+	         (let ((env (envelope-for m (first case) (second case))))
+	           (assert-true env (format nil "AGX055 ~a: envelope unresolved" (first case)))
+	           (assert-equal "agriculture_yield_optimization_ai" (reality-engine-lsp::jstring env "agent" "") (format nil "AGX055 ~a: dispatchableAgent" (first case)))
+	           (assert-equal "ag-yield-optimization-ai-yuma-facility-bridge" (reality-engine-lsp::jstring env "trigger" "") (format nil "AGX055 ~a: aiTrigger" (first case)))
+	           (assert-equal "advise" (reality-engine-lsp::jstring env "autonomyMode" "") (format nil "AGX055 ~a: autonomyMode" (first case)))
+	           (assert-equal "pe-sensor" (reality-engine-lsp::jstring env "writeBackType" "") (format nil "AGX055 ~a: writeBack.type" (first case)))
+	           (assert-equal (third case) (reality-engine-lsp::jstring env "ragStatusCode" "") (format nil "AGX055 ~a: ragStatusCode" (first case)))
            (assert-equal "agriculture-operations"                   (reality-engine-lsp::jstring env "ownerTeam" "")         (format nil "AGX055 ~a: ownerTeam" (first case)))
          (let* ((pe-state (reality-engine-lsp::make-perception-state-from-config
                            :dimension 768
@@ -1189,10 +1231,12 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                 (record (pe-record-for pe-state m (first case) (second case)))
                 (pe-env (reality-engine-lsp::jget record "envelope"))
                 (gov (reality-engine-lsp::jget pe-env "governance")))
-           (assert-true record (format nil "AGX055 PE ~a: dispatch record unresolved" (first case)))
-           (assert-equal "agriculture_yield_optimization_ai" (reality-engine-lsp::jstring (reality-engine-lsp::jget pe-env "dispatch") "agent" "") (format nil "AGX055 PE ~a: dispatchableAgent" (first case)))
-           (assert-equal "ag-yield-optimization-ai-yuma-facility-bridge" (reality-engine-lsp::jstring (reality-engine-lsp::jget pe-env "dispatch") "trigger" "") (format nil "AGX055 PE ~a: aiTrigger" (first case)))
-           (assert-equal (third case) (reality-engine-lsp::jstring gov "ragStatusCode" "") (format nil "AGX055 PE ~a: ragStatusCode" (first case)))))))
+	           (assert-true record (format nil "AGX055 PE ~a: dispatch record unresolved" (first case)))
+	           (assert-equal "agriculture_yield_optimization_ai" (reality-engine-lsp::jstring (reality-engine-lsp::jget pe-env "dispatch") "agent" "") (format nil "AGX055 PE ~a: dispatchableAgent" (first case)))
+	           (assert-equal "ag-yield-optimization-ai-yuma-facility-bridge" (reality-engine-lsp::jstring (reality-engine-lsp::jget pe-env "dispatch") "trigger" "") (format nil "AGX055 PE ~a: aiTrigger" (first case)))
+	           (assert-equal "advise" (reality-engine-lsp::jstring (reality-engine-lsp::jget pe-env "dispatch") "autonomyMode" "") (format nil "AGX055 PE ~a: autonomyMode" (first case)))
+	           (assert-equal "pe-sensor" (reality-engine-lsp::jstring (reality-engine-lsp::jget (reality-engine-lsp::jget pe-env "dispatch") "writeBack") "type" "") (format nil "AGX055 PE ~a: writeBack.type" (first case)))
+	           (assert-equal (third case) (reality-engine-lsp::jstring gov "ragStatusCode" "") (format nil "AGX055 PE ~a: ragStatusCode" (first case)))))))
 
      ;; Bridge perceptual contract — AGX055.output == AgYieldOptimizationAI.input == length 12.
      (let* ((bridge-root (reality-engine-lsp::parse-json (reality-engine-lsp::safe-read-file (namestring (merge-pathnames "AGX055_yuma-facility-ai-synthesis-bridge.json" +ai-machines-dir+)))))

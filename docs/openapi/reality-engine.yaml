@@ -5,13 +5,13 @@ info:
   description: |
     OpenAPI contract for the Common Lisp (SBCL) Reality Engine service.
 
-    The service defaults to `http://localhost:3299`.  Wire-compatible
+    The service defaults to `http://localhost:5601`.  Wire-compatible
     with the AI (TypeScript / Node.js, default runtime) and CPP (native
     C++) runtimes — same JSON corpus, byte-identical mergeBatch
     ordering, identical Prometheus shape.  This runtime emits
     `runtime="lsp"` on every metric line.
 servers:
-  - url: http://localhost:3299
+  - url: http://localhost:5601
     description: Local Reality Engine default
 tags:
   - name: System

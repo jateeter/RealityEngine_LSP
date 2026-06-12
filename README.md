@@ -54,10 +54,10 @@ cp .env.example .env
 
 Defaults match the sibling implementations:
 
-- Reality Engine: `http://localhost:3299`
-- Perception Engine: `http://localhost:3300`
-- Machine directory: `../RealityEngine_AI/examples/machines`
-- Vector dimension: `768` (configurable floor; grows elastically to span all machine mappings)
+- Reality Engine: `http://localhost:5601`
+- Perception Engine: `http://localhost:5600`
+- Machine directory: `../RealityEngine_Machines/machines`
+- Vector dimension: `7680` (configurable floor; grows elastically to span all machine mappings)
 
 ## MQTT Integration
 
@@ -123,11 +123,11 @@ flags):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `REALITY_ENGINE_PORT` | `3299` | RE bind port |
-| `PERCEPTION_ENGINE_PORT` | `3300` | PE bind port |
-| `VECTOR_DIMENSION` | `768` | Perceptual-space dimension floor |
-| `MACHINES_DIR` | `../RealityEngine_AI/examples/machines` | Source of startup machines |
-| `LOCAL_AI_API_URL` | `http://localhost:8000` | localAIStack integration target |
+| `REALITY_ENGINE_PORT` | `5601` | RE bind port |
+| `PERCEPTION_ENGINE_PORT` | `5600` | PE bind port |
+| `VECTOR_DIMENSION` | `7680` | Perceptual-space dimension floor |
+| `MACHINES_DIR` | `../RealityEngine_Machines/machines` | Source of startup machines |
+| `LOCAL_AI_API_URL` | `http://localhost:4000` | localAIStack integration target |
 | `INTEGRATIONS_CONFIG` | `config/integrations.json` when present | Provider-neutral startup registry for source mappings |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Local Ollama adapter base URL |
 | `OLLAMA_MODEL` | `gpt-oss:20b` | Default Ollama model for PE-controlled dispatch |

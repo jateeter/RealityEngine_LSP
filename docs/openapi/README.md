@@ -4,8 +4,8 @@ Two OpenAPI 3.0.3 documents describe the LSP runtime's HTTP surface.
 
 | File | Service | Default URL |
 |---|---|---|
-| [`reality-engine.yaml`](reality-engine.yaml)     | Reality Engine     | `http://localhost:3299` |
-| [`perception-engine.yaml`](perception-engine.yaml) | Perception Engine | `http://localhost:3300` |
+| [`reality-engine.yaml`](reality-engine.yaml)     | Reality Engine     | `http://localhost:5601` |
+| [`perception-engine.yaml`](perception-engine.yaml) | Perception Engine | `http://localhost:5600` |
 
 Wire-compatible with [`RealityEngine_AI`](../../../RealityEngine_AI/docs/openapi/)
 (the default runtime) and [`RealityEngine_CPP`](../../../RealityEngine_CPP/docs/openapi/)
