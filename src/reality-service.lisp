@@ -1867,7 +1867,7 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                                                                 step)
                                                               (obj "error" "Provide exactly one of: vector, sparseVector, domainVectors"))))))))))
 
-(defun start-reality-service (&key (port 3299) (machine-dir "../RealityEngine_AI/examples/machines") (dimension 768))
+(defun start-reality-service (&key (port 5601) (machine-dir "../RealityEngine_Machines/machines") (dimension 7680))
   (let* ((state (make-reality-state-from-config :machine-dir machine-dir :dimension dimension))
          (actor (state-actor "reality-service" state)))
     (start-http-server port (reality-routes actor) :name "reality-engine-lsp"
@@ -1877,6 +1877,6 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                               #'re-sse-stream-handler)))))
 
 (defun start-reality-from-environment ()
-  (start-reality-service :port (env-int "REALITY_ENGINE_PORT" 3299)
-                         :machine-dir (env "MACHINES_DIR" "../RealityEngine_AI/examples/machines")
-                         :dimension (env-int "VECTOR_DIMENSION" 768)))
+  (start-reality-service :port (env-int "REALITY_ENGINE_PORT" 5601)
+                         :machine-dir (env "MACHINES_DIR" "../RealityEngine_Machines/machines")
+                         :dimension (env-int "VECTOR_DIMENSION" 7680)))

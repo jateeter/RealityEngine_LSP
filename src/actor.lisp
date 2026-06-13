@@ -75,7 +75,9 @@
 (defun actor-ask (actor message &key (timeout 30))
   (let ((lock (bt:make-lock "ask-lock"))
         (condition (bt:make-condition-variable :name "ask-cv"))
-        envelope)
+        envelope
+        (deadline (+ (get-internal-real-time)
+                     (round (* timeout internal-time-units-per-second)))))
     (setf envelope (make-envelope :message message
                                   :reply-lock lock
                                   :reply-condition condition
@@ -84,8 +86,12 @@
       (push envelope (actor-mailbox actor))
       (bt:condition-notify (actor-condition actor)))
     (bt:with-lock-held (lock)
-      (unless (envelope-replied-p envelope)
-        (bt:condition-wait condition lock :timeout timeout))
+      (loop until (envelope-replied-p envelope)
+            for remaining = (/ (- deadline (get-internal-real-time))
+                               internal-time-units-per-second)
+            do (when (<= remaining 0)
+                 (error "Actor ask timed out for ~a" (actor-name actor)))
+               (bt:condition-wait condition lock :timeout remaining))
       (unless (envelope-replied-p envelope)
         (error "Actor ask timed out for ~a" (actor-name actor)))
       (when (envelope-reply-error envelope)

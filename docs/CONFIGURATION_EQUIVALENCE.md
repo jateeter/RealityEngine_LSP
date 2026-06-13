@@ -4,11 +4,11 @@ RealityEngine_LSP uses the same environment variables as the sibling runtimes.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `REALITY_ENGINE_PORT` | `3299` | Reality Engine HTTP port |
-| `PERCEPTION_ENGINE_PORT` | `3300` | Perception Engine HTTP port |
-| `VECTOR_DIMENSION` | `768` | Dense transport compatibility floor |
-| `MACHINES_DIR` | `../RealityEngine_AI/examples/machines` | Machine JSON corpus |
-| `LOCAL_AI_API_URL` | `http://localhost:8000` | localAIStack API base URL |
+| `REALITY_ENGINE_PORT` | `5601` | Reality Engine HTTP port |
+| `PERCEPTION_ENGINE_PORT` | `5600` | Perception Engine HTTP port |
+| `VECTOR_DIMENSION` | `7680` | Dense transport compatibility floor |
+| `MACHINES_DIR` | `../RealityEngine_Machines/machines` | Machine JSON corpus |
+| `LOCAL_AI_API_URL` | `http://localhost:4000` | localAIStack API base URL |
 | `LOCAL_AI_MACHINES_DIR` | `../localAIStack/data/machines` | localAI bridge machine directory |
 | `LOCAL_AI_BOOTSTRAP` | `false` | Reserved for startup bootstrap parity |
 | `QDRANT_URL` | `http://localhost:4333` | Shared Qdrant REST URL |
@@ -28,4 +28,3 @@ Configuration can be inspected at:
 
 Runtime options can be changed through `PATCH /api/runtime/options`, matching
 the C++ API shape.
-

@@ -7,8 +7,9 @@ cd "$ROOT_DIR"
 
 REALITY_ENGINE_E2E_PORT="${REALITY_ENGINE_E2E_PORT:-3399}"
 PERCEPTION_ENGINE_E2E_PORT="${PERCEPTION_ENGINE_E2E_PORT:-3401}"
-VECTOR_DIMENSION="${VECTOR_DIMENSION:-5120}"
+VECTOR_DIMENSION="${VECTOR_DIMENSION:-7680}"
 HEALTHKIT_BRIDGE_TOKEN="${HEALTHKIT_BRIDGE_TOKEN:-spezi-e2e-token}"
+E2E_MACHINES_DIR="$(mktemp -d "${TMPDIR:-/tmp}/healthkit-spezi-lsp-machines.XXXXXX")"
 
 REALITY_PID=""
 PERCEPTION_PID=""
@@ -22,6 +23,7 @@ cleanup() {
     kill "$REALITY_PID" >/dev/null 2>&1 || true
     wait "$REALITY_PID" >/dev/null 2>&1 || true
   fi
+  rm -rf "$E2E_MACHINES_DIR"
 }
 trap cleanup EXIT
 
@@ -126,11 +128,13 @@ echo "  Perception Engine port: $PERCEPTION_ENGINE_E2E_PORT"
 
 REALITY_ENGINE_PORT="$REALITY_ENGINE_E2E_PORT" \
   VECTOR_DIMENSION="$VECTOR_DIMENSION" \
+  MACHINES_DIR="$E2E_MACHINES_DIR" \
   bin/reality-engine-lsp reality >/tmp/reality_engine_healthkit_spezi_lsp_e2e.log 2>&1 &
 REALITY_PID="$!"
 wait_for_http "http://localhost:${REALITY_ENGINE_E2E_PORT}/api/health" "Reality Engine"
 
 PERCEPTION_ENGINE_PORT="$PERCEPTION_ENGINE_E2E_PORT" \
+  REALITY_ENGINE_PORT="$REALITY_ENGINE_E2E_PORT" \
   REALITY_ENGINE_URL="http://localhost:${REALITY_ENGINE_E2E_PORT}" \
   VECTOR_DIMENSION="$VECTOR_DIMENSION" \
   INTEGRATIONS_CONFIG="config/integrations.healthkit-spezi.example.json" \
@@ -141,11 +145,6 @@ wait_for_http "http://localhost:${PERCEPTION_ENGINE_E2E_PORT}/api/health" "Perce
 
 PE_URL="http://localhost:${PERCEPTION_ENGINE_E2E_PORT}"
 curl -sf "$PE_URL/api/integrations/status" | assert_registry
-
-bad_status="$(curl -s -o /tmp/healthkit_spezi_lsp_unauthorized.json -w "%{http_code}" -X POST "$PE_URL/api/integrations/healthkit/ingest" \
-  -H "Content-Type: application/json" \
-  -d '{"bridgeId":"healthkit-ios-bridge","bridgeToken":"wrong","type":"HKCorrelationTypeIdentifierBloodPressure","values":[0.72,0.48,0.24,0.99]}')"
-assert_status_code "$bad_status" "401"
 
 bp_payload="$(curl -sf -X POST "$PE_URL/api/integrations/healthkit/ingest" -H "Content-Type: application/json" -d '{"bridgeId":"healthkit-ios-bridge","bridgeToken":"'"$HEALTHKIT_BRIDGE_TOKEN"'","type":"HKCorrelationTypeIdentifierBloodPressure","unit":"mm[Hg]","values":[0.72,0.48,0.24,0.99],"metadata":{"standard":"SpeziHealthKit","fhirCode":"85354-9"}}')"
 assert_ingest "$bp_payload" "healthkit.blood-pressure" "healthkit:HKCorrelationTypeIdentifierBloodPressure" 4320
@@ -164,9 +163,26 @@ post_machine "$bp_machine"
 post_machine "$exercise_machine"
 post_machine "$sleep_machine"
 
-push_payload="$(curl -sf -X POST "$PE_URL/api/push" -H "Content-Type: application/json" -d '{"compact":true}')"
+wait_for_http "http://localhost:${REALITY_ENGINE_E2E_PORT}/api/machines" "Reality Engine machine catalog"
+sleep 1
+wait_for_http "$PE_URL/api/state" "Perception Engine actor"
+
+push_status="$(curl -s -o /tmp/healthkit_spezi_lsp_push.json -w "%{http_code}" -X POST "$PE_URL/api/push" \
+  -H "Content-Type: application/json" \
+  -d '{"compact":true}')"
+if [ "$push_status" != "200" ]; then
+  echo "HealthKit Spezi PE push failed with HTTP $push_status" >&2
+  cat /tmp/healthkit_spezi_lsp_push.json >&2 || true
+  exit 1
+fi
+push_payload="$(cat /tmp/healthkit_spezi_lsp_push.json)"
 assert_merge_region "$push_payload" 4350 2
 assert_merge_region "$push_payload" 4352 2
 assert_merge_region "$push_payload" 4354 2
+
+bad_status="$(curl -s -o /tmp/healthkit_spezi_lsp_unauthorized.json -w "%{http_code}" -X POST "$PE_URL/api/integrations/healthkit/ingest" \
+  -H "Content-Type: application/json" \
+  -d '{"bridgeId":"healthkit-ios-bridge","bridgeToken":"wrong","type":"HKCorrelationTypeIdentifierBloodPressure","values":[0.72,0.48,0.24,0.99]}')"
+assert_status_code "$bad_status" "401"
 
 echo "HealthKit Spezi bridge e2e tests passed (LSP)"

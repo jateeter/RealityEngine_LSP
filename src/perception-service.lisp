@@ -1352,13 +1352,14 @@ Callers accumulate results into resolved/unmapped lists."
                      "noWaitDispatch" t
                      "handoff" handoff)))))
 
-(defun push-perception (state include-machine-results)
+(defun push-perception (state include-machine-results &key compact)
   (let* ((engine (perception-state-engine state))
          (vector (assemble-perception-vector engine))
          (payload (obj "vector" (vectorize vector)
                        "matchAlgorithm" (perception-engine-match-algorithm engine)
                        "includeMachineResults" (json-bool include-machine-results)
-                       "includePerceptualSpace" t)))
+                       "includePerceptualSpace" (json-bool (not compact))
+                       "compact" (json-bool compact))))
     (handler-case
         (let* ((step      (http-post-json (format nil "~a/api/perceive" (perception-state-reality-url state))
                                           payload))
@@ -1510,7 +1511,9 @@ Callers accumulate results into resolved/unmapped lists."
                                                (lambda (state)
                                                  (push-perception state
                                                                   (jbool body "includeMachineResults"
-                                                                         (not (jbool body "compact" nil)))))))))
+                                                                         (not (jbool body "compact" nil)))
+                                                                  :compact (jbool body "compact" nil)))
+                                               :timeout 120))))
    (make-route "GET" "/api/push/:id" (lambda (params body query)
                                       (declare (ignore body query))
                                       (error-response (format nil "Push record ~a not found" (gethash "id" params)) 404)))
@@ -1780,11 +1783,11 @@ startup — the PE still serves HTTP signals as a pure REST engine."
         (error (c)
           (format *error-output* "[MQTT] bridge failed to start: ~a~%" c))))))
 
-(defun start-perception-service (&key (port 3300)
-                                      (reality-url "http://localhost:3299")
-                                      (localai-url "http://localhost:8000")
+(defun start-perception-service (&key (port 5600)
+                                      (reality-url "http://localhost:5601")
+                                      (localai-url "http://localhost:4000")
                                       (localai-machine-dir "../localAIStack/data/machines")
-                                      (dimension 768))
+                                      (dimension 7680))
   (let* ((state (make-perception-state-from-config :dimension dimension
                                                    :reality-url reality-url
                                                    :localai-url localai-url
@@ -1814,9 +1817,9 @@ startup — the PE still serves HTTP signals as a pure REST engine."
                         (make-mcp-dispatchers actor)))))
 
 (defun start-perception-from-environment ()
-  (start-perception-service :port (env-int "PERCEPTION_ENGINE_PORT" 3300)
+  (start-perception-service :port (env-int "PERCEPTION_ENGINE_PORT" 5600)
                             :reality-url (or (env "REALITY_ENGINE_URL" nil)
-                                             (format nil "http://localhost:~a" (env-int "REALITY_ENGINE_PORT" 3299)))
-                            :localai-url (env "LOCAL_AI_API_URL" "http://localhost:8000")
+                                             (format nil "http://localhost:~a" (env-int "REALITY_ENGINE_PORT" 5601)))
+                            :localai-url (env "LOCAL_AI_API_URL" "http://localhost:4000")
                             :localai-machine-dir (env "LOCAL_AI_MACHINES_DIR" "../localAIStack/data/machines")
-                            :dimension (env-int "VECTOR_DIMENSION" 768)))
+                            :dimension (env-int "VECTOR_DIMENSION" 7680)))

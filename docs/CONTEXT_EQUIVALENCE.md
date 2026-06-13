@@ -6,7 +6,7 @@ RealityEngine_LSP preserves the deployment context of the existing runtimes.
 
 Default paths match the C++ startup scripts:
 
-- `MACHINES_DIR=../RealityEngine_AI/examples/machines`
+- `MACHINES_DIR=../RealityEngine_Machines/machines`
 - `LOCAL_AI_MACHINES_DIR=../localAIStack/data/machines`
 - `QDRANT_STORAGE_DIR=../localAIStack/volumes/qdrant`
 
@@ -43,4 +43,3 @@ The following mapping semantics mirror the C++ runtime:
 - machine output merges into `perceptualMapping.output.offset/length`
 - `compact` suppresses per-machine results unless explicitly overridden
 - sparse/domain vector forms are assembled into a dense perceptual vector
-

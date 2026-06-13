@@ -17,6 +17,7 @@ VECTOR_DIMENSION="${VECTOR_DIMENSION:-7680}"
 MACHINES_DIR="${MACHINES_DIR:-../RealityEngine_Machines/machines}"
 LOCAL_AI_API_URL="${LOCAL_AI_API_URL:-http://localhost:4000}"
 LOCAL_AI_MACHINES_DIR="${LOCAL_AI_MACHINES_DIR:-../localAIStack/data/machines}"
+QDRANT_URL="${QDRANT_URL:-http://localhost:4333}"
 # MQTT bridge env passthrough — currently consumed by the mapping registry
 # only (the LSP MQTT client driver is deferred per the rollout plan).  Once
 # the driver lands these are picked up unchanged.
@@ -47,7 +48,7 @@ if [ ! -f "$QUICKLISP_SETUP" ]; then
 fi
 
 export REALITY_ENGINE_PORT PERCEPTION_ENGINE_PORT VECTOR_DIMENSION MACHINES_DIR
-export LOCAL_AI_API_URL LOCAL_AI_MACHINES_DIR
+export LOCAL_AI_API_URL LOCAL_AI_MACHINES_DIR QDRANT_URL
 export MQTT_BROKER_HOST MQTT_BROKER_PORT MQTT_CLIENT_ID MQTT_MAPPINGS_FILE
 
 sbcl --noinform --load "$QUICKLISP_SETUP" \
@@ -70,6 +71,7 @@ echo "Reality Engine LSP     : http://localhost:${REALITY_ENGINE_PORT}${INSTANCE
 echo "Perception Engine LSP  : http://localhost:${PERCEPTION_ENGINE_PORT}${INSTANCE_ID:+ [instance: $INSTANCE_ID]}"
 echo "Machines               : ${MACHINES_DIR}"
 echo "Vector dimension       : ${VECTOR_DIMENSION}"
+echo "Qdrant                 : ${QDRANT_URL}"
 [ -n "$MQTT_BROKER_HOST" ] && \
   echo "MQTT broker (mapping)  : ${MQTT_BROKER_HOST}:${MQTT_BROKER_PORT}"
 [ -n "$MQTT_MAPPINGS_FILE" ] && \

@@ -258,7 +258,7 @@
          (rest-args (rest args))
          (pe-url-raw (or (cli-arg args "--pe-url")
                          (uiop:getenv "PE_URL")
-                         "http://localhost:3300"))
+                         "http://localhost:5600"))
          (base (trim-trailing-slashes pe-url-raw)))
     (handler-case
         (let ((result (cli-run-command command rest-args base)))

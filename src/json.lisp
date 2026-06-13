@@ -103,7 +103,7 @@
         (lambda (key item)
           (unless first (write-char #\, stream))
           (setf first nil)
-          (write-json (string key) stream)
+          (write-json (if (stringp key) key (princ-to-string key)) stream)
           (write-char #\: stream)
           (write-json item stream))
         value))
