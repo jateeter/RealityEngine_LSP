@@ -11,6 +11,14 @@ model: state is owned by mailbox-driven service actors, messages are
 processed serially per actor, `tell` is fire-and-forget, `ask` returns a
 future-like reply, and supervised actors can be restarted.
 
+## Integrated Specification
+
+Cross-repository deployment rules are owned by
+[`RealityEngine_CI/DEPLOYMENT_CONTRACT.md`](../RealityEngine_CI/DEPLOYMENT_CONTRACT.md)
+and [`RealityEngine_CI/INTEGRATED_SPECIFICATION.md`](../RealityEngine_CI/INTEGRATED_SPECIFICATION.md).
+The active machine and RE/PE operations contract is described in
+[`RealityEngine_Machines/docs/REALITY_PERCEPTION_OPERATIONS.md`](../RealityEngine_Machines/docs/REALITY_PERCEPTION_OPERATIONS.md).
+
 ## Requirements
 
 - SBCL
@@ -35,12 +43,12 @@ make test
 
 ## Run
 
-The simplest entry point is the unified orchestrator from `RealityEngine_AI`:
+The simplest entry point is the unified orchestrator from `RealityEngine_CI`:
 
 ```bash
 # Either route works — both delegate the same way
 ./startUniverse.sh --re-engine=lsp --pe-engine=lsp   # from this repo (shim)
-                                                      # or from RealityEngine_AI directly
+                                                      # or from RealityEngine_CI directly
 ./stopUniverse.sh                                    # tears the LSP engines down
 ```
 
