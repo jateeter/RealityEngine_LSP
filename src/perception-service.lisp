@@ -1673,7 +1673,28 @@ Callers accumulate results into resolved/unmapped lists."
                                             (mqtt-reload-bridge state body)))))
 	                   (cond
 	                     ((stringp result) (error-response result 400))
-	                     (t (json-response result))))))))
+	                     (t (json-response result))))))
+   (make-route "POST" "/api/mqtt/enable"
+               (lambda (_ body query)
+                 (declare (ignore _ query))
+                 (let ((result (actor-ask actor
+                                          (lambda (state)
+                                            (mqtt-enable-bridge state actor body)))))
+                   (cond
+                     ((stringp result) (error-response result 400))
+                     (t (json-response result))))))
+   (make-route "POST" "/api/mqtt/disable"
+               (lambda (_ body query)
+                 (declare (ignore _ body query))
+                 (actor-ask actor
+                            (lambda (state)
+                              (let ((b (perception-state-mqtt-bridge state)))
+                                (when b
+                                  (mqtt-bridge-stop b)
+                                  (setf (perception-state-mqtt-bridge state) nil)
+                                  (format *standard-output*
+                                          "[MQTT] bridge disabled via API~%")))))
+                 (json-response (obj "success" (json-bool t) "enabled" (json-bool nil)))))))
 
 ;; ── MQTT ingest path ────────────────────────────────────────────────────────
 ;;
@@ -1747,6 +1768,78 @@ operator's input is invalid."
                "enabled" (json-bool t)
                "mappings" (length (mqtt-mapping-registry-rules new-registry))
                "warnings" (vectorize warnings)))))))
+
+(defun parse-mqtt-broker-url (url)
+  "Parse 'mqtt://host:port' or 'host:port' into (values host port).
+Port defaults to 1883 when absent or unparseable."
+  (let* ((addr (let ((sep (search "://" url)))
+                 (if sep (subseq url (+ sep 3)) url)))
+         (colon (position #\: addr :from-end t))
+         (host  (if colon (subseq addr 0 colon) addr))
+         (port  (when colon
+                  (parse-integer (subseq addr (1+ colon)) :junk-allowed t))))
+    (values host (or port 1883))))
+
+(defun mqtt-enable-bridge (state actor body)
+  "POST /api/mqtt/enable handler — parse brokerUrl + mappings, build and
+start a new MQTT bridge.  Returns a JSON object on success or an error
+string when input is invalid."
+  (let* ((broker-url (jget body "brokerUrl"))
+         (mappings-val (jget body "mappings")))
+    (when (or (null broker-url) (string= broker-url ""))
+      (return-from mqtt-enable-bridge "brokerUrl is required"))
+    (multiple-value-bind (broker-host broker-port)
+        (parse-mqtt-broker-url broker-url)
+      (let ((new-registry nil))
+        (handler-case
+            (setf new-registry (mqtt-mapping-registry-from-json
+                                (or mappings-val (obj "mappings" (arr)))))
+          (error (c)
+            (return-from mqtt-enable-bridge (format nil "schema: ~a" c))))
+        (when (zerop (length (mqtt-mapping-registry-rules new-registry)))
+          (return-from mqtt-enable-bridge
+            "mappings array is empty — at least one rule is required"))
+        (let* ((allow (member (env "MQTT_ALLOW_REGION_OVERLAP" "0")
+                              '("1" "true" "TRUE" "yes") :test #'string=))
+               (warnings (mqtt-validate-overlaps new-registry allow))
+               (current  (perception-state-mqtt-bridge state))
+               (existing-client-id (when current
+                                     (mqtt-client-config-client-id
+                                      (reality-engine-lsp::%mqtt-client-config
+                                       (reality-engine-lsp::%mqtt-bridge-client current)))))
+               (cfg (make-mqtt-client-config
+                     :broker-host broker-host
+                     :broker-port broker-port
+                     :client-id (or existing-client-id "reality-engine-pe-lsp")))
+               (ingest (lambda (sensor-id offset length values ttl-ms topic mapping-id)
+                         (actor-tell actor
+                                     (lambda (st)
+                                       (ingest-mqtt-signal st sensor-id offset length
+                                                           values ttl-ms topic mapping-id)))))
+               (trigger (lambda ()
+                          (actor-tell actor
+                                      (lambda (st)
+                                        (handler-case (push-perception st nil)
+                                          (error (c)
+                                            (format *error-output*
+                                                    "[mqtt-bridge] push trigger error: ~a~%" c))))))))
+          (when current (mqtt-bridge-stop current))
+          (let ((bridge (make-mqtt-bridge cfg new-registry ingest trigger)))
+            (handler-case
+                (progn
+                  (mqtt-bridge-start bridge)
+                  (setf (perception-state-mqtt-bridge state) bridge)
+                  (format *standard-output*
+                          "[MQTT] bridge enabled via API — broker=~a:~a mappings=~a~%"
+                          broker-host broker-port
+                          (length (mqtt-mapping-registry-rules new-registry)))
+                  (obj "success" (json-bool t)
+                       "enabled" (json-bool t)
+                       "mappings" (length (mqtt-mapping-registry-rules new-registry))
+                       "warnings" (vectorize warnings)))
+              (error (c)
+                (setf (perception-state-mqtt-bridge state) nil)
+                (format nil "MQTT bridge failed to start: ~a" c)))))))))
 
 (defun maybe-boot-mqtt-bridge (state actor)
   "Build + start the MQTT bridge from the environment, when configured.
