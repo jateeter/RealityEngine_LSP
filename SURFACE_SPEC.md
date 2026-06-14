@@ -246,6 +246,8 @@ Default ports: Scala 5000 · CPP 5300 · LSP 5600
 | GET | `/api/mqtt/status` | ✓ | ✓ | ✓ |
 | GET | `/api/mqtt/mappings` | ✓ | ✓ | ✓ |
 | PUT | `/api/mqtt/mappings` | ✓ | ✓ | ✓ |
+| POST | `/api/mqtt/enable` | ✗ | ✗ | ✗ |
+| POST | `/api/mqtt/disable` | ✗ | ✗ | ✗ |
 
 ### Streaming
 
@@ -269,7 +271,12 @@ Default ports: Scala 5000 · CPP 5300 · LSP 5600
 
 ### Open gaps
 
-None. All routes listed in this spec are implemented by all three runtimes.
+| Route | CPP | LSP | Scala |
+|-------|-----|-----|-------|
+| `POST /api/mqtt/enable` | planned | planned | planned |
+| `POST /api/mqtt/disable` | planned | planned | planned |
+
+The Manager returns HTTP 501 for these routes until the active runtime implements them.
 
 ---
 
@@ -450,13 +457,25 @@ HTTP status: `200` (all ok) · `207` (partial failures).
 
 The following routes appeared in the locked historical RealityEngine_AI surface
 that has been replaced by Scala, but are not part of the canonical surface and
-must not be implemented in CPP, LSP, Scala, or the Manager:
+must not be implemented in CPP, LSP, or Scala:
 
-- `POST /api/mqtt/enable`
-- `POST /api/mqtt/disable`
-- `GET /api/mqtt/example`
+- `GET /api/mqtt/example` — AI PE only; not proxied by the Manager (endpoint removed from PE)
 - `GET /api/integrations/healthkit/example`
 - `GET /api/integrations/carekit/example`
 - `POST /api/triggers/replay/:dispatchId`
 - `GET /api/logs/ingest` (Loki-specific, Manager visualizer backend only)
 - `GET /api/viz/*` (Manager visualizer backend only)
+
+### Manager Visualizer Backend Proxy Routes
+
+The Manager exposes the following `/api/pe/mqtt/*` proxy routes that forward to the active
+Perception Engine. The enable/disable routes return HTTP 501 until the active runtime
+implements them (see Open gaps above).
+
+| Method | Manager route | Forwards to AI PE |
+|--------|---------------|-------------------|
+| GET | `/api/pe/mqtt/status` | `GET /api/mqtt/status` |
+| GET | `/api/pe/mqtt/mappings` | `GET /api/mqtt/mappings` |
+| POST | `/api/pe/mqtt/enable` | `POST /api/mqtt/enable` |
+| POST | `/api/pe/mqtt/disable` | `POST /api/mqtt/disable` |
+| PUT | `/api/pe/mqtt/mappings` | `PUT /api/mqtt/mappings` |
