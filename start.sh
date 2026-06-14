@@ -15,6 +15,7 @@ REALITY_ENGINE_PORT="${REALITY_ENGINE_PORT:-5601}"
 PERCEPTION_ENGINE_PORT="${PERCEPTION_ENGINE_PORT:-5600}"
 VECTOR_DIMENSION="${VECTOR_DIMENSION:-7680}"
 MACHINES_DIR="${MACHINES_DIR:-../RealityEngine_Machines/machines}"
+RE_LOAD_MACHINES="${RE_LOAD_MACHINES:-1}"
 LOCAL_AI_API_URL="${LOCAL_AI_API_URL:-http://localhost:4000}"
 LOCAL_AI_MACHINES_DIR="${LOCAL_AI_MACHINES_DIR:-../localAIStack/data/machines}"
 QDRANT_URL="${QDRANT_URL:-http://localhost:4333}"
@@ -45,6 +46,14 @@ fi
 if [ ! -f "$QUICKLISP_SETUP" ]; then
   echo "Missing Quicklisp. Expected ${ROOT_DIR}/quicklisp/setup.lisp or ${HOME}/quicklisp/setup.lisp." >&2
   exit 1
+fi
+
+# When RE_LOAD_MACHINES=0 the RE starts with no corpus (CI will seed separately).
+# Use a temp empty directory so the runtime still receives a valid path.
+if [ "${RE_LOAD_MACHINES}" = "0" ]; then
+    _machines_load_dir=$(mktemp -d)
+    trap 'rm -rf "$_machines_load_dir"' EXIT
+    MACHINES_DIR="$_machines_load_dir"
 fi
 
 export REALITY_ENGINE_PORT PERCEPTION_ENGINE_PORT VECTOR_DIMENSION MACHINES_DIR
