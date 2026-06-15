@@ -1,11 +1,13 @@
 LISP ?= sbcl
-QUICKLISP ?= $(CURDIR)/quicklisp/setup.lisp
+# Resolve Quicklisp like start.sh: repo-local first, then $HOME. Override on the
+# command line (QUICKLISP=/path/to/setup.lisp) or via the environment if needed.
+QUICKLISP ?= $(firstword $(wildcard $(CURDIR)/quicklisp/setup.lisp $(HOME)/quicklisp/setup.lisp))
 
 .PHONY: deps-check test build reality perception e2e-healthkit-spezi clean
 
 deps-check:
 	@test -x "$$(command -v $(LISP))" || (echo "Missing Common Lisp runtime: $(LISP)" >&2; exit 1)
-	@test -f "$(QUICKLISP)" || (echo "Missing Quicklisp setup: $(QUICKLISP)" >&2; exit 1)
+	@test -n "$(QUICKLISP)" && test -f "$(QUICKLISP)" || (echo "Missing Quicklisp setup: expected $(CURDIR)/quicklisp/setup.lisp or $(HOME)/quicklisp/setup.lisp" >&2; exit 1)
 
 test: deps-check
 	$(LISP) --noinform --disable-debugger --load "$(QUICKLISP)" \
