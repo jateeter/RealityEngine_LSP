@@ -881,6 +881,28 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                   "metadata" (or (machine-metadata machine) (obj)))
              nodes))
      (reality-state-machines state))
+    ;; Edges: source output region overlaps target input region.
+    ;; Mirrors Scala PerceptualSpaceSimulator.rebuildEdgeCache — interval
+    ;; intersection test, one directed edge per overlapping (source, target) pair.
+    (let (machine-list)
+      (maphash (lambda (_ m) (push m machine-list)) (reality-state-machines state))
+      (dolist (source machine-list)
+        (when (machine-mapping source)
+          (dolist (target machine-list)
+            (when (and (machine-mapping target)
+                       (not (string= (machine-id source) (machine-id target))))
+              (let* ((src-out (mapping-output (machine-mapping source)))
+                     (tgt-in  (mapping-input  (machine-mapping target)))
+                     (src-end (+ (region-offset src-out) (region-length src-out)))
+                     (tgt-end (+ (region-offset tgt-in)  (region-length tgt-in))))
+                (unless (or (<= src-end (region-offset tgt-in))
+                            (>= (region-offset src-out) tgt-end))
+                  (push (obj "source"       (machine-id source)
+                             "target"       (machine-id target)
+                             "sourceRegion" (region-json src-out)
+                             "targetRegion" (region-json tgt-in)
+                             "overlap"      t)
+                        edges))))))))
     (obj "nodes" (vectorize (nreverse nodes))
          "edges" (vectorize (nreverse edges)))))
 
