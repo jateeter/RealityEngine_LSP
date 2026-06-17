@@ -68,7 +68,7 @@ export REALITY_ENGINE_PORT PERCEPTION_ENGINE_PORT VECTOR_DIMENSION MACHINES_DIR
 export LOCAL_AI_API_URL LOCAL_AI_MACHINES_DIR QDRANT_URL
 export MQTT_BROKER_HOST MQTT_BROKER_PORT MQTT_CLIENT_ID MQTT_MAPPINGS_FILE
 
-sbcl --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
+sbcl --dynamic-space-size 2048 --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
   --eval "(pushnew (truename \".\") ql:*local-project-directories*)" \
   --eval "(handler-case (ql:register-local-projects) (error (c) (format t \"~&Warning: register-local-projects: ~a~%\" c)))" \
   --eval "(ql:quickload :reality-engine-lsp :force t)" \
@@ -76,7 +76,7 @@ sbcl --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
   --eval "(loop (sleep 3600))" > "logs/reality-engine${_INST}.log" 2>&1 &
 echo "$!" > "run/reality-engine${_INST}.pid"
 
-sbcl --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
+sbcl --dynamic-space-size 2048 --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
   --eval "(pushnew (truename \".\") ql:*local-project-directories*)" \
   --eval "(handler-case (ql:register-local-projects) (error (c) (format t \"~&Warning: register-local-projects: ~a~%\" c)))" \
   --eval "(ql:quickload :reality-engine-lsp :force t)" \
