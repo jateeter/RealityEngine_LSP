@@ -8,7 +8,7 @@
 (defstruct sse-client
   (queue nil)
   (lock (bt:make-lock "sse-c-lock"))
-  (cvar (bt:make-condition-variable "sse-c-cvar")))
+  (cvar (bt:make-condition-variable :name "sse-c-cvar")))
 
 (defvar *sse-clients* nil)
 (defvar *sse-lock* (bt:make-lock "sse-registry"))
@@ -246,7 +246,7 @@ every 15 s so proxies do not close idle connections."
   stream
   (queue nil)
   (lock (bt:make-lock "ws-c-lock"))
-  (cvar (bt:make-condition-variable "ws-c-cvar")))
+  (cvar (bt:make-condition-variable :name "ws-c-cvar")))
 
 (defvar *ws-clients* nil)
 (defvar *ws-lock* (bt:make-lock "ws-registry"))
