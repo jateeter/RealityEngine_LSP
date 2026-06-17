@@ -84,6 +84,13 @@
 (defun machine-sequence-list (machine)
   (object-values-sorted (machine-sequences machine)))
 
+(defun machine-summary-json (machine)
+  "Minimal projection used by the PE catalog refresher — id, name, metadata only.
+Omits sequences, vectors, and perceptualMapping to keep the response small."
+  (obj "id"       (machine-id machine)
+       "name"     (machine-name machine)
+       "metadata" (or (machine-metadata machine) (obj))))
+
 (defun machine-json (machine &key full)
   (let* ((sequences (machine-sequence-list machine))
          (sequence-ids (mapcar #'sequence-id sequences))

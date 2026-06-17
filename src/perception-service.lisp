@@ -570,7 +570,7 @@ Wire-compatible with _AI Dispatcher.replay() — same mode:\"replay\" + replayOf
 Intended to be called from the background refresher thread only — never
 from the actor thread.  Soft-fails: existing catalog is preserved on error."
   (handler-case
-      (let* ((response (http-get-json (format nil "~a/api/machines"
+      (let* ((response (http-get-json (format nil "~a/api/machines?summary=true"
                                               (perception-state-reality-url state))))
              (machines (jarray-list (or (jget response "machines") (arr))))
              (new-catalog (make-hash-table :test #'equal)))

@@ -1060,13 +1060,18 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                                                                (record-history state (obj "type" "engine-process" "result" result))
                                                                (obj "result" result))))))))
    (make-route "GET" "/api/machines" (lambda (_ body query)
-                                      (declare (ignore _ body query))
-                                      (json-response
-                                       (actor-ask actor
-                                                  (lambda (state)
-                                                    (obj "machines" (vectorize
-                                                                     (mapcar #'machine-json
-                                                                             (object-values (reality-state-machines state))))))))))
+                                      (declare (ignore _ body))
+                                      (let ((summary-p (and (hash-table-p* query)
+                                                            (member (gethash "summary" query)
+                                                                    '("true" "1") :test #'string=))))
+                                        (json-response
+                                         (actor-ask actor
+                                                    (lambda (state)
+                                                      (obj "machines" (vectorize
+                                                                       (mapcar (if summary-p
+                                                                                   #'machine-summary-json
+                                                                                   #'machine-json)
+                                                                               (object-values (reality-state-machines state)))))))))))
    (make-route "GET" "/api/machines/:id" (lambda (params body query)
                                           (declare (ignore body query))
                                           (let ((machine (actor-ask actor (lambda (state) (gethash (gethash "id" params) (reality-state-machines state)))))))
@@ -1447,11 +1452,16 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                                               (declare (ignore _ body query))
                                               (state-json (lambda (state) (obj "activeVectors" (active-vectors-json state))))))
      (make-route "GET" "/api/machines" (lambda (_ body query)
-                                         (declare (ignore _ body query))
-                                         (state-json (lambda (state)
-                                                       (obj "machines" (vectorize
-                                                                        (mapcar #'machine-json
-                                                                                (object-values-sorted (reality-state-machines state)))))))))
+                                         (declare (ignore _ body))
+                                         (let ((summary-p (and (hash-table-p* query)
+                                                               (member (gethash "summary" query)
+                                                                       '("true" "1") :test #'string=))))
+                                           (state-json (lambda (state)
+                                                         (obj "machines" (vectorize
+                                                                          (mapcar (if summary-p
+                                                                                      #'machine-summary-json
+                                                                                      #'machine-json)
+                                                                                  (object-values-sorted (reality-state-machines state))))))))))
      (make-route "GET" "/api/machines/:id" (lambda (params body query)
                                              (declare (ignore body query))
                                              (let ((machine (actor-ask actor (lambda (state)
