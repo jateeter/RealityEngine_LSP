@@ -1384,6 +1384,30 @@ Callers accumulate results into resolved/unmapped lists."
       (error (condition)
         (obj "success" +json-false+ "error" (princ-to-string condition) "timestamp" (now-ms))))))
 
+;; Bundled yuma-agriculture demo mapping registry for GET /api/mqtt/example.
+;; Mirrors RealityEngine_CPP/config/mqtt-mappings.yuma-agriculture.json.
+;; Band normalization emits 1.0 (in nominal range) or 0.0 (out of range),
+;; producing the 4-bit status patterns the AGX001/005/026/032 machines expect.
+(defparameter +mqtt-example-mappings+
+  (parse-json "{\"version\":\"1.0\",\"defaults\":{\"ttlMs\":60000,\"qos\":0,\"acceptRetained\":true,\"pushMode\":\"debounced\",\"debounceMs\":500},\"mappings\":[
+    {\"id\":\"agx001-ph-ok\",        \"topicFilter\":\"LATERAL/WaterSuite/DEV0000001/SensorReadings/v1\",     \"sensorIdTemplate\":\"agx001.water.ph.ok\",        \"region\":{\"offset\":40, \"length\":1},\"extract\":{\"type\":\"json\",\"pointer\":\"/data/wpH\"},        \"normalize\":{\"mode\":\"band\",\"min\":6.5,  \"max\":8.5}},
+    {\"id\":\"agx001-ec-ok\",        \"topicFilter\":\"LATERAL/WaterSuite/DEV0000001/SensorReadings/v1\",     \"sensorIdTemplate\":\"agx001.water.ec.ok\",        \"region\":{\"offset\":41, \"length\":1},\"extract\":{\"type\":\"json\",\"pointer\":\"/data/wEC\"},         \"normalize\":{\"mode\":\"band\",\"min\":0.5,  \"max\":3.0}},
+    {\"id\":\"agx001-orp-ok\",       \"topicFilter\":\"LATERAL/WaterSuite/DEV0000001/SensorReadings/v1\",     \"sensorIdTemplate\":\"agx001.water.orp.ok\",       \"region\":{\"offset\":42, \"length\":1},\"extract\":{\"type\":\"json\",\"pointer\":\"/data/wORP\"},        \"normalize\":{\"mode\":\"band\",\"min\":200,  \"max\":600}},
+    {\"id\":\"agx001-turbidity-ok\", \"topicFilter\":\"LATERAL/WaterSuite/DEV0000001/SensorReadings/v1\",     \"sensorIdTemplate\":\"agx001.water.turbidity.ok\", \"region\":{\"offset\":43, \"length\":1},\"extract\":{\"type\":\"json\",\"pointer\":\"/data/wTurbidity\"}, \"normalize\":{\"mode\":\"band\",\"min\":0,    \"max\":100}},
+    {\"id\":\"agx005-do-ok\",        \"topicFilter\":\"LATERAL/DOSuite/DEV0000017/SensorReadings/v1\",        \"sensorIdTemplate\":\"agx005.do.level.ok\",        \"region\":{\"offset\":84, \"length\":1},\"extract\":{\"type\":\"json\",\"pointer\":\"/data/wDO\"},         \"normalize\":{\"mode\":\"band\",\"min\":5,    \"max\":25}},
+    {\"id\":\"agx005-do-temp-ok\",   \"topicFilter\":\"LATERAL/DOSuite/DEV0000017/SensorReadings/v1\",        \"sensorIdTemplate\":\"agx005.do.temp.ok\",         \"region\":{\"offset\":85, \"length\":1},\"extract\":{\"type\":\"json\",\"pointer\":\"/data/wDOTemp\"},     \"normalize\":{\"mode\":\"band\",\"min\":60,   \"max\":85}},
+    {\"id\":\"agx005-do-watch\",     \"topicFilter\":\"LATERAL/DOSuite/DEV0000017/SensorReadings/v1\",        \"sensorIdTemplate\":\"agx005.do.watch\",           \"region\":{\"offset\":86, \"length\":1},\"extract\":{\"type\":\"json\",\"pointer\":\"/data/wDO\"},         \"normalize\":{\"mode\":\"band\",\"min\":3,    \"max\":5}},
+    {\"id\":\"agx005-temp-watch\",   \"topicFilter\":\"LATERAL/DOSuite/DEV0000017/SensorReadings/v1\",        \"sensorIdTemplate\":\"agx005.do.temp.watch\",      \"region\":{\"offset\":87, \"length\":1},\"extract\":{\"type\":\"json\",\"pointer\":\"/data/wDOTemp\"},     \"normalize\":{\"mode\":\"band\",\"min\":85,   \"max\":95}},
+    {\"id\":\"agx026-temp-ok\",      \"topicFilter\":\"LATERAL/AmbientSuite/DEV0000009/SensorReadings/v1\",   \"sensorIdTemplate\":\"agx026.temp.ok\",            \"region\":{\"offset\":184,\"length\":1},\"extract\":{\"type\":\"json\",\"pointer\":\"/data/aTemp\"},       \"normalize\":{\"mode\":\"band\",\"min\":65,   \"max\":85}},
+    {\"id\":\"agx026-humidity-ok\",  \"topicFilter\":\"LATERAL/AmbientSuite/DEV0000009/SensorReadings/v1\",   \"sensorIdTemplate\":\"agx026.humidity.ok\",        \"region\":{\"offset\":185,\"length\":1},\"extract\":{\"type\":\"json\",\"pointer\":\"/data/aHum\"},        \"normalize\":{\"mode\":\"band\",\"min\":40,   \"max\":70}},
+    {\"id\":\"agx026-temp-watch\",   \"topicFilter\":\"LATERAL/AmbientSuite/DEV0000009/SensorReadings/v1\",   \"sensorIdTemplate\":\"agx026.temp.watch\",         \"region\":{\"offset\":186,\"length\":1},\"extract\":{\"type\":\"json\",\"pointer\":\"/data/aTemp\"},       \"normalize\":{\"mode\":\"band\",\"min\":85,   \"max\":95}},
+    {\"id\":\"agx026-humidity-watch\",\"topicFilter\":\"LATERAL/AmbientSuite/DEV0000009/SensorReadings/v1\",  \"sensorIdTemplate\":\"agx026.humidity.watch\",     \"region\":{\"offset\":187,\"length\":1},\"extract\":{\"type\":\"json\",\"pointer\":\"/data/aHum\"},        \"normalize\":{\"mode\":\"band\",\"min\":20,   \"max\":40}},
+    {\"id\":\"agx032-co2-ok\",       \"topicFilter\":\"LATERAL/AmbientSuite/DEV0000009/SensorReadings/v1\",   \"sensorIdTemplate\":\"agx032.co2.ok\",             \"region\":{\"offset\":228,\"length\":1},\"extract\":{\"type\":\"json\",\"pointer\":\"/data/aCO2\"},        \"normalize\":{\"mode\":\"band\",\"min\":600,  \"max\":1500}},
+    {\"id\":\"agx032-co2-watch\",    \"topicFilter\":\"LATERAL/AmbientSuite/DEV0000009/SensorReadings/v1\",   \"sensorIdTemplate\":\"agx032.co2.watch\",          \"region\":{\"offset\":229,\"length\":1},\"extract\":{\"type\":\"json\",\"pointer\":\"/data/aCO2\"},        \"normalize\":{\"mode\":\"band\",\"min\":1500, \"max\":3000}},
+    {\"id\":\"agx032-co2-danger\",   \"topicFilter\":\"LATERAL/AmbientSuite/DEV0000009/SensorReadings/v1\",   \"sensorIdTemplate\":\"agx032.co2.danger\",         \"region\":{\"offset\":230,\"length\":1},\"extract\":{\"type\":\"json\",\"pointer\":\"/data/aCO2\"},        \"normalize\":{\"mode\":\"band\",\"min\":3000, \"max\":5000}},
+    {\"id\":\"agx032-temp-ok\",      \"topicFilter\":\"LATERAL/AmbientSuite/DEV0000009/SensorReadings/v1\",   \"sensorIdTemplate\":\"agx032.temp.ok\",            \"region\":{\"offset\":231,\"length\":1},\"extract\":{\"type\":\"json\",\"pointer\":\"/data/aTemp\"},       \"normalize\":{\"mode\":\"band\",\"min\":65,   \"max\":85}}
+  ]}"))
+
 (defun perception-routes (actor)
   (list
    (make-route "GET" "/" (lambda (_ body query)
@@ -1619,9 +1643,9 @@ Callers accumulate results into resolved/unmapped lists."
                                           (json-response (http-get-json (format nil "~a/api/machines"
                                                                                 (actor-ask actor #'perception-state-reality-url))))
                                         (error (condition) (error-response (princ-to-string condition) 502)))))
-   ;; MQTT bridge — same surface as AI / CPP.  Returns enabled=false when
-   ;; MQTT_BROKER_HOST was not set at PE startup; otherwise reports
-   ;; connection state + bridge-level counters + the broker config.
+   ;; MQTT bridge — same surface as AI / CPP / Scala.  Returns enabled=false when
+   ;; MQTT_BROKER_HOST/MQTT_BROKER_URL was not set at PE startup; otherwise
+   ;; reports connection state + bridge-level counters + the broker config.
    (make-route "GET" "/api/mqtt/status"
                (lambda (_ body query)
                  (declare (ignore _ body query))
@@ -1694,7 +1718,16 @@ Callers accumulate results into resolved/unmapped lists."
                                   (setf (perception-state-mqtt-bridge state) nil)
                                   (format *standard-output*
                                           "[MQTT] bridge disabled via API~%")))))
-                 (json-response (obj "success" (json-bool t) "enabled" (json-bool nil)))))))
+                 (json-response (obj "success" (json-bool t) "enabled" (json-bool nil)))))
+
+   ;; GET /api/mqtt/example — bundled yuma-agriculture demo registry.
+   ;; Mirrors RealityEngine_CPP/config/mqtt-mappings.yuma-agriculture.json.
+   ;; Uses band normalization so cells emit 1.0/0.0, matching the 4-bit
+   ;; status pattern the agriculture machines (AGX001/005/026/032) expect.
+   (make-route "GET" "/api/mqtt/example"
+               (lambda (_ body query)
+                 (declare (ignore _ body query))
+                 (json-response +mqtt-example-mappings+)))))
 
 ;; ── MQTT ingest path ────────────────────────────────────────────────────────
 ;;
