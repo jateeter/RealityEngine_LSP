@@ -26,6 +26,9 @@ MQTT_BROKER_HOST="${MQTT_BROKER_HOST:-}"
 MQTT_BROKER_PORT="${MQTT_BROKER_PORT:-1883}"
 MQTT_CLIENT_ID="${MQTT_CLIENT_ID:-reality-engine-pe-lsp}"
 MQTT_MAPPINGS_FILE="${MQTT_MAPPINGS_FILE:-}"
+# PE integration registry — HealthKit / CareKit ingest routing.
+# localAIStack personal-health domain: ../localAIStack/config/pe-integrations.json
+INTEGRATIONS_CONFIG="${INTEGRATIONS_CONFIG:-}"
 # INSTANCE_ID — when set, PID files are suffixed so multiple LSP instances
 # can run from the same repo directory simultaneously.
 INSTANCE_ID="${INSTANCE_ID:-}"
@@ -67,10 +70,16 @@ fi
 export REALITY_ENGINE_PORT PERCEPTION_ENGINE_PORT VECTOR_DIMENSION MACHINES_DIR
 export LOCAL_AI_API_URL LOCAL_AI_MACHINES_DIR QDRANT_URL
 export MQTT_BROKER_HOST MQTT_BROKER_PORT MQTT_CLIENT_ID MQTT_MAPPINGS_FILE
+export INTEGRATIONS_CONFIG
 
 sbcl --dynamic-space-size 2048 --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
   --eval "(pushnew (truename \".\") ql:*local-project-directories*)" \
   --eval "(handler-case (ql:register-local-projects) (error (c) (format t \"~&Warning: register-local-projects: ~a~%\" c)))" \
+  --eval "(ql:quickload :reality-engine-lsp :force t)" \
+  --quit > "logs/quicklisp-bootstrap${_INST}.log" 2>&1
+
+sbcl --dynamic-space-size 2048 --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
+  --eval "(pushnew (truename \".\") ql:*local-project-directories*)" \
   --eval "(ql:quickload :reality-engine-lsp :force t)" \
   --eval "(reality-engine-lsp:start-reality-from-environment)" \
   --eval "(loop (sleep 3600))" > "logs/reality-engine${_INST}.log" 2>&1 &
@@ -78,7 +87,6 @@ echo "$!" > "run/reality-engine${_INST}.pid"
 
 sbcl --dynamic-space-size 2048 --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
   --eval "(pushnew (truename \".\") ql:*local-project-directories*)" \
-  --eval "(handler-case (ql:register-local-projects) (error (c) (format t \"~&Warning: register-local-projects: ~a~%\" c)))" \
   --eval "(ql:quickload :reality-engine-lsp :force t)" \
   --eval "(reality-engine-lsp:start-perception-from-environment)" \
   --eval "(loop (sleep 3600))" > "logs/perception-engine${_INST}.log" 2>&1 &
@@ -93,3 +101,5 @@ echo "Qdrant                 : ${QDRANT_URL}"
   echo "MQTT broker (mapping)  : ${MQTT_BROKER_HOST}:${MQTT_BROKER_PORT}"
 [ -n "$MQTT_MAPPINGS_FILE" ] && \
   echo "MQTT mappings          : ${MQTT_MAPPINGS_FILE}"
+[ -n "$INTEGRATIONS_CONFIG" ] && \
+  echo "Integrations config    : ${INTEGRATIONS_CONFIG}"
