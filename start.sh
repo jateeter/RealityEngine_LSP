@@ -26,6 +26,7 @@ MQTT_BROKER_HOST="${MQTT_BROKER_HOST:-}"
 MQTT_BROKER_PORT="${MQTT_BROKER_PORT:-1883}"
 MQTT_CLIENT_ID="${MQTT_CLIENT_ID:-reality-engine-pe-lsp}"
 MQTT_MAPPINGS_FILE="${MQTT_MAPPINGS_FILE:-}"
+# PE integration registry — CI-generated config (health + ACP/OpenClaw).
 _DEFAULT_INTEGRATIONS_CONFIG="../RealityEngine_CI/config/integrations.json"
 if [ -z "${INTEGRATIONS_CONFIG:-}" ] && [ -f "$_DEFAULT_INTEGRATIONS_CONFIG" ]; then
   INTEGRATIONS_CONFIG="$_DEFAULT_INTEGRATIONS_CONFIG"
@@ -90,13 +91,17 @@ sbcl --dynamic-space-size 2048 --noinform --disable-debugger --load "$QUICKLISP_
   --eval "(pushnew (truename \".\") ql:*local-project-directories*)" \
   --eval "(handler-case (ql:register-local-projects) (error (c) (format t \"~&Warning: register-local-projects: ~a~%\" c)))" \
   --eval "(ql:quickload :reality-engine-lsp :force t)" \
+  --quit > "logs/quicklisp-bootstrap${_INST}.log" 2>&1
+
+sbcl --dynamic-space-size 2048 --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
+  --eval "(pushnew (truename \".\") ql:*local-project-directories*)" \
+  --eval "(ql:quickload :reality-engine-lsp :force t)" \
   --eval "(reality-engine-lsp:start-reality-from-environment)" \
   --eval "(loop (sleep 3600))" > "logs/reality-engine${_INST}.log" 2>&1 &
 echo "$!" > "run/reality-engine${_INST}.pid"
 
 sbcl --dynamic-space-size 2048 --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
   --eval "(pushnew (truename \".\") ql:*local-project-directories*)" \
-  --eval "(handler-case (ql:register-local-projects) (error (c) (format t \"~&Warning: register-local-projects: ~a~%\" c)))" \
   --eval "(ql:quickload :reality-engine-lsp :force t)" \
   --eval "(reality-engine-lsp:start-perception-from-environment)" \
   --eval "(loop (sleep 3600))" > "logs/perception-engine${_INST}.log" 2>&1 &

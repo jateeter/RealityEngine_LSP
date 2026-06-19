@@ -1249,9 +1249,9 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
 
      ;; Yuma cascade — 3-tick AGX051 escalation, AGX055 fires AQUA_URGENT, [3959]=1.
      (let* ((state (cascade-state))
-            (agx051-id (reality-engine-lsp::machine-id (gethash "machine-AGX051_yuma-aqua-maintenance-forecaster"      (reality-engine-lsp::reality-state-machines state))))
-            (agx055-id (reality-engine-lsp::machine-id (gethash "machine-AGX055_yuma-facility-ai-synthesis-bridge"     (reality-engine-lsp::reality-state-machines state))))
-            (yield-id  (reality-engine-lsp::machine-id (gethash "machine-AgYieldOptimizationAI"                        (reality-engine-lsp::reality-state-machines state))))
+            (agx051-id (reality-engine-lsp::machine-id (gethash "machine-agx051-yuma-aqua-maintenance-forecaster"      (reality-engine-lsp::reality-state-machines state))))
+            (agx055-id (reality-engine-lsp::machine-id (gethash "machine-agx055-yuma-facility-ai-synthesis-bridge"     (reality-engine-lsp::reality-state-machines state))))
+            (yield-id  (reality-engine-lsp::machine-id (gethash "machine-agyieldoptimizationai"                        (reality-engine-lsp::reality-state-machines state))))
             (m051-final nil))
        ;; Stage 1 — 3 ticks of escalation
        (dolist (tick +tier1-urgent-ticks+)
@@ -1304,7 +1304,7 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
 
      ;; Stable path — all-NORMAL inputs → AGX055 FACILITY_STABLE / GREEN
      (let* ((state (cascade-state))
-            (agx055-id (reality-engine-lsp::machine-id (gethash "machine-AGX055_yuma-facility-ai-synthesis-bridge" (reality-engine-lsp::reality-state-machines state))))
+            (agx055-id (reality-engine-lsp::machine-id (gethash "machine-agx055-yuma-facility-ai-synthesis-bridge" (reality-engine-lsp::reality-state-machines state))))
             (input (let ((v (make-list (reality-engine-lsp::reality-state-dimension state) :initial-element 0.0d0)))
                      (loop for x in +tier1-normal-input+ for i from 40  do (setf (nth i v) x))
                      (loop for x in +tier1-normal-input+ for i from 84  do (setf (nth i v) x))
