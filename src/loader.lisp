@@ -2,6 +2,11 @@
 
 (defparameter +sta-default-threshold+ 0.5d0)
 
+(defun canonical-machine-id-fragment (name)
+  (with-output-to-string (out)
+    (loop for ch across (string-downcase name)
+          do (write-char (if (alphanumericp ch) ch #\-) out))))
+
 (defun sta-element-state (element)
   (let ((threshold (or (jnumber element "threshold" nil) +sta-default-threshold+))
         (value (or (jnumber element "value" 0.0d0) 0.0d0)))
@@ -203,16 +208,19 @@
   (when strict-sta
     (assert-sta-for-life-safety json))
   (let* ((root (if (jobject-p (jget json "machine")) (jget json "machine") json))
+         (metadata (or (jget root "metadata") (obj)))
          (sequences (make-hash-table :test #'equal))
          (machine (make-machine
                    :id (or forced-id (jstring root "id" nil) (make-id "machine"))
                    :name (or (jstring root "name" nil) "unnamed")
                    :description (or (jstring root "description" nil) "")
-                   :metadata (or (jget root "metadata") (obj))
+                   :metadata metadata
                    :mapping (parse-mapping (jget root "perceptualMapping"))
                    :match-algorithm (comparator-name (jstring root "matchAlgorithm" "gte"))
                    :arbiter-rule (arbiter-name (jstring root "arbiterRule" "passthrough"))
                    :sequences nil)))
+    (when (jarray-p (jget root "inputSequences"))
+      (setf (jget metadata "inputSequences") (jget root "inputSequences")))
     (dolist (sequence-json (jarray-list (or (jget root "sequences") (arr))))
       (let ((sequence (parse-sequence sequence-json)))
         (setf (gethash (sequence-id sequence) sequences) sequence)))
@@ -229,7 +237,7 @@
       (unless (eql major 1)
         (error "~a: incompatible machine JSON version: ~a (current: 1.0.0)"
                (file-namestring path) ver)))
-    (machine-from-json json (format nil "machine-~a" (pathname-name path)))))
+    (machine-from-json json (format nil "machine-~a" (canonical-machine-id-fragment (pathname-name path))))))
 
 (defun load-machines-from-directory (directory)
   (let ((dir (uiop:ensure-directory-pathname directory))

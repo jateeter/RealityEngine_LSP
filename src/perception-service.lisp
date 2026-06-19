@@ -249,10 +249,18 @@ Per-sequence boundaries live in metadata.segments for UI display."
                          (incf created))
                        (incf skipped))))))))))
     (obj "created" created
-         "skipped" skipped
-         "machinesSeen" machines-seen
          "errors" (vectorize (mapcar #'identity errors))
-         "vectorSize" (perception-engine-dimension engine))))
+         "machinesSeen" machines-seen
+         "skipped" skipped
+         "success" (json-bool t))))
+
+(defun canonical-bootstrap-summary-json (summary)
+  (format nil "{\"created\":~d,\"errors\":~a,\"machinesSeen\":~d,\"skipped\":~d,\"success\":~a}"
+          (truncate (or (jnumber summary "created" 0) 0))
+          (json-stringify (or (jget summary "errors" nil) (arr)))
+          (truncate (or (jnumber summary "machinesSeen" 0) 0))
+          (truncate (or (jnumber summary "skipped" 0) 0))
+          (if (jbool summary "success" nil) "true" "false")))
 
 (defun localai-status-json (state)
   (let ((sensors nil))
@@ -1415,7 +1423,7 @@ Callers accumulate results into resolved/unmapped lists."
                            (json-response (obj "service" "Perception Engine (LSP)" "status" "running"))))
    (make-route "GET" "/api/health" (lambda (_ body query)
                                      (declare (ignore _ body query))
-                                     (json-response (obj "status" "healthy" "timestamp" (now-ms)))))
+                                     (json-response (obj "status" "healthy"))))
    (make-route "GET" "/api/state" (lambda (_ body query)
                                     (declare (ignore _ body query))
                                     (json-response (actor-ask actor (lambda (state)
@@ -1610,8 +1618,11 @@ Callers accumulate results into resolved/unmapped lists."
                                              (if result (json-response (obj "source" result)) (error-response "Source not found" 404)))))
    (make-route "POST" "/api/sources/bootstrap-from-machines" (lambda (_ body query)
                                                               (declare (ignore _ body query))
-                                                              (json-response
-                                                               (actor-ask actor #'bootstrap-test-sources-from-machines))))
+                                                              (text-response
+                                                               (canonical-bootstrap-summary-json
+                                                                (actor-ask actor #'bootstrap-test-sources-from-machines))
+                                                               200
+                                                               "application/json; charset=utf-8")))
    (make-route "DELETE" "/api/sources/:id" (lambda (params body query)
                                             (declare (ignore body query))
                                             (json-response
