@@ -5,15 +5,25 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
 if [ -f .env ]; then
-  set -a
-  # shellcheck disable=SC1091
-  source .env
-  set +a
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|\#*) continue ;;
+    esac
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      ''|*[!A-Za-z0-9_]*) continue ;;
+    esac
+    if [ -z "${!key+x}" ]; then
+      export "$key=$value"
+    fi
+  done < .env
 fi
 
 REALITY_ENGINE_PORT="${REALITY_ENGINE_PORT:-5601}"
 PERCEPTION_ENGINE_PORT="${PERCEPTION_ENGINE_PORT:-5600}"
 VECTOR_DIMENSION="${VECTOR_DIMENSION:-7680}"
+SBCL_DYNAMIC_SPACE_SIZE="${SBCL_DYNAMIC_SPACE_SIZE:-4096}"
 MACHINES_DIR="${MACHINES_DIR:-../RealityEngine_Machines/machines}"
 RE_LOAD_MACHINES="${RE_LOAD_MACHINES:-1}"
 LOCAL_AI_API_URL="${LOCAL_AI_API_URL:-http://localhost:4000}"
@@ -87,20 +97,20 @@ export INTEGRATIONS_CONFIG
 export ACP_ENABLED ACP_PLATFORM ACP_SURFACE ACP_GATEWAY_URL OPENCLAW_GATEWAY_URL
 export ACP_SESSION_KEY OPENCLAW_ACP_SESSION ACP_TARGET_AGENT ACP_COMPLETION_SOURCE_MAPPING_ID
 
-sbcl --dynamic-space-size 2048 --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
+sbcl --dynamic-space-size "$SBCL_DYNAMIC_SPACE_SIZE" --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
   --eval "(pushnew (truename \".\") ql:*local-project-directories*)" \
   --eval "(handler-case (ql:register-local-projects) (error (c) (format t \"~&Warning: register-local-projects: ~a~%\" c)))" \
   --eval "(ql:quickload :reality-engine-lsp :force t)" \
   --quit > "logs/quicklisp-bootstrap${_INST}.log" 2>&1
 
-sbcl --dynamic-space-size 2048 --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
+sbcl --dynamic-space-size "$SBCL_DYNAMIC_SPACE_SIZE" --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
   --eval "(pushnew (truename \".\") ql:*local-project-directories*)" \
   --eval "(ql:quickload :reality-engine-lsp :force t)" \
   --eval "(reality-engine-lsp:start-reality-from-environment)" \
   --eval "(loop (sleep 3600))" > "logs/reality-engine${_INST}.log" 2>&1 &
 echo "$!" > "run/reality-engine${_INST}.pid"
 
-sbcl --dynamic-space-size 2048 --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
+sbcl --dynamic-space-size "$SBCL_DYNAMIC_SPACE_SIZE" --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
   --eval "(pushnew (truename \".\") ql:*local-project-directories*)" \
   --eval "(ql:quickload :reality-engine-lsp :force t)" \
   --eval "(reality-engine-lsp:start-perception-from-environment)" \
@@ -111,6 +121,7 @@ echo "Reality Engine LSP     : http://localhost:${REALITY_ENGINE_PORT}${INSTANCE
 echo "Perception Engine LSP  : http://localhost:${PERCEPTION_ENGINE_PORT}${INSTANCE_ID:+ [instance: $INSTANCE_ID]}"
 echo "Machines               : ${MACHINES_DIR}"
 echo "Vector dimension       : ${VECTOR_DIMENSION}"
+echo "SBCL dynamic space     : ${SBCL_DYNAMIC_SPACE_SIZE} MB"
 echo "Qdrant                 : ${QDRANT_URL}"
 [ -n "$MQTT_BROKER_HOST" ] && \
   echo "MQTT broker (mapping)  : ${MQTT_BROKER_HOST}:${MQTT_BROKER_PORT}"
