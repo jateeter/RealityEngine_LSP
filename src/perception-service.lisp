@@ -1828,8 +1828,10 @@ Port defaults to 1883 when absent or unparseable."
   "POST /api/mqtt/enable handler — parse brokerUrl + mappings, build and
 start a new MQTT bridge.  Returns a JSON object on success or an error
 string when input is invalid."
-  (let* ((broker-url (jget body "brokerUrl"))
-         (mappings-val (jget body "mappings")))
+  (let* ((broker-url   (jget body "brokerUrl"))
+         (mappings-val (jget body "mappings"))
+         (body-username (let ((v (jget body "username"))) (when (and v (string/= v "")) v)))
+         (body-password (let ((v (jget body "password"))) (when (and v (string/= v "")) v))))
     (when (or (null broker-url) (string= broker-url ""))
       (return-from mqtt-enable-bridge "brokerUrl is required"))
     (multiple-value-bind (broker-host broker-port)
@@ -1854,7 +1856,9 @@ string when input is invalid."
                (cfg (make-mqtt-client-config
                      :broker-host broker-host
                      :broker-port broker-port
-                     :client-id (or existing-client-id "reality-engine-pe-lsp")))
+                     :client-id   (or existing-client-id "reality-engine-pe-lsp")
+                     :username    body-username
+                     :password    body-password))
                (ingest (lambda (sensor-id offset length values ttl-ms topic mapping-id)
                          (actor-tell actor
                                      (lambda (st)
