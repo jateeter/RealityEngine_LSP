@@ -239,11 +239,22 @@
                (file-namestring path) ver)))
     (machine-from-json json (format nil "machine-~a" (canonical-machine-id-fragment (pathname-name path))))))
 
+(defun collect-json-files-recursive (dir)
+  "Return all .json files under DIR sorted lexicographically."
+  (let ((result '()))
+    (labels ((walk (d)
+               (dolist (f (uiop:directory-files d "*.json"))
+                 (push f result))
+               (dolist (sub (uiop:subdirectories d))
+                 (walk sub))))
+      (walk (uiop:ensure-directory-pathname dir)))
+    (sort result #'string< :key #'namestring)))
+
 (defun load-machines-from-directory (directory)
   (let ((dir (uiop:ensure-directory-pathname directory))
         (machines nil))
     (when (uiop:directory-exists-p dir)
-      (dolist (path (sort (uiop:directory-files dir "*.json") #'string< :key #'namestring))
+      (dolist (path (collect-json-files-recursive dir))
         (handler-case
             (push (load-machine-from-file path) machines)
           (error (condition)
