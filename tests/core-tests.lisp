@@ -734,6 +734,13 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                            (reality-engine-lsp::reality-routes nil)))))
     (assert-true (find "/api/runtime/storage-footprint" patterns :test #'string=)
                  "Reality routes should expose storage footprint resolver"))
+  (let ((patterns (mapcar #'reality-engine-lsp::route-pattern
+                          (reality-engine-lsp::flatten-routes
+                           (reality-engine-lsp::reality-routes nil)))))
+    (dolist (pattern '("/api/buses/semantic"
+                       "/api/buses/semantic/:id"))
+      (assert-true (find pattern patterns :test #'string=)
+                   (format nil "Reality routes should expose ~a" pattern))))
 
   ;; /api/metrics Prometheus text-format emission — verifies cross-runtime
   ;; parity with AI/CPP.  Every metric line must carry runtime="lsp" and the

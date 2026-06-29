@@ -877,6 +877,34 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
        "state" (if (reality-vector-active-p vector) "active" "inactive")
        "wasJustMatched" (json-bool (reality-vector-just-matched-p vector))))
 
+(defun semantic-bus-registry-path (machine-dir)
+  (let ((explicit (env "SEMANTIC_BUS_REGISTRY" nil)))
+    (when (and explicit (> (length explicit) 0))
+      (return-from semantic-bus-registry-path explicit)))
+  (let ((cursor (uiop:ensure-directory-pathname machine-dir)))
+    (loop repeat 6
+          while cursor
+          for candidate = (merge-pathnames "domains/semantic-bus-registry.json" cursor)
+          when (probe-file candidate)
+            do (return (namestring candidate))
+          do (let ((parent (uiop:pathname-parent-directory-pathname cursor)))
+               (setf cursor (and parent (not (equal parent cursor)) parent)))
+          finally (return (namestring (merge-pathnames "../domains/semantic-bus-registry.json"
+                                                        (uiop:ensure-directory-pathname machine-dir)))))))
+
+(defun semantic-bus-registry-json (state)
+  (let* ((path (semantic-bus-registry-path (reality-state-machine-dir state)))
+         (registry (parse-json (safe-read-file path))))
+    (unless (jarray-p (jget registry "semanticBuses"))
+      (error "invalid registry shape at ~a" path))
+    registry))
+
+(defun find-semantic-bus-json (registry id)
+  (find id
+        (jarray-list (jget registry "semanticBuses"))
+        :test #'string=
+        :key (lambda (bus) (jstring bus "id" ""))))
+
 (defun machine-graph-json (state)
   (let (nodes edges)
     (maphash
@@ -1496,6 +1524,22 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                                                                                       #'machine-summary-json
                                                                                       #'machine-json)
                                                                                   (object-values-sorted (reality-state-machines state))))))))))
+     (make-route "GET" "/api/buses/semantic" (lambda (_ body query)
+                                                     (declare (ignore _ body query))
+                                                     (handler-case
+                                                         (state-json #'semantic-bus-registry-json)
+                                                       (error (e)
+                                                         (error-response (format nil "semantic bus registry unavailable: ~a" e) 404)))))
+     (make-route "GET" "/api/buses/semantic/:id" (lambda (params body query)
+                                                         (declare (ignore body query))
+                                                         (handler-case
+                                                             (let* ((registry (actor-ask actor #'semantic-bus-registry-json))
+                                                                    (bus (find-semantic-bus-json registry (gethash "id" params))))
+                                                               (if bus
+                                                                   (json-response (obj "bus" bus))
+                                                                   (error-response "Semantic bus not found" 404)))
+                                                           (error (e)
+                                                             (error-response (format nil "semantic bus registry unavailable: ~a" e) 404)))))
      (make-route "GET" "/api/machines/:id" (lambda (params body query)
                                              (declare (ignore body query))
                                              (let ((machine (actor-ask actor (lambda (state)
