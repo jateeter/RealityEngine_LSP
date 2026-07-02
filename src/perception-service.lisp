@@ -138,7 +138,8 @@
                                         :sensor-id sensor-id
                                         :last-value nil
                                         :last-updated 0
-                                        :ttl-ms ttl-ms))))
+                                        :ttl-ms ttl-ms
+                                        :origin "localai"))))
               (push (source-json source) registered)))))
     (dolist (filename (localai-machine-files))
       (let ((path (merge-pathnames filename (uiop:ensure-directory-pathname (perception-state-localai-machine-dir state)))))
@@ -435,7 +436,7 @@ Per-sequence boundaries live in metadata.segments for UI display."
                                         (source-id-part (cdr binding)))))
     out))
 
-(defun commit-signal-source (state sensor-id name region values ttl-ms)
+(defun commit-signal-source (state sensor-id name region values ttl-ms &optional origin)
   (let* ((engine (perception-state-engine state))
          (source (sensor-exists-p engine sensor-id)))
     (unless source
@@ -449,7 +450,9 @@ Per-sequence boundaries live in metadata.segments for UI display."
                                  :sensor-id sensor-id
                                  :last-value nil
                                  :last-updated 0
-                                 :ttl-ms ttl-ms))))
+                                 :ttl-ms ttl-ms
+                                 :origin origin))))
+    (when origin (setf (source-origin source) origin))
     (setf (source-name source) name
           (source-region source) region
           (source-ttl-ms source) ttl-ms
@@ -471,7 +474,8 @@ Per-sequence boundaries live in metadata.segments for UI display."
          (name (or (jstring body "name" nil) default-name sensor-id))
          (region (or default-region (signal-body-region body values)))
          (ttl-ms (or (jnumber body "ttlMs" nil) default-ttl-ms 30000))
-         (source (commit-signal-source state sensor-id name region values ttl-ms))
+         (source (commit-signal-source state sensor-id name region values ttl-ms
+                                       (or (jstring body "origin" nil) "signal")))
          (push-result +json-null+))
     (when (jbool body "triggerPush" nil)
       (setf push-result (push-perception state (not (jbool body "compactPush" nil)))))
@@ -866,7 +870,7 @@ dispatch_triggers and TS Dispatcher.onStep: drop ops without governance
            (name (or (jstring body "name" nil)
                      (and mapping (jstring mapping "name" nil))
                      (format nil "agent:~a/~a/completion" provider agent)))
-           (source (commit-signal-source state sensor-id name region numbers ttl-ms))
+           (source (commit-signal-source state sensor-id name region numbers ttl-ms provider))
            (received-at (now-ms))
            ;; Build a signal result matching the shape ingest-signal-body returns,
            ;; so callers see "signal" not "source" — parity with CPP / AI.
@@ -999,7 +1003,7 @@ Callers accumulate results into resolved/unmapped lists."
                (ttl-ms    (or (jnumber mapping "ttlMs" nil) (* 60 60000)))
                (name      (or (jstring mapping "name" nil)
                               (format nil "healthkit:~a" type)))
-               (source    (commit-signal-source state sensor-id name region values ttl-ms)))
+               (source    (commit-signal-source state sensor-id name region values ttl-ms "healthkit")))
           (obj "resolved"       t
                "sensorId"       sensor-id
                "name"           name
@@ -1087,7 +1091,8 @@ Callers accumulate results into resolved/unmapped lists."
                                          (or (jstring body "name" nil) (format nil "carekit:~a" sample-type))
                                          region
                                          values
-                                         ttl-ms)))
+                                         ttl-ms
+                                         "carekit")))
       (obj "success" t
            "sourceMappingId" mapping-id
            "sampleType" sample-type
@@ -1769,7 +1774,8 @@ feed_mqtt_signal (CPP)."
                                       :sensor-id sensor-id
                                       :last-value values
                                       :last-updated (now-ms)
-                                      :ttl-ms (if (> ttl-ms 0) ttl-ms 30000)))))
+                                      :ttl-ms (if (> ttl-ms 0) ttl-ms 30000)
+                                      :origin "mqtt"))))
     (broadcast (obj "type" "mqtt-ingest"
                     "payload" (obj "sensorId" sensor-id
                                    "offset" offset

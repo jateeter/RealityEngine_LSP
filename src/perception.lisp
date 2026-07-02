@@ -3,7 +3,11 @@
 (defstruct source
   id kind name active-p region pattern frequency amplitude dc-offset
   machine-id machine-name sequence-name sequence-metadata test-sequence inputs cursor loop-p
-  sensor-id last-value last-updated ttl-ms)
+  sensor-id last-value last-updated ttl-ms
+  ;; Provenance — which integration feeds this source ("mqtt", "openclaw",
+  ;; "ollama", "healthkit", "carekit", "localai", "signal").  NIL for
+  ;; manually created sources; omitted from JSON when unset.
+  origin)
 
 (defstruct perception-engine
   dimension sources match-algorithm last-push auto-running-p auto-interval-ms
@@ -60,7 +64,9 @@ machines downstream don't keep reading a value that was supposed to expire."
                (jget out "lastUpdated") last-updated
                (jget out "ttlMs") ttl
                (jget out "ageMs") age
-               (jget out "stale") (json-bool stale-p))))
+               (jget out "stale") (json-bool stale-p))
+         (when (source-origin source)
+           (setf (jget out "origin") (source-origin source)))))
       (t
        (setf (jget out "pattern") (or (source-pattern source) "constant")
              (jget out "frequency") (or (source-frequency source) 1.0d0)
@@ -96,7 +102,8 @@ machines downstream don't keep reading a value that was supposed to expire."
      :sensor-id (jstring json "sensorId" nil)
      :last-value (numbers-from-json (or (jget json "lastValue") (arr)))
      :last-updated (or (jnumber json "lastUpdated" nil) 0)
-     :ttl-ms (or (jnumber json "ttlMs" nil) 5000))))
+     :ttl-ms (or (jnumber json "ttlMs" nil) 5000)
+     :origin (jstring json "origin" nil))))
 
 (defun ensure-source-id (engine source)
   (unless (source-id source)
