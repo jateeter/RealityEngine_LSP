@@ -16,6 +16,46 @@
 (defun compose-key (producer-machine-id producer-sequence-id)
   (format nil "~a|~a" producer-machine-id producer-sequence-id))
 
+(defun machine-json-list-rows (machine-dir)
+  "Rows for GET /api/machines/json/list — recursive so files in domain
+subdirectories (machines/domains/<name>/) are included."
+  (let ((dir (uiop:ensure-directory-pathname machine-dir))
+        (rows nil))
+    (when (uiop:directory-exists-p dir)
+      ;; collect-json-files-recursive returns truenames; relativize against
+      ;; the directory truename so relFile survives symlinked roots.
+      (let ((dir-name (namestring (truename dir))))
+        (dolist (path (collect-json-files-recursive dir))
+          (let* ((full (namestring path))
+                 (rel (if (and (> (length full) (length dir-name))
+                               (string= dir-name full :end2 (length dir-name)))
+                          (subseq full (length dir-name))
+                          (file-namestring path))))
+            (push (obj "filename" (file-namestring path)
+                       "relFile" (substitute #\/ #\\ rel)
+                       "name" (pathname-name path)
+                       "description" ""
+                       "version" "1.0.0"
+                       "metadata" (obj)
+                       "sequenceCount" 0)
+                  rows)))))
+    (nreverse rows)))
+
+(defun resolve-machine-json-path (machine-dir name)
+  "Resolve NAME to a machine JSON file under MACHINE-DIR. Tries the flat
+path first, then falls back to a recursive basename search so files in
+domain subdirectories load by filename (corpus filenames are unique)."
+  (when (search ".." name)
+    (error "Invalid machine name: ~a" name))
+  (let* ((dir (uiop:ensure-directory-pathname machine-dir))
+         (filename (if (uiop:string-suffix-p ".json" name) name (format nil "~a.json" name)))
+         (flat (merge-pathnames filename dir)))
+    (if (probe-file flat)
+        flat
+        (or (find filename (collect-json-files-recursive dir)
+                  :key #'file-namestring :test #'string=)
+            flat))))
+
 (defun ensure-space-length (state length)
   (when (> length (length (reality-state-perceptual-space state)))
     (setf (reality-state-perceptual-space state)
@@ -1217,18 +1257,7 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                                                 (json-response
                                                  (actor-ask actor
                                                             (lambda (state)
-                                                              (let ((rows nil)
-                                                                    (dir (uiop:ensure-directory-pathname (reality-state-machine-dir state))))
-                                                                (when (uiop:directory-exists-p dir)
-                                                                  (dolist (path (uiop:directory-files dir "*.json"))
-                                                                    (push (obj "filename" (file-namestring path)
-                                                                               "name" (pathname-name path)
-                                                                               "description" ""
-                                                                               "version" "1.0.0"
-                                                                               "metadata" (obj)
-                                                                               "sequenceCount" 0)
-                                                                          rows)))
-                                                                (obj "machines" (vectorize (nreverse rows)))))))))
+                                                              (obj "machines" (vectorize (machine-json-list-rows (reality-state-machine-dir state)))))))))
    (make-route "GET" "/api/machines/json/:name" (lambda (params body query)
                                                  (declare (ignore body query))
                                                  (handler-case
@@ -1236,9 +1265,8 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                                                       (actor-ask actor
                                                                  (lambda (state)
                                                                    (let* ((name (gethash "name" params))
-                                                                          (filename (if (uiop:string-suffix-p ".json" name) name (format nil "~a.json" name)))
-                                                                          (path (merge-pathnames filename (uiop:ensure-directory-pathname (reality-state-machine-dir state))))
-                                                                     (machine (load-machine-from-file path)))
+                                                                          (path (resolve-machine-json-path (reality-state-machine-dir state) name))
+                                                                          (machine (load-machine-from-file path)))
                                                                      (put-machine state machine)
                                                                      (obj "success" t "machine" (machine-json machine :full t) "message" "Machine loaded successfully")))))
                                                    (error (condition) (error-response (princ-to-string condition) 404)))))
@@ -1643,29 +1671,13 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
      (make-route "GET" "/api/machines/json/list" (lambda (_ body query)
                                                   (declare (ignore _ body query))
                                                   (state-json (lambda (state)
-                                                                (let ((rows nil)
-                                                                      (dir (uiop:ensure-directory-pathname (reality-state-machine-dir state))))
-                                                                  (when (uiop:directory-exists-p dir)
-                                                                    (dolist (path (uiop:directory-files dir "*.json"))
-                                                                      (push (obj "filename" (file-namestring path)
-                                                                                 "name" (pathname-name path)
-                                                                                 "description" ""
-                                                                                 "version" "1.0.0"
-                                                                                 "metadata" (obj)
-                                                                                 "sequenceCount" 0)
-                                                                            rows)))
-                                                                  (obj "machines" (vectorize (nreverse rows))))))))
+                                                                (obj "machines" (vectorize (machine-json-list-rows (reality-state-machine-dir state))))))))
      (make-route "GET" "/api/machines/json/:name" (lambda (params body query)
                                                    (declare (ignore body query))
                                                    (handler-case
                                                        (state-json (lambda (state)
                                                                      (let* ((name (gethash "name" params))
-                                                                            (filename (if (uiop:string-suffix-p ".json" name)
-                                                                                          name
-                                                                                          (format nil "~a.json" name)))
-                                                                            (path (merge-pathnames
-                                                                                   filename
-                                                                                   (uiop:ensure-directory-pathname (reality-state-machine-dir state))))
+                                                                            (path (resolve-machine-json-path (reality-state-machine-dir state) name))
                                                                             (machine (load-machine-from-file path)))
                                                                        (put-machine state machine)
                                                                        (obj "success" t "machine" (machine-json machine :full t)

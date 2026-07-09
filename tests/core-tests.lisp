@@ -133,7 +133,7 @@
 ;; The same corpus walked by:
 ;;   RealityEngine_AI/src/__tests__/AiTriggerDispatch.test.ts
 ;;   RealityEngine_CPP/tests/e2e_ai_trigger_dispatch.cpp
-;; reports 895/4480/3586/3586 — pinning the same counters here catches any
+;; reports 1058/5126/4251/4251 (recursive walk incl. machines/domains/) — pinning the same counters here catches any
 ;; LSP-side drift in process-machine-input or resolve-governance.  And the
 ;; Yuma 3-tick cascade (AGX051→AGX055→AgYieldOptimizationAI) asserts the
 ;; same mergeBatch shapes both other runtimes already enforce.
@@ -186,7 +186,7 @@
    agentBinding; skip baseline (expectedOutputCount=0) sequences;
    require SLA only for paging tiers (processStatus ∈ {error, warning})."
   (let ((machines 0) (sequences 0) (outputs 0) (envelopes 0) (failures nil))
-    (dolist (path (sort (uiop:directory-files machine-dir "*.json") #'string< :key #'namestring))
+    (dolist (path (reality-engine-lsp::collect-json-files-recursive machine-dir))
       (let* ((raw (reality-engine-lsp::safe-read-file (namestring path)))
              (root (handler-case (reality-engine-lsp::parse-json raw)
                      (error (c) (push (format nil "~a: parse failed — ~a" (file-namestring path) c) failures)
@@ -309,7 +309,7 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                 :localai-machine-dir "../localAIStack/data/machines"))
         (machines 0) (sequences 0) (outputs 0) (records 0) (failures nil))
     (setf (reality-engine-lsp::perception-state-dispatch-ledger-limit state) 5000)
-    (dolist (path (sort (uiop:directory-files machine-dir "*.json") #'string< :key #'namestring))
+    (dolist (path (reality-engine-lsp::collect-json-files-recursive machine-dir))
       (let* ((raw (reality-engine-lsp::safe-read-file (namestring path)))
              (root (handler-case (reality-engine-lsp::parse-json raw)
                      (error (c) (push (format nil "~a: parse failed — ~a" (file-namestring path) c) failures)
@@ -1149,12 +1149,12 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
        ;; Counter parity — same numbers reported by:
        ;;   RealityEngine_AI  AiTriggerDispatch.test.ts          (jest)
        ;;   RealityEngine_CPP e2e_ai_trigger_dispatch            (C++ exec)
-       (format t "~&[parity] LSP walked corpus: machines=~a sequences=~a outputs=~a envelopes=~a (AI/CPP target: 895/4480/3586/3586)~%"
+       (format t "~&[parity] LSP walked corpus: machines=~a sequences=~a outputs=~a envelopes=~a (AI/CPP target: 1058/5126/4251/4251)~%"
                machines sequences outputs envelopes)
-       (assert-equal 895  machines  "AiTriggerDispatch parity — machinesWithTriggers != 895 (AI/CPP value)")
-       (assert-equal 4480 sequences "AiTriggerDispatch parity — inputSequencesRun  != 4480 (AI/CPP value)")
-       (assert-equal 3586 outputs   "AiTriggerDispatch parity — outputsProduced    != 3586 (AI/CPP value)")
-       (assert-equal 3586 envelopes "AiTriggerDispatch parity — envelopesResolved  != 3586 (AI/CPP value)"))
+       (assert-equal 1058  machines  "AiTriggerDispatch parity — machinesWithTriggers != 1058 (AI/CPP value)")
+       (assert-equal 5126 sequences "AiTriggerDispatch parity — inputSequencesRun  != 5126 (AI/CPP value)")
+       (assert-equal 4251 outputs   "AiTriggerDispatch parity — outputsProduced    != 4251 (AI/CPP value)")
+       (assert-equal 4251 envelopes "AiTriggerDispatch parity — envelopesResolved  != 4251 (AI/CPP value)"))
 
      ;; PE dispatch parity — same corpus and counts, but exercised through the
      ;; PE-owned dispatch ledger path that records async bridge envelopes after
@@ -1170,14 +1170,14 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
          (format *error-output* "~&[parity] PE dispatch failures (first 10):~%")
          (dolist (f (subseq failures 0 (min 10 (length failures))))
            (format *error-output* "  - ~a~%" f)))
-       (format t "~&[parity] LSP PE dispatch corpus: machines=~a sequences=~a outputs=~a records=~a (CPP target: 895/4480/3586/3586)~%"
+       (format t "~&[parity] LSP PE dispatch corpus: machines=~a sequences=~a outputs=~a records=~a (CPP target: 1058/5126/4251/4251)~%"
                machines sequences outputs records)
        (assert-equal nil failures "PE dispatch parity — corpus walk must produce no failures")
-       (assert-equal 895  machines  "PE dispatch parity — machinesWithTriggers != 895 (CPP value)")
-       (assert-equal 4480 sequences "PE dispatch parity — inputSequencesRun  != 4480 (CPP value)")
-       (assert-equal 3586 outputs   "PE dispatch parity — outputsProduced    != 3586 (CPP value)")
-       (assert-equal 3586 records   "PE dispatch parity — ledger records      != 3586 (CPP envelopesResolved)")
-       (assert-equal 3586
+       (assert-equal 1058  machines  "PE dispatch parity — machinesWithTriggers != 1058 (CPP value)")
+       (assert-equal 5126 sequences "PE dispatch parity — inputSequencesRun  != 5126 (CPP value)")
+       (assert-equal 4251 outputs   "PE dispatch parity — outputsProduced    != 4251 (CPP value)")
+       (assert-equal 4251 records   "PE dispatch parity — ledger records      != 4251 (CPP envelopesResolved)")
+       (assert-equal 4251
                      (reality-engine-lsp::perception-state-envelopes-created pe-state)
                      "PE dispatch parity — envelopesCreated counter drifted"))
 
