@@ -413,7 +413,7 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                     "AGX055_yuma-facility-ai-synthesis-bridge.json"
                     "AgYieldOptimizationAI.json"))
       (reality-engine-lsp::put-machine state
-        (reality-engine-lsp::load-machine-from-file (merge-pathnames file +ai-machines-dir+))))
+        (reality-engine-lsp::load-machine-from-file (reality-engine-lsp::resolve-machine-json-path +ai-machines-dir+ file))))
     state))
 
 (defun stage1-input (state tick-values)
@@ -1183,7 +1183,7 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
 
      ;; AGX051 pin — urgent_maint resolves to aquaculture_predictive_maintenance_agent / RED / sla=900.
      (let* ((m (reality-engine-lsp::load-machine-from-file
-                (merge-pathnames "AGX051_yuma-aqua-maintenance-forecaster.json" +ai-machines-dir+)))
+                (reality-engine-lsp::resolve-machine-json-path +ai-machines-dir+ "AGX051_yuma-aqua-maintenance-forecaster.json")))
             (env (envelope-for m "agx-051-urgent-maint" '(1 0 0 0))))
        (assert-true env                                                                "AGX051 urgent_maint: envelope unresolved")
        (assert-equal "aquaculture_predictive_maintenance_agent"                        (reality-engine-lsp::jstring env "agent" "")       "AGX051 urgent_maint: dispatch agent")
@@ -1216,7 +1216,7 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
 
      ;; AGX055 pin — five sequences route to agriculture_yield_optimization_ai with matching RAG.
      (let ((m (reality-engine-lsp::load-machine-from-file
-               (merge-pathnames "AGX055_yuma-facility-ai-synthesis-bridge.json" +ai-machines-dir+))))
+               (reality-engine-lsp::resolve-machine-json-path +ai-machines-dir+ "AGX055_yuma-facility-ai-synthesis-bridge.json"))))
        (dolist (case '(("agx-055-aqua-urgent"     (1 0 0 0 0 0 0 0 0 0 0 0) "RED")
                        ("agx-055-do-urgent"       (0 0 0 1 0 0 0 0 0 0 0 0) "RED")
                        ("agx-055-climate-urgent"  (0 0 0 0 0 0 1 0 0 0 0 0) "RED")
@@ -1246,8 +1246,8 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
 	           (assert-equal (third case) (reality-engine-lsp::jstring gov "ragStatusCode" "") (format nil "AGX055 PE ~a: ragStatusCode" (first case)))))))
 
      ;; Bridge perceptual contract — AGX055.output == AgYieldOptimizationAI.input == length 12.
-     (let* ((bridge-root (reality-engine-lsp::parse-json (reality-engine-lsp::safe-read-file (namestring (merge-pathnames "AGX055_yuma-facility-ai-synthesis-bridge.json" +ai-machines-dir+)))))
-            (yield-root  (reality-engine-lsp::parse-json (reality-engine-lsp::safe-read-file (namestring (merge-pathnames "AgYieldOptimizationAI.json"                 +ai-machines-dir+)))))
+     (let* ((bridge-root (reality-engine-lsp::parse-json (reality-engine-lsp::safe-read-file (namestring (reality-engine-lsp::resolve-machine-json-path +ai-machines-dir+ "AGX055_yuma-facility-ai-synthesis-bridge.json")))))
+            (yield-root  (reality-engine-lsp::parse-json (reality-engine-lsp::safe-read-file (namestring (reality-engine-lsp::resolve-machine-json-path +ai-machines-dir+ "AgYieldOptimizationAI.json")))))
             (bridge-out (reality-engine-lsp::jget (reality-engine-lsp::jget (reality-engine-lsp::jget bridge-root "machine") "perceptualMapping") "output"))
             (yield-in   (reality-engine-lsp::jget (reality-engine-lsp::jget (reality-engine-lsp::jget yield-root "machine") "perceptualMapping") "input")))
        (assert-equal (reality-engine-lsp::jnumber bridge-out "offset" nil) (reality-engine-lsp::jnumber yield-in "offset" nil) "bridge contract — output.offset != yield input.offset")
