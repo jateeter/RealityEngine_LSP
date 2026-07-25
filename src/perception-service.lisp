@@ -911,7 +911,7 @@ dispatch_triggers and TS Dispatcher.onStep: drop ops without governance
        "contract" (obj "transport" "https"
                        "singleSample" (arr "type" "value" "sourceName")
                        "batchSamples" (arr "bridgeId" "samples[]")
-                       "auth" (if (perception-state-healthkit-bridge-token state) "bridgeToken" "none"))))
+                       "auth" (if (perception-state-healthkit-bridge-token state) "bridgeToken|bearer" "none"))))
 
 ;; ── HealthKit AI-model helpers ────────────────────────────────────────────
 
@@ -1015,13 +1015,16 @@ Callers accumulate results into resolved/unmapped lists."
                "ttlMs"          ttl-ms
                "source"         (source-json source)))))))
 
-(defun ingest-healthkit (state body)
-  "Returns (cons http-status obj) — callers use json-response with both."
+(defun ingest-healthkit (state body &optional bearer-token)
+  "Returns (cons http-status obj) — callers use json-response with both.
+BEARER-TOKEN must be captured on the request thread (see request-bearer-token);
+it is accepted as an alternative to the body bridgeToken/token fields."
   (let ((required-token (perception-state-healthkit-bridge-token state)))
     (when (and required-token
                (not (string= required-token (or (jstring body "token" nil)
                                                 (jstring body "bridgeToken" nil)
-                                                ""))))
+                                                "")))
+               (not (equal required-token bearer-token)))
       (return-from ingest-healthkit
         (cons 401 (obj "success" +json-false+ "error" "invalid HealthKit bridge token")))))
   (let ((resolved nil) (unmapped nil))
@@ -1502,9 +1505,10 @@ Callers accumulate results into resolved/unmapped lists."
                                                             (json-response (actor-ask actor #'healthkit-status-json))))
    (make-route "POST" "/api/integrations/healthkit/ingest" (lambda (_ body query)
                                                              (declare (ignore _ query))
-                                                             (let ((result (actor-ask actor
-                                                                                      (lambda (state)
-                                                                                        (ingest-healthkit state body)))))
+                                                             (let* ((bearer (request-bearer-token))
+                                                                    (result (actor-ask actor
+                                                                                       (lambda (state)
+                                                                                         (ingest-healthkit state body bearer)))))
                                                                (if (consp result)
                                                                    (json-response (cdr result) (car result))
                                                                    (json-response result)))))

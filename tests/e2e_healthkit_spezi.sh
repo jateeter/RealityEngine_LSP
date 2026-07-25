@@ -185,4 +185,16 @@ bad_status="$(curl -s -o /tmp/healthkit_spezi_lsp_unauthorized.json -w "%{http_c
   -d '{"bridgeId":"healthkit-ios-bridge","bridgeToken":"wrong","type":"HKCorrelationTypeIdentifierBloodPressure","values":[0.72,0.48,0.24,0.99]}')"
 assert_status_code "$bad_status" "401"
 
+bad_bearer_status="$(curl -s -o /tmp/healthkit_spezi_lsp_bad_bearer.json -w "%{http_code}" -X POST "$PE_URL/api/integrations/healthkit/ingest" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer wrong" \
+  -d '{"bridgeId":"healthkit-ios-bridge","type":"HKCorrelationTypeIdentifierBloodPressure","values":[0.72,0.48,0.24,0.99]}')"
+assert_status_code "$bad_bearer_status" "401"
+
+bearer_status="$(curl -s -o /tmp/healthkit_spezi_lsp_bearer.json -w "%{http_code}" -X POST "$PE_URL/api/integrations/healthkit/ingest" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${HEALTHKIT_BRIDGE_TOKEN}" \
+  -d '{"bridgeId":"healthkit-ios-bridge","type":"HKCorrelationTypeIdentifierBloodPressure","unit":"mm[Hg]","values":[0.72,0.48,0.24,0.99]}')"
+assert_status_code "$bearer_status" "200"
+
 echo "HealthKit Spezi bridge e2e tests passed (LSP)"
