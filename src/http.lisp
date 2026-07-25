@@ -18,6 +18,16 @@
 (defun request-body-json ()
   (parse-json (or (hunchentoot:raw-post-data :force-text t) "")))
 
+(defun request-bearer-token ()
+  "Token from an Authorization: Bearer header on the current request, or NIL.
+Must be called on the request thread — the hunchentoot context is dynamic."
+  (let ((auth (hunchentoot:header-in* :authorization)))
+    (when (and auth
+               (> (length auth) 7)
+               (string-equal "bearer " (subseq auth 0 7)))
+      (let ((token (string-trim " " (subseq auth 7))))
+        (when (plusp (length token)) token)))))
+
 (defun query-params ()
   (let ((out (make-hash-table :test #'equal)))
     (dolist (pair (hunchentoot:get-parameters*))
