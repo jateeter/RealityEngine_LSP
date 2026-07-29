@@ -959,12 +959,21 @@ Tokens: {type}, {sampleType} (alias), {source}, {provider}, {agent}."
     (format nil "hk.~a~a" slug suffix)))
 
 (defun lookup-hk-mapping (state type source-name)
-  "Two-level registry lookup: healthkit:<type>:<sourceName> wins over healthkit:<type>."
+  "Inferred registry lookup: healthkit:<type>:<sourceName> wins over healthkit:<type>."
   (when (and source-name (not (string= source-name "")))
     (let ((specific (source-mapping-by-id state
                                           (format nil "healthkit:~a:~a" type source-name))))
       (when specific (return-from lookup-hk-mapping specific))))
   (source-mapping-by-id state (format nil "healthkit:~a" type)))
+
+(defun explicit-hk-source-mapping-id (body)
+  "Explicit HealthKit source mapping id, honoring sourceMappingId before mappingId."
+  (let ((source-mapping-id (jstring body "sourceMappingId" nil)))
+    (when (and source-mapping-id (not (string= source-mapping-id "")))
+      (return-from explicit-hk-source-mapping-id source-mapping-id)))
+  (let ((mapping-id (jstring body "mappingId" nil)))
+    (when (and mapping-id (not (string= mapping-id "")))
+      mapping-id)))
 
 (defun ingest-healthkit-one (state body)
   "Resolve one HK sample against the registry.
@@ -985,11 +994,16 @@ Callers accumulate results into resolved/unmapped lists."
       (return-from ingest-healthkit-one
         (obj "unmapped" t "type" type "sourceName" (or source-name +json-null+)
              "reason" "sample.value must be a finite number")))
-    (let ((mapping (lookup-hk-mapping state type source-name)))
+    (let* ((explicit-id (explicit-hk-source-mapping-id body))
+           (mapping (if explicit-id
+                        (source-mapping-by-id state explicit-id)
+                        (lookup-hk-mapping state type source-name))))
       (unless mapping
         (return-from ingest-healthkit-one
           (obj "unmapped" t "type" type "sourceName" (or source-name +json-null+)
-               "reason" (format nil "no registry mapping (declare healthkit:~a[:<sourceName>])" type))))
+               "reason" (if explicit-id
+                            (format nil "unknown sourceMappingId \"~a\"" explicit-id)
+                            (format nil "no registry mapping (declare healthkit:~a[:<sourceName>])" type)))))
       (let* ((region-json (jget mapping "region"))
              (region (when (and region-json
                                 (not (eq region-json +json-null+)))
