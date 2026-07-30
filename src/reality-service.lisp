@@ -8,6 +8,11 @@
   ;; RealityEngine_CPP/CesCoverageRegistry so the same Prometheus scrape
   ;; config covers all three runtimes.  Keyed by tab-joined identifiers.
   cov-matched cov-activated cov-outputs cov-steps cov-paging cov-deprecated
+  ;; Semantic audit trail — re:SequenceObservation records emitted while
+  ;; machines process input (RealityEngine_Machines
+  ;; docs/SEMANTIC_AUDIT_CONTRACT.md, milestone M5).  Newest-last list,
+  ;; truncated to +semantic-audit-capacity+.
+  semantic-audit
   checkpoints
   match-threshold
   sampler-running-p sampler-strategy sampler-interval-ms sampler-sample-count
@@ -289,6 +294,51 @@ counters.  Called once per machine per step from process-perceptual-input."
                       (+ (or (gethash (coverage-key mid mname sid)
                                       (reality-state-cov-outputs state)) 0)
                          (length (jarray-list asserted))))))))))))
+
+(defparameter +semantic-audit-capacity+ 1000)
+
+(defun record-semantic-audit (state machine transition-json)
+  "Append one re:SequenceObservation per matched step of every sequence in
+TRANSITION-JSON.  Determination fields come from the first asserted output;
+IRIs are attached at read time by the /api/audit/semantics route."
+  (let ((mid (machine-id machine))
+        (mname (machine-name machine))
+        (seq-results (jget transition-json "sequenceResults"))
+        (new nil))
+    (when (jobject-p seq-results)
+      (dolist (sid (object-keys-sorted seq-results))
+        (let* ((sr (jget seq-results sid))
+               (matched (jget sr "matchedVectors"))
+               (asserted (jget sr "assertedOutputs"))
+               (outputs (and (jarray-p asserted) (jarray-list asserted)))
+               (first-output (car outputs))
+               (completed (and first-output t))
+               (out-meta (and first-output (jget first-output "metadata"))))
+          (when (jarray-p matched)
+            (dolist (vid (jarray-list matched))
+              (when (stringp vid)
+                (push (obj "at" (now-ms)
+                           "machineId" mid
+                           "machineName" mname
+                           "sequenceId" sid
+                           "stepId" vid
+                           "completed" (json-bool completed)
+                           "determinationId" (if first-output
+                                                 (jstring first-output "id" +json-null+)
+                                                 +json-null+)
+                           "actionCode" (if (jobject-p out-meta)
+                                            (jstring out-meta "action" +json-null+)
+                                            +json-null+)
+                           "ragStatus" (if (jobject-p out-meta)
+                                           (jstring out-meta "ragStatusCode" +json-null+)
+                                           +json-null+))
+                      new)))))))
+    (when new
+      (let ((combined (append (reality-state-semantic-audit state) (nreverse new))))
+        (setf (reality-state-semantic-audit state)
+              (if (> (length combined) +semantic-audit-capacity+)
+                  (last combined +semantic-audit-capacity+)
+                  combined))))))
 
 (defun record-merge-coverage (state operation)
   "Bump paging-decision and deprecated-fire counters from one merge-batch
@@ -859,6 +909,7 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
            ;; Coverage tracking — once per machine per step, regardless of
            ;; whether the caller wanted machine-results in the response.
            (record-machine-coverage state machine (transition-result-json result))
+           (record-semantic-audit state machine (transition-result-json result))
            (when include-machine-results
              (setf (gethash id machine-results) (transition-result-json result)))
            (push (obj "offset" (region-offset (mapping-input mapping))
@@ -983,6 +1034,63 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
     (unless (jobject-p (jget manifest "machines"))
       (error "invalid semantics manifest shape at ~a" path))
     manifest))
+
+(defun sanitize-iri-local (local)
+  "Restrict an ABox IRI local name to the generator's PN_LOCAL subset
+(scripts/generate-owl.py sanitize()) so runtime IRIs match the corpus."
+  (if (or (null local) (zerop (length local)))
+      "unnamed"
+      (map 'string
+           (lambda (c)
+             (if (or (alphanumericp c) (char= c #\_) (char= c #\-)) c #\_))
+           local)))
+
+(defun semantic-audit-json (state limit)
+  "Records for GET /api/audit/semantics — the newest LIMIT observations with
+IRIs joined from the corpus semantics manifest."
+  (let* ((bases (make-hash-table :test #'equal))
+         (manifest (ignore-errors (semantics-manifest-json state)))
+         (ontology-known (and manifest t))
+         (all (reality-state-semantic-audit state))
+         (bounded (max 0 (min limit +semantic-audit-capacity+)))
+         (records (if (> (length all) bounded) (last all bounded) all)))
+    (declare (ignore ontology-known))
+    (when manifest
+      (maphash (lambda (key entry)
+                 (declare (ignore key))
+                 (let ((iri (jstring entry "iri" nil))
+                       (name (jstring entry "name" nil)))
+                   (when (and iri name)
+                     (let ((hash (position #\# iri)))
+                       (when hash
+                         (setf (gethash name bases) (subseq iri 0 hash)))))))
+               (jget manifest "machines")))
+    (obj "records"
+         (vectorize
+          (mapcar
+           (lambda (r)
+             (let* ((mname (jstring r "machineName" ""))
+                    (base (gethash mname bases))
+                    (det (jstring r "determinationId" nil)))
+               (flet ((iri (prefix local)
+                        (if (and base local)
+                            (format nil "~a#~a-~a" base prefix (sanitize-iri-local local))
+                            +json-null+)))
+                 (obj "type" "re:SequenceObservation"
+                      "at" (jnumber r "at" 0)
+                      "machineId" (jstring r "machineId" "")
+                      "machineName" mname
+                      "machineIri" (if base (format nil "~a#machine" base) +json-null+)
+                      "sequenceId" (jstring r "sequenceId" "")
+                      "sequenceIri" (iri "seq" (jstring r "sequenceId" nil))
+                      "stepId" (jstring r "stepId" "")
+                      "stepIri" (iri "step" (jstring r "stepId" nil))
+                      "completed" (jget r "completed" +json-false+)
+                      "determinationIri" (if det (iri "out" det) +json-null+)
+                      "actionCode" (jget r "actionCode" +json-null+)
+                      "ragStatus" (jget r "ragStatus" +json-null+)))))
+           records))
+         "count" (length records))))
 
 (defun find-semantics-entry (manifest name)
   "Return (values key entry) for the manifest machine named NAME, else nil."
@@ -1635,6 +1743,18 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                                                                    (error-response "Semantic bus not found" 404)))
                                                            (error (e)
                                                              (error-response (format nil "semantic bus registry unavailable: ~a" e) 404)))))
+     ;; Semantic audit trail (SEMANTIC_AUDIT_CONTRACT.md, milestone M5):
+     ;; re:SequenceObservation records emitted while machines process input,
+     ;; IRI-enriched from the corpus semantics manifest at read time.
+     (make-route "GET" "/api/audit/semantics" (lambda (_ body query)
+                                                (declare (ignore _ body))
+                                                (let ((limit (or (ignore-errors
+                                                                   (parse-integer (or (gethash "limit" query) "100")))
+                                                                 100)))
+                                                  (json-response
+                                                   (actor-ask actor
+                                                              (lambda (state)
+                                                                (semantic-audit-json state limit)))))))
      ;; OWL semantic identity (roadmap M4): IRI + ABox content hash from the
      ;; corpus semantics/abox-manifest.json, keyed by machine name. Contract
      ;; mirrors the C++, Scala, and TypeScript engines.
