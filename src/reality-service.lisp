@@ -16,9 +16,20 @@
 (defun compose-key (producer-machine-id producer-sequence-id)
   (format nil "~a|~a" producer-machine-id producer-sequence-id))
 
-(defun machine-json-list-rows (machine-dir)
+(defun semantics-key-for-rel (rel)
+  "Manifest keys are <domain>/<stem>: domains/<d>/X.json -> d/X, else core/X."
+  (let ((no-ext (if (uiop:string-suffix-p rel ".json")
+                    (subseq rel 0 (- (length rel) 5))
+                    rel)))
+    (if (uiop:string-prefix-p "domains/" no-ext)
+        (subseq no-ext 8)
+        (format nil "core/~a" no-ext))))
+
+(defun machine-json-list-rows (machine-dir &optional semantics-by-key)
   "Rows for GET /api/machines/json/list — recursive so files in domain
-subdirectories (machines/domains/<name>/) are included."
+subdirectories (machines/domains/<name>/) are included. SEMANTICS-BY-KEY,
+when provided, is the \"machines\" object of the corpus OWL semantics
+manifest; matching rows gain semanticsIri/semanticsHash (roadmap M4)."
   (let ((dir (uiop:ensure-directory-pathname machine-dir))
         (rows nil))
     (when (uiop:directory-exists-p dir)
@@ -30,15 +41,21 @@ subdirectories (machines/domains/<name>/) are included."
                  (rel (if (and (> (length full) (length dir-name))
                                (string= dir-name full :end2 (length dir-name)))
                           (subseq full (length dir-name))
-                          (file-namestring path))))
-            (push (obj "filename" (file-namestring path)
-                       "relFile" (substitute #\/ #\\ rel)
-                       "name" (pathname-name path)
-                       "description" ""
-                       "version" "1.0.0"
-                       "metadata" (obj)
-                       "sequenceCount" 0)
-                  rows)))))
+                          (file-namestring path)))
+                 (rel-clean (substitute #\/ #\\ rel))
+                 (row (obj "filename" (file-namestring path)
+                           "relFile" rel-clean
+                           "name" (pathname-name path)
+                           "description" ""
+                           "version" "1.0.0"
+                           "metadata" (obj)
+                           "sequenceCount" 0)))
+            (when semantics-by-key
+              (let ((entry (jget semantics-by-key (semantics-key-for-rel rel-clean))))
+                (when (jobject-p entry)
+                  (setf (jget row "semanticsIri") (jstring entry "iri" +json-null+))
+                  (setf (jget row "semanticsHash") (jstring entry "sha256" +json-null+)))))
+            (push row rows)))))
     (nreverse rows)))
 
 (defun resolve-machine-json-path (machine-dir name)
@@ -939,6 +956,53 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
       (error "invalid registry shape at ~a" path))
     registry))
 
+;; OWL semantics manifest (RealityEngine_Machines semantics/abox-manifest.json):
+;; per-machine semantic identity — ABox IRI + content hash — for the
+;; cross-engine semantic-equivalence surface (roadmap milestone M4).
+(defun semantics-manifest-path (machine-dir)
+  (let ((explicit (env "SEMANTICS_MANIFEST" nil)))
+    (when (and explicit (> (length explicit) 0))
+      (return-from semantics-manifest-path explicit)))
+  (let ((cursor (uiop:ensure-directory-pathname machine-dir)))
+    (loop repeat 6
+          while cursor
+          for candidate = (merge-pathnames "semantics/abox-manifest.json" cursor)
+          when (probe-file candidate)
+            do (return (namestring candidate))
+          do (let ((parent (uiop:pathname-parent-directory-pathname cursor)))
+               (setf cursor (and parent (not (equal parent cursor)) parent)))
+          finally (return (namestring (merge-pathnames "../semantics/abox-manifest.json"
+                                                        (uiop:ensure-directory-pathname machine-dir)))))))
+
+(defun semantics-manifest-json (state)
+  (let* ((path (semantics-manifest-path (reality-state-machine-dir state)))
+         (manifest (parse-json (safe-read-file path))))
+    (unless (jobject-p (jget manifest "machines"))
+      (error "invalid semantics manifest shape at ~a" path))
+    manifest))
+
+(defun find-semantics-entry (manifest name)
+  "Return (values key entry) for the manifest machine named NAME, else nil."
+  (maphash (lambda (key entry)
+             (when (and (jobject-p entry) (string= (jstring entry "name" "") name))
+               (return-from find-semantics-entry (values key entry))))
+           (jget manifest "machines"))
+  nil)
+
+(defun percent-decode (s)
+  "Percent-decode a path parameter (machine names contain spaces)."
+  (with-output-to-string (out)
+    (loop with i = 0
+          while (< i (length s))
+          do (let ((c (char s i)))
+               (if (and (char= c #\%) (< (+ i 2) (length s))
+                        (digit-char-p (char s (+ i 1)) 16)
+                        (digit-char-p (char s (+ i 2)) 16))
+                   (progn
+                     (write-char (code-char (parse-integer s :start (+ i 1) :end (+ i 3) :radix 16)) out)
+                     (incf i 3))
+                   (progn (write-char c out) (incf i)))))))
+
 (defun find-semantic-bus-json (registry id)
   (find id
         (jarray-list (jget registry "semanticBuses"))
@@ -1568,6 +1632,25 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                                                                    (error-response "Semantic bus not found" 404)))
                                                            (error (e)
                                                              (error-response (format nil "semantic bus registry unavailable: ~a" e) 404)))))
+     ;; OWL semantic identity (roadmap M4): IRI + ABox content hash from the
+     ;; corpus semantics/abox-manifest.json, keyed by machine name. Contract
+     ;; mirrors the C++, Scala, and TypeScript engines.
+     (make-route "GET" "/api/machines/semantics/:name" (lambda (params body query)
+                                                         (declare (ignore body query))
+                                                         (handler-case
+                                                             (let ((manifest (actor-ask actor #'semantics-manifest-json))
+                                                                   (name (percent-decode (gethash "name" params))))
+                                                               (multiple-value-bind (key entry) (find-semantics-entry manifest name)
+                                                                 (if entry
+                                                                     (json-response (obj "name" name
+                                                                                         "machineKey" key
+                                                                                         "semanticsIri" (jstring entry "iri" +json-null+)
+                                                                                         "semanticsHash" (jstring entry "sha256" +json-null+)
+                                                                                         "sourceFile" (jstring entry "sourceFile" +json-null+)
+                                                                                         "ontology" (jstring manifest "ontology" +json-null+)))
+                                                                     (error-response (format nil "No semantics manifest entry for machine: ~a" name) 404))))
+                                                           (error (e)
+                                                             (error-response (format nil "semantics manifest unavailable: ~a" e) 404)))))
      (make-route "GET" "/api/machines/:id" (lambda (params body query)
                                              (declare (ignore body query))
                                              (let ((machine (actor-ask actor (lambda (state)
@@ -1671,7 +1754,9 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
      (make-route "GET" "/api/machines/json/list" (lambda (_ body query)
                                                   (declare (ignore _ body query))
                                                   (state-json (lambda (state)
-                                                                (obj "machines" (vectorize (machine-json-list-rows (reality-state-machine-dir state))))))))
+                                                                (obj "machines" (vectorize (machine-json-list-rows
+                                                                                            (reality-state-machine-dir state)
+                                                                                            (ignore-errors (jget (semantics-manifest-json state) "machines")))))))))
      (make-route "GET" "/api/machines/json/:name" (lambda (params body query)
                                                    (declare (ignore body query))
                                                    (handler-case
