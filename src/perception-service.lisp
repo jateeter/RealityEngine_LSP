@@ -80,6 +80,9 @@
           (obj "id" "agent-completion-risk"
                "sensorIdTemplate" "agent.{agent}.completion"
                "region" (obj "offset" 4200 "length" 4)
+               "extract" (obj "type" "json"
+                              "pointers" (arr "/completed" "/failed" "/confidence" "/actionClass"))
+               "normalize" (obj "mode" "passthrough" "clamp" t)
                "ttlMs" 300000
                "pushMode" "debounced"
                "debounceMs" 250)
@@ -89,6 +92,9 @@
           (obj "id" "acp-openclaw-completion"
                "sensorIdTemplate" "acp.openclaw.{agent}.completion"
                "region" (obj "offset" 4210 "length" 4)
+               "extract" (obj "type" "json"
+                              "pointers" (arr "/completed" "/failed" "/confidence" "/actionClass"))
+               "normalize" (obj "mode" "passthrough" "clamp" t)
                "ttlMs" 300000
                "pushMode" "debounced"
                "debounceMs" 250)
@@ -818,16 +824,159 @@ dispatch_triggers and TS Dispatcher.onStep: drop ops without governance
                (incf (perception-state-dispatch-errors state)))))))
       (vectorize (nreverse records)))))
 
-(defun completion-values-from-content (content)
-  (handler-case
-      (let ((parsed (parse-json content)))
+(defun completion-scalar-number (value)
+  (cond
+    ((numberp value) (coerce value 'double-float))
+    ((eq value t) 1.0d0)
+    ((eq value +json-false+) 0.0d0)
+    ((stringp value)
+     (handler-case
+         (let ((*read-default-float-format* 'double-float))
+           (multiple-value-bind (parsed pos) (read-from-string value)
+             (if (and (= pos (length value)) (realp parsed))
+                 (coerce parsed 'double-float)
+                 :invalid)))
+       (error () :invalid)))
+    (t :invalid)))
+
+(defun validate-completion-values-array (values)
+  (unless (jarray-p values)
+    (error "provider completion values must be an array"))
+  (vectorize
+   (mapcar (lambda (value)
+             (let ((number (completion-scalar-number value)))
+               (when (eq number :invalid)
+                 (error "provider completion value is not a finite number"))
+               number))
+           (jarray-list values))))
+
+(defun response-values-from-content-json (content-json)
+  (cond
+    ((jarray-p (jget content-json "values"))
+     (validate-completion-values-array (jget content-json "values")))
+    ((and (jobject-p (jget content-json "completion"))
+          (jarray-p (jget (jget content-json "completion") "values")))
+     (validate-completion-values-array (jget (jget content-json "completion") "values")))
+    (t nil)))
+
+(defun completion-values-from-pointer (content-json pointer)
+  (let ((node (mqtt-navigate-pointer content-json pointer)))
+    (when (eq node :missing)
+      (error "missing required JSON pointer: ~a" pointer))
+    (cond
+      ((jarray-p node) (validate-completion-values-array node))
+      (t
+       (let ((number (completion-scalar-number node)))
+         (when (eq number :invalid)
+           (error "JSON pointer resolved to a non-finite value: ~a" pointer))
+         (vectorize (list number)))))))
+
+(defun extract-completion-values-for-mapping (content-json mapping)
+  (let ((extract (and mapping (jget mapping "extract"))))
+    (if (and (jobject-p extract)
+             (string= (jstring extract "type" "") "json"))
         (cond
-          ((jarray-p (jget parsed "values")) (jget parsed "values"))
-          ((and (jobject-p (jget parsed "completion"))
-                (jarray-p (jget (jget parsed "completion") "values")))
-           (jget (jget parsed "completion") "values"))
-          (t nil)))
-    (error () nil)))
+          ((jarray-p (jget extract "pointers"))
+           (vectorize
+            (mapcar (lambda (pointer)
+                      (let ((node (mqtt-navigate-pointer content-json pointer)))
+                        (when (eq node :missing)
+                          (error "missing required JSON pointer: ~a" pointer))
+                        (let ((number (completion-scalar-number node)))
+                          (when (eq number :invalid)
+                            (error "JSON pointer resolved to a non-finite value: ~a" pointer))
+                          number)))
+                    (jarray-list (jget extract "pointers")))))
+          ((jstring extract "pointer" nil)
+           (completion-values-from-pointer content-json (jstring extract "pointer")))
+          (t
+           (or (response-values-from-content-json content-json)
+               (error "provider response did not include completion values"))))
+        (or (response-values-from-content-json content-json)
+            (error "provider response did not include completion values")))))
+
+(defun normalize-completion-values (values mapping)
+  (let ((normalize (and mapping (jget mapping "normalize"))))
+    (if (not (jobject-p normalize))
+        values
+        (let ((mode (jstring normalize "mode" "passthrough"))
+              (clamp (jbool normalize "clamp" nil)))
+          (vectorize
+           (mapcar (lambda (value)
+                     (let ((n value))
+                       (cond
+                         ((string= mode "minmax")
+                          (let* ((min (or (jnumber normalize "min" nil) 0.0d0))
+                                 (max (or (jnumber normalize "max" nil) 1.0d0))
+                                 (span (- max min)))
+                            (setf n (if (zerop span) 0.0d0 (/ (- n min) span)))))
+                         ((string= mode "linear")
+                          (setf n (+ (* n (or (jnumber normalize "scale" nil) 1.0d0))
+                                      (or (jnumber normalize "offset" nil) 0.0d0)))))
+                       (if clamp (clamp01 n) n)))
+                   (jarray-list values)))))))
+
+(defun completion-values-from-content (content &optional mapping)
+  (let ((content-json (handler-case (parse-json content)
+                        (error () (error "provider response content is not valid JSON")))))
+    (normalize-completion-values
+     (extract-completion-values-for-mapping content-json mapping)
+     mapping)))
+
+(defun decode-json-pointer-token (token)
+  (let ((out (make-array 0 :element-type 'character :fill-pointer 0 :adjustable t))
+        (i 0)
+        (n (length token)))
+    (loop while (< i n) do
+      (if (and (char= (aref token i) #\~)
+               (< (1+ i) n)
+               (member (aref token (1+ i)) '(#\0 #\1)))
+          (progn
+            (vector-push-extend (if (char= (aref token (1+ i)) #\1) #\/ #\~) out)
+            (incf i 2))
+          (progn
+            (vector-push-extend (aref token i) out)
+            (incf i))))
+    out))
+
+(defun json-pointer-top-level-key (pointer)
+  (if (or (zerop (length pointer)) (char/= (aref pointer 0) #\/))
+      "value"
+      (let* ((end (or (position #\/ pointer :start 1) (length pointer)))
+             (raw (subseq pointer 1 end)))
+        (decode-json-pointer-token raw))))
+
+(defun completion-schema-for-mapping (mapping)
+  (let* ((extract (and mapping (jget mapping "extract")))
+         (pointers (cond
+                     ((and (jobject-p extract) (jarray-p (jget extract "pointers")))
+                      (jarray-list (jget extract "pointers")))
+                     ((and (jobject-p extract) (jstring extract "pointer" nil))
+                      (list (jstring extract "pointer")))
+                     (t nil))))
+    (if pointers
+        (let ((properties (obj))
+              (required nil))
+          (dolist (pointer pointers)
+            (let ((key (json-pointer-top-level-key pointer)))
+              (setf (jget properties key)
+                    (obj "type" (arr "number" "boolean")))
+              (push key required)))
+          (obj "type" "object"
+               "additionalProperties" +json-false+
+               "properties" properties
+               "required" (vectorize (nreverse required))))
+        (obj "type" "object"
+             "additionalProperties" +json-false+
+             "properties" (obj "values" (obj "type" "array"
+                                             "items" (obj "type" "number")))
+             "required" (arr "values")))))
+
+(defun openai-text-format-for-mapping (mapping)
+  (obj "format" (obj "type" "json_schema"
+                     "name" "reality_engine_completion"
+                     "strict" t
+                     "schema" (completion-schema-for-mapping mapping))))
 
 (defun ingest-completion (state body)
   ;; Returns (cons http-status body-hash) — route handler unpacks it.
@@ -1223,6 +1372,7 @@ it is accepted as an alternative to the body bridgeToken/token fields."
         (let* ((model (or (jstring body "model" nil) (perception-state-ollama-model state)))
                (mapping-id (or (jstring body "sourceMappingId" nil)
                                (perception-state-ollama-completion-source-mapping-id state)))
+               (mapping (and mapping-id (source-mapping-by-id state mapping-id)))
                (payload (obj "model" model
                              "stream" +json-false+
                              "messages" (vectorize
@@ -1230,32 +1380,62 @@ it is accepted as an alternative to the body bridgeToken/token fields."
                                                     "content" "Return concise JSON. If committing a PE completion, include numeric values.")
                                                (obj "role" "user"
                                                     "content" (dispatch-record-prompt record))))))
-               (response (http-request-json (format nil "~a/api/chat" (perception-state-ollama-base-url state))
+               (response nil)
+               (content "")
+               (values nil)
+               (completion +json-null+))
+          (when (and mapping-id (not mapping))
+            (error "Unknown sourceMappingId \"~a\"" mapping-id))
+          (when mapping
+            (setf (jget payload "format") (completion-schema-for-mapping mapping)))
+          (setf response (http-request-json (format nil "~a/api/chat" (perception-state-ollama-base-url state))
                                             :method :post
                                             :payload payload))
-               (content (or (jstring (jget response "message") "content" nil) ""))
-               (values (completion-values-from-content content))
-               (completion +json-null+))
-          (when values
-            (setf completion (ingest-completion
-                              state
-                              (obj "provider" "ollama"
-                                   "agent" (jstring record "target" "ollama")
-                                   "sourceMappingId" mapping-id
-                                   "correlationId" id
-                                   "values" values))))
+          (setf content (or (jstring (jget response "message") "content" nil) ""))
+          (setf values (completion-values-from-content content mapping))
+          (setf completion (ingest-completion
+                            state
+                            (obj "provider" "ollama"
+                                 "agent" (jstring record "target" "ollama")
+                                 "sourceMappingId" mapping-id
+                                 "correlationId" id
+                                 "values" values)))
           (update-dispatch-record state id (obj "status" "delivered"
                                                 "adapter" "ollama"
                                                 "provider" "ollama"
                                                 "externalRunId" (or (jstring response "created_at" nil)
-                                                                    (make-id "ollama-run"))))
-          (obj "success" t "provider" "ollama" "response" response "completion" completion))
+                                                                    (make-id "ollama-run"))
+                                                "providerReceipt" (obj "model" model
+                                                                       "completionCommitted" t)))
+          (obj "success" t
+               "dispatchId" id
+               "provider" "ollama"
+               "model" model
+               "response" response
+               "completionCommitted" t
+               "completion" completion
+               "receipt" (obj "provider" "ollama"
+                              "adapter" "ollama"
+                              "status" "sent"
+                              "externalRunId" (or (jstring response "created_at" nil)
+                                                  (make-id "ollama-run"))
+                              "providerReceipt" (obj "model" model
+                                                     "completionCommitted" t))))
       (error (condition)
         (update-dispatch-record state id (obj "status" "failed"
                                               "adapter" "ollama"
                                               "provider" "ollama"
-                                              "lastError" (princ-to-string condition)))
-        (obj "success" +json-false+ "provider" "ollama" "error" (princ-to-string condition))))))
+                                              "lastError" (princ-to-string condition)
+                                              "providerReceipt" (obj "model" (or (jstring body "model" nil)
+                                                                                 (perception-state-ollama-model state)))))
+        (obj "success" +json-false+
+             "dispatchId" id
+             "provider" "ollama"
+             "error" (princ-to-string condition)
+             "receipt" (obj "provider" "ollama"
+                            "adapter" "ollama"
+                            "status" "failed"
+                            "error" (princ-to-string condition)))))))
 
 (defun openai-response-text (response)
   (or (jstring response "output_text" nil)
@@ -1266,6 +1446,22 @@ it is accepted as an alternative to the body bridgeToken/token fields."
               (setf out (jstring content "text")))))
         out)
       ""))
+
+(defun assert-openai-response-ready (response)
+  (let ((status (jstring response "status" nil)))
+    (when (and status (not (string= status "completed")))
+      (error "OpenAI response status is ~a" status)))
+  (when (jobject-p (jget response "error"))
+    (error "OpenAI response error: ~a"
+           (or (jstring (jget response "error") "message" nil)
+               (json-stringify (jget response "error")))))
+  (dolist (item (jarray-list (or (jget response "output") (arr))))
+    (when (string= (jstring item "type" "") "refusal")
+      (error "OpenAI response was refused"))
+    (dolist (content (jarray-list (or (jget item "content") (arr))))
+      (when (or (string= (jstring content "type" "") "refusal")
+                (jstring content "refusal" nil))
+        (error "OpenAI response was refused")))))
 
 (defun dispatch-openai (state body)
   (let* ((id (or (jstring body "dispatchId" nil) (jstring body "id" nil)))
@@ -1279,39 +1475,71 @@ it is accepted as an alternative to the body bridgeToken/token fields."
         (let* ((model (or (jstring body "model" nil) (perception-state-openai-model state)))
                (mapping-id (or (jstring body "sourceMappingId" nil)
                                (perception-state-openai-completion-source-mapping-id state)))
+               (mapping (and mapping-id (source-mapping-by-id state mapping-id)))
                (payload (obj "model" model
                              "instructions" "Return concise JSON. If committing a PE completion, include numeric values."
                              "input" (dispatch-record-prompt record)))
-               (response (http-request-json
+               (response nil)
+               (content "")
+               (values nil)
+               (completion +json-null+))
+          (when (and mapping-id (not mapping))
+            (error "Unknown sourceMappingId \"~a\"" mapping-id))
+          (unless (jobject-p (jget payload "text"))
+            (setf (jget payload "text") (openai-text-format-for-mapping mapping)))
+          (setf response (http-request-json
                           (format nil "~a/responses" (perception-state-openai-base-url state))
                           :method :post
                           :payload payload
                           :headers (list (cons "Authorization"
                                                (format nil "Bearer ~a" (perception-state-openai-api-key state))))))
-               (content (openai-response-text response))
-               (values (completion-values-from-content content))
-               (completion +json-null+))
-          (when values
-            (setf completion (ingest-completion
-                              state
-                              (obj "provider" "openai"
-                                   "agent" (jstring record "target" "openai")
-                                   "sourceMappingId" mapping-id
-                                   "correlationId" id
-                                   "completionId" (or (jstring response "id" nil) +json-null+)
-                                   "values" values))))
+          (assert-openai-response-ready response)
+          (setf content (openai-response-text response))
+          (setf values (completion-values-from-content content mapping))
+          (setf completion (ingest-completion
+                            state
+                            (obj "provider" "openai"
+                                 "agent" (jstring record "target" "openai")
+                                 "sourceMappingId" mapping-id
+                                 "correlationId" id
+                                 "completionId" (or (jstring response "id" nil) +json-null+)
+                                 "values" values)))
           (update-dispatch-record state id (obj "status" "delivered"
                                                 "adapter" "openai"
                                                 "provider" "openai"
                                                 "externalRunId" (or (jstring response "id" nil)
-                                                                    (make-id "openai-run"))))
-          (obj "success" t "provider" "openai" "response" response "completion" completion))
+                                                                    (make-id "openai-run"))
+                                                "providerReceipt" (obj "model" model
+                                                                       "completionCommitted" t)))
+          (obj "success" t
+               "dispatchId" id
+               "provider" "openai"
+               "model" model
+               "response" response
+               "completionCommitted" t
+               "completion" completion
+               "receipt" (obj "provider" "openai"
+                              "adapter" "openai"
+                              "status" "sent"
+                              "externalRunId" (or (jstring response "id" nil)
+                                                  (make-id "openai-run"))
+                              "providerReceipt" (obj "model" model
+                                                     "completionCommitted" t))))
       (error (condition)
         (update-dispatch-record state id (obj "status" "failed"
                                               "adapter" "openai"
                                               "provider" "openai"
-                                              "lastError" (princ-to-string condition)))
-        (obj "success" +json-false+ "provider" "openai" "error" (princ-to-string condition))))))
+                                              "lastError" (princ-to-string condition)
+                                              "providerReceipt" (obj "model" (or (jstring body "model" nil)
+                                                                                 (perception-state-openai-model state)))))
+        (obj "success" +json-false+
+             "dispatchId" id
+             "provider" "openai"
+             "error" (princ-to-string condition)
+             "receipt" (obj "provider" "openai"
+                            "adapter" "openai"
+                            "status" "failed"
+                            "error" (princ-to-string condition)))))))
 
 (defun acp-status-json (state)
   (obj "enabled" (json-bool (perception-state-acp-enabled-p state))

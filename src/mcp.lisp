@@ -74,6 +74,36 @@
       (mcp-text (json-stringify (funcall fn re-url)))
     (error (e) (mcp-text (json-stringify (obj "error" (princ-to-string e))) t))))
 
+(defvar *mcp-allow-mutation-override* nil
+  "Test-only override for mutating MCP tool policy.")
+
+(defun mcp-tool-allowlisted-p (tool-name)
+  (let ((raw (env "RE_MCP_ALLOWED_TOOLS" "")))
+    (and (> (length raw) 0)
+         (member tool-name
+                 (mapcar (lambda (item)
+                           (string-trim '(#\Space #\Tab #\Newline #\Return) item))
+                         (split-string raw #\,))
+                 :test #'string=))))
+
+(defun mcp-mutating-tool-allowed-p (tool-name)
+  (or *mcp-allow-mutation-override*
+      (mcp-tool-allowlisted-p tool-name)
+      (env-bool "RE_MCP_ALLOW_MUTATION" nil)))
+
+(defun mcp-disabled-by-policy (tool-name)
+  (mcp-text
+   (json-stringify
+    (obj "error"
+         (format nil "Tool \"~a\" is disabled by policy. Enable with RE_MCP_ALLOW_MUTATION=true or add it to RE_MCP_ALLOWED_TOOLS."
+                 tool-name)))
+   t))
+
+(defun mcp-cons-json-text (result)
+  (if (consp result)
+      (mcp-text (json-stringify (cdr result)) (>= (car result) 400))
+      (mcp-text (json-stringify result))))
+
 ;; ── Tool registry ────────────────────────────────────────────────────────────
 
 (defun mcp-build-tools (actor re-url)
@@ -496,6 +526,112 @@
                                        records))
                                  records)))
                (mcp-text (json-stringify (obj "records" (vectorize trimmed)))))))
+
+     (tool "integrations.completion"
+           "Commit a provider or agent completion through PE source mappings. Mutating; gated by RE_MCP_ALLOW_MUTATION / RE_MCP_ALLOWED_TOOLS."
+           (obj "type" "object"
+                "properties" (obj "provider" (obj "type" "string")
+                                  "values" (obj "type" "array" "items" (obj "type" "number"))
+                                  "agent" (obj "type" "string")
+                                  "correlationId" (obj "type" "string")
+                                  "envelopeId" (obj "type" "string")
+                                  "sourceMappingId" (obj "type" "string")
+                                  "mappingId" (obj "type" "string")
+                                  "sensorId" (obj "type" "string")
+                                  "region" (obj "type" "object")
+                                  "ttlMs" (obj "type" "number"))
+                "required" (arr "provider" "values"))
+           (lambda (args)
+             (let ((tool-name "integrations.completion"))
+               (if (mcp-mutating-tool-allowed-p tool-name)
+                   (mcp-cons-json-text
+                    (actor-ask actor (lambda (s)
+                                       (ingest-completion s args))))
+                   (mcp-disabled-by-policy tool-name)))))
+
+     (tool "integrations.post_completion"
+           "Alias for integrations.completion."
+           (obj "type" "object"
+                "properties" (obj "provider" (obj "type" "string")
+                                  "values" (obj "type" "array" "items" (obj "type" "number"))
+                                  "agent" (obj "type" "string")
+                                  "correlationId" (obj "type" "string")
+                                  "envelopeId" (obj "type" "string")
+                                  "sourceMappingId" (obj "type" "string")
+                                  "mappingId" (obj "type" "string")
+                                  "sensorId" (obj "type" "string")
+                                  "region" (obj "type" "object")
+                                  "ttlMs" (obj "type" "number"))
+                "required" (arr "provider" "values"))
+           (lambda (args)
+             (let ((tool-name "integrations.post_completion"))
+               (if (mcp-mutating-tool-allowed-p tool-name)
+                   (mcp-cons-json-text
+                    (actor-ask actor (lambda (s)
+                                       (ingest-completion s args))))
+                   (mcp-disabled-by-policy tool-name)))))
+
+     (tool "integrations.dispatch_provider"
+           "Dispatch an existing ledger record through the requested provider adapter. Mutating; gated by RE_MCP_ALLOW_MUTATION / RE_MCP_ALLOWED_TOOLS."
+           (obj "type" "object"
+                "properties" (obj "provider" (obj "type" "string" "enum" (arr "openai" "ollama"))
+                                  "dispatch_id" (obj "type" "string")
+                                  "dispatchId" (obj "type" "string")
+                                  "sourceMappingId" (obj "type" "string")
+                                  "model" (obj "type" "string"))
+                "required" (arr "provider"))
+           (lambda (args)
+             (let ((tool-name "integrations.dispatch_provider"))
+               (if (mcp-mutating-tool-allowed-p tool-name)
+                   (let* ((provider (jstring args "provider" ""))
+                          (dispatch-id (or (jstring args "dispatch_id" nil)
+                                           (jstring args "dispatchId" nil))))
+                     (when dispatch-id (setf (jget args "dispatchId") dispatch-id))
+                     (cond
+                       ((string= provider "openai")
+                        (mcp-cons-json-text
+                         (actor-ask actor (lambda (s) (dispatch-openai s args)))))
+                       ((string= provider "ollama")
+                        (mcp-cons-json-text
+                         (actor-ask actor (lambda (s) (dispatch-ollama s args)))))
+                       (t (mcp-text (json-stringify (obj "error" "Unsupported provider")) t))))
+                   (mcp-disabled-by-policy tool-name)))))
+
+     (tool "integrations.dispatch_openai"
+           "Dispatch an existing ledger record through the OpenAI adapter. Mutating; gated by RE_MCP_ALLOW_MUTATION / RE_MCP_ALLOWED_TOOLS."
+           (obj "type" "object"
+                "properties" (obj "dispatch_id" (obj "type" "string")
+                                  "dispatchId" (obj "type" "string")
+                                  "sourceMappingId" (obj "type" "string")
+                                  "model" (obj "type" "string"))
+                "required" (arr "dispatch_id"))
+           (lambda (args)
+             (let ((tool-name "integrations.dispatch_openai"))
+               (if (mcp-mutating-tool-allowed-p tool-name)
+                   (progn
+                     (when (jstring args "dispatch_id" nil)
+                       (setf (jget args "dispatchId") (jstring args "dispatch_id")))
+                     (mcp-cons-json-text
+                      (actor-ask actor (lambda (s) (dispatch-openai s args)))))
+                   (mcp-disabled-by-policy tool-name)))))
+
+     (tool "integrations.dispatch_ollama"
+           "Dispatch an existing ledger record through the Ollama adapter. Mutating; gated by RE_MCP_ALLOW_MUTATION / RE_MCP_ALLOWED_TOOLS."
+           (obj "type" "object"
+                "properties" (obj "dispatch_id" (obj "type" "string")
+                                  "dispatchId" (obj "type" "string")
+                                  "sourceMappingId" (obj "type" "string")
+                                  "model" (obj "type" "string"))
+                "required" (arr "dispatch_id"))
+           (lambda (args)
+             (let ((tool-name "integrations.dispatch_ollama"))
+               (if (mcp-mutating-tool-allowed-p tool-name)
+                   (progn
+                     (when (jstring args "dispatch_id" nil)
+                       (setf (jget args "dispatchId") (jstring args "dispatch_id")))
+                     (mcp-cons-json-text
+                      (actor-ask actor (lambda (s) (dispatch-ollama s args)))))
+                   (mcp-disabled-by-policy tool-name)))))
 
      ;; trigger.replay — re-emit a dispatch record's envelope
      (tool "trigger.replay"

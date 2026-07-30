@@ -800,7 +800,93 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                     "unknown explicit completion sourceMappingId should return 404")
       (assert-equal "Unknown sourceMappingId \"missing-completion-mapping\""
                     (reality-engine-lsp::jstring (cdr missing) "error" "")
-                    "unknown completion mapping should match CPP/AI error text")))
+                    "unknown completion mapping should match CPP/AI error text"))
+    (let* ((mapping (reality-engine-lsp::source-mapping-by-id state "agent-completion-risk"))
+           (values (reality-engine-lsp::completion-values-from-content
+                    "{\"completed\":1,\"failed\":0,\"confidence\":0.75,\"actionClass\":0}"
+                    mapping)))
+      (assert-equal '(1.0d0 0.0d0 0.75d0 0.0d0)
+                    (coerce values 'list)
+                    "provider completion extraction should follow sourceMappingId pointers")
+      (assert-error
+       (lambda ()
+         (reality-engine-lsp::completion-values-from-content
+          "{\"completed\":1,\"failed\":0,\"confidence\":0.75}"
+          mapping))
+       "provider completion extraction should reject missing required mapping pointers")))
+  (let* ((state (reality-engine-lsp::make-perception-state-from-config
+                 :dimension 5000
+                 :reality-url "http://localhost:3299"
+                 :localai-url "http://localhost:8000"
+                 :localai-machine-dir "../localAIStack/data/machines"))
+         (actor (reality-engine-lsp::state-actor "mcp-provider-test" state)))
+    (unwind-protect
+         (let* ((tools (reality-engine-lsp::mcp-build-tools actor "http://localhost:3299"))
+                (names (mapcar (lambda (tool) (getf tool :name)) tools))
+                (list-response (reality-engine-lsp::mcp-dispatch
+                                (reality-engine-lsp::obj "method" "tools/list" "id" 1)
+                                actor
+                                tools))
+                (wire-names (mapcar (lambda (tool)
+                                      (reality-engine-lsp::jstring tool "name" ""))
+                                    (reality-engine-lsp::jarray-list
+                                     (reality-engine-lsp::jget
+                                      (reality-engine-lsp::jget list-response "result")
+                                      "tools"))))
+                (completion-tool (find "integrations.completion" tools
+                                       :key (lambda (tool) (getf tool :name))
+                                       :test #'string=))
+                (post-completion-tool (find "integrations.post_completion" tools
+                                            :key (lambda (tool) (getf tool :name))
+                                            :test #'string=))
+                (provider-tool (find "integrations.dispatch_provider" tools
+                                     :key (lambda (tool) (getf tool :name))
+                                     :test #'string=))
+                (openai-tool (find "integrations.dispatch_openai" tools
+                                   :key (lambda (tool) (getf tool :name))
+                                   :test #'string=))
+                (ollama-tool (find "integrations.dispatch_ollama" tools
+                                   :key (lambda (tool) (getf tool :name))
+                                   :test #'string=)))
+           (dolist (name '("integrations.completion"
+                           "integrations.post_completion"
+                           "integrations.dispatch_provider"
+                           "integrations.dispatch_openai"
+                           "integrations.dispatch_ollama"))
+             (assert-true (find name names :test #'string=)
+                          (format nil "LSP MCP should expose ~a" name)))
+           (assert-true (find "integrations.dispatch_openai" wire-names :test #'string=)
+                        "MCP tools/list should publish provider dispatcher tools")
+           (assert-true post-completion-tool
+                        "LSP MCP should expose the post_completion alias")
+           (assert-true provider-tool
+                        "LSP MCP should expose the generic provider dispatcher")
+           (assert-true ollama-tool
+                        "LSP MCP should expose the Ollama dispatcher")
+           (let ((denied (funcall (getf openai-tool :fn)
+                                  (reality-engine-lsp::obj "dispatch_id" "d-1"))))
+             (assert-true (reality-engine-lsp::jbool denied "isError" nil)
+                          "mutating provider MCP tools should fail closed by default"))
+           (let* ((allowed (let ((reality-engine-lsp::*mcp-allow-mutation-override* t))
+                             (funcall (getf completion-tool :fn)
+                                      (reality-engine-lsp::obj
+                                       "provider" "mcp-test"
+                                       "agent" "mcp-test"
+                                       "sourceMappingId" "agent-completion-risk"
+                                       "values" (reality-engine-lsp::vectorize (list 1 0 0.5 0))))))
+                  (text (reality-engine-lsp::jstring
+                         (aref (reality-engine-lsp::jget allowed "content") 0)
+                         "text"
+                         ""))
+                  (payload (reality-engine-lsp::parse-json text))
+                  (source (reality-engine-lsp::jget (reality-engine-lsp::jget payload "signal") "source")))
+             (assert-equal nil
+                           (reality-engine-lsp::jget allowed "isError")
+                           "policy-enabled completion MCP call should not be marked as error")
+             (assert-equal "agent.mcp-test.completion"
+                           (reality-engine-lsp::jstring source "sensorId" "")
+                           "policy-enabled MCP completion should commit through source mappings")))
+      (reality-engine-lsp::stop-actor actor)))
   ;; ── HealthKit Spezi bridge — canonical contract ──────────────────────────
   ;; Mirrors CPP e2e_healthkit_spezi.sh: token auth rejection, resolved shape
   ;; with region + source.lastValue for all three Spezi sensor types.
