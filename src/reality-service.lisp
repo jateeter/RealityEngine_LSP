@@ -48,7 +48,10 @@ domain subdirectories load by filename (corpus filenames are unique)."
   (when (search ".." name)
     (error "Invalid machine name: ~a" name))
   (let* ((dir (uiop:ensure-directory-pathname machine-dir))
-         (filename (if (uiop:string-suffix-p ".json" name) name (format nil "~a.json" name)))
+         (filename (if (and (>= (length name) 5)
+                            (string= ".json" name :start2 (- (length name) 5)))
+                       name
+                       (format nil "~a.json" name)))
          (flat (merge-pathnames filename dir)))
     (if (probe-file flat)
         flat
