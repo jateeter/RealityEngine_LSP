@@ -219,7 +219,7 @@
                    :match-algorithm (comparator-name (jstring root "matchAlgorithm" "gte"))
                    :arbiter-rule (arbiter-name (jstring root "arbiterRule" "passthrough"))
                    :sequences nil)))
-    (when (jarray-p (jget root "inputSequences"))
+    (when (jarray-present-p root "inputSequences")
       (setf (jget metadata "inputSequences") (jget root "inputSequences")))
     (dolist (sequence-json (jarray-list (or (jget root "sequences") (arr))))
       (let ((sequence (parse-sequence sequence-json)))
