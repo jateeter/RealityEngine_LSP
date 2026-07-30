@@ -721,7 +721,7 @@ Wire-compatible with CPP build_trigger_envelope and TS buildTriggerEnvelope."
                     "outputIndex" (or (jnumber op "outputIndex" nil) 0)
                     "stepNumber" 0
                     "perceptualMapping" (obj "output" (or (jget op "region") +json-null+))
-                    "provenance" (if (jarray-p (jget op "provenance"))
+                    "provenance" (if (jarray-present-p op "provenance")
                                      (jget op "provenance") (arr))
                     "deprecation" (or (jget op "deprecation") +json-null+))
          "outputVector" (obj "values" values
@@ -852,10 +852,10 @@ dispatch_triggers and TS Dispatcher.onStep: drop ops without governance
 
 (defun response-values-from-content-json (content-json)
   (cond
-    ((jarray-p (jget content-json "values"))
+    ((jarray-present-p content-json "values")
      (validate-completion-values-array (jget content-json "values")))
     ((and (jobject-p (jget content-json "completion"))
-          (jarray-p (jget (jget content-json "completion") "values")))
+          (jarray-present-p (jget content-json "completion") "values"))
      (validate-completion-values-array (jget (jget content-json "completion") "values")))
     (t nil)))
 
@@ -876,7 +876,7 @@ dispatch_triggers and TS Dispatcher.onStep: drop ops without governance
     (if (and (jobject-p extract)
              (string= (jstring extract "type" "") "json"))
         (cond
-          ((jarray-p (jget extract "pointers"))
+          ((jarray-present-p extract "pointers")
            (vectorize
             (mapcar (lambda (pointer)
                       (let ((node (mqtt-navigate-pointer content-json pointer)))
@@ -949,7 +949,7 @@ dispatch_triggers and TS Dispatcher.onStep: drop ops without governance
 (defun completion-schema-for-mapping (mapping)
   (let* ((extract (and mapping (jget mapping "extract")))
          (pointers (cond
-                     ((and (jobject-p extract) (jarray-p (jget extract "pointers")))
+                     ((and (jobject-p extract) (jarray-present-p extract "pointers"))
                       (jarray-list (jget extract "pointers")))
                      ((and (jobject-p extract) (jstring extract "pointer" nil))
                       (list (jstring extract "pointer")))
@@ -1132,7 +1132,7 @@ Callers accumulate results into resolved/unmapped lists."
          (source-name (jstring body "sourceName" nil))
          (raw-value   (jnumber body "value" nil))
          (values      (cond
-                        ((jarray-p (jget body "values")) (numbers-from-json (jget body "values")))
+                        ((jarray-present-p body "values") (numbers-from-json (jget body "values")))
                         (raw-value                       (list (coerce raw-value 'double-float)))
                         (t                               nil))))
     (when (string= type "")
@@ -1285,8 +1285,7 @@ it is accepted as an alternative to the body bridgeToken/token fields."
   (let ((results nil)
         (all-ok t)
         (reserved-keys '("samples" "bridgeToken" "token")))
-    (if (and (not (eq (jget body "samples" :missing) :missing))
-             (jarray-p (jget body "samples")))
+    (if (jarray-present-p body "samples")
         (dolist (sample (jarray-list (jget body "samples")))
           ;; Merge top-level fields into sample (sample keys win); strip reserved keys.
           (let ((merged (make-hash-table :test #'equal)))

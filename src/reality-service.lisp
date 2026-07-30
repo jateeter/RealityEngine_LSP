@@ -621,10 +621,13 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
           (emit "re_runtime_mapping_version" base (reality-state-mapping-version state)))))))
 
 (defun assemble-input-vector (state body)
+  ;; Each branch must test key *presence*, not `jarray-p' of a possibly-absent
+  ;; value — see `jarray-present-p'.  With plain `jarray-p' the "vector" branch
+  ;; matched every request and the sparse/domain forms were unreachable.
   (cond
-    ((jarray-p (jget body "vector"))
+    ((jarray-present-p body "vector")
      (numbers-from-json (jget body "vector")))
-    ((jarray-p (jget body "sparseVector"))
+    ((jarray-present-p body "sparseVector")
      (let ((length (reality-state-dimension state)))
        (dolist (entry (jarray-list (jget body "sparseVector")))
          (setf length (max length (1+ (truncate (jnumber entry "index" 0))))))
@@ -633,7 +636,7 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
            (setf (nth (truncate (jnumber entry "index" 0)) values)
                  (or (jnumber entry "value" 0.0d0) 0.0d0)))
          values)))
-    ((jarray-p (jget body "domainVectors"))
+    ((jarray-present-p body "domainVectors")
      (let ((length (reality-state-dimension state)))
        (dolist (entry (jarray-list (jget body "domainVectors")))
          (let ((offset (truncate (jnumber entry "offset" 0)))
@@ -1006,7 +1009,7 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
 (defun semantic-bus-registry-json (state)
   (let* ((path (semantic-bus-registry-path (reality-state-machine-dir state)))
          (registry (parse-json (safe-read-file path))))
-    (unless (jarray-p (jget registry "semanticBuses"))
+    (unless (jarray-present-p registry "semanticBuses")
       (error "invalid registry shape at ~a" path))
     registry))
 

@@ -37,6 +37,18 @@
 (defun jarray-p (value)
   (or (vectorp value) (and (listp value) (not (hash-table-p* value)))))
 
+(defun jarray-present-p (object key)
+  "True when OBJECT has KEY and its value is an array.
+
+`jarray-p' alone must never be used to test an optional key: a missing key
+yields NIL, and NIL satisfies `listp', so `(jarray-p (jget body \"k\"))' is
+true for every object.  In a `cond' that makes the first such branch shadow
+every later one.  parse-json binds yason:*parse-json-arrays-as-vectors*, so a
+present-but-empty array is #() — non-NIL and therefore still matched here,
+while an absent key is not."
+  (let ((value (jget object key)))
+    (and value (jarray-p value))))
+
 (defun jarray-list (value)
   (cond
     ((vectorp value) (coerce value 'list))

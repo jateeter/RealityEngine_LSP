@@ -1417,5 +1417,49 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
            (assert-equal '(0 0 0 0 0 0 0 0 0 0 0 1) (reality-engine-lsp::numbers-from-json (reality-engine-lsp::jget m055 "values")) "stable path: values != FACILITY_STABLE one-hot")
            (assert-equal "GREEN" (reality-engine-lsp::jstring (reality-engine-lsp::jget m055 "governance") "ragStatusCode" "") "stable path: rag != GREEN"))))))
 
+  ;; ── /api/perceive input forms (regression for the jarray-p / missing-key
+  ;; trap: a missing key is NIL, NIL is a list, so `jarray-p' matched every
+  ;; optional array key and the first cond branch shadowed the rest) ────────
+  (let ((state (make-test-state 16)))
+    (assert-true (not (reality-engine-lsp::jarray-present-p
+                       (reality-engine-lsp::obj) "vector"))
+                 "jarray-present-p: absent key must not count as an array")
+    (assert-true (reality-engine-lsp::jarray-present-p
+                  (reality-engine-lsp::obj "vector" (reality-engine-lsp::vectorize '()))
+                  "vector")
+                 "jarray-present-p: present-but-empty array must count")
+
+    ;; Dense form.
+    (assert-equal '(1.0d0 2.0d0)
+                  (reality-engine-lsp::assemble-input-vector
+                   state (reality-engine-lsp::obj
+                          "vector" (reality-engine-lsp::vectorize '(1.0d0 2.0d0))))
+                  "assemble-input-vector: dense vector form")
+
+    ;; Sparse form — previously unreachable; index 3 must land in slot 3.
+    (let ((sparse (reality-engine-lsp::assemble-input-vector
+                   state (reality-engine-lsp::obj
+                          "sparseVector" (reality-engine-lsp::vectorize
+                                          (list (reality-engine-lsp::obj "index" 3 "value" 7.0d0)))))))
+      (assert-true sparse "assemble-input-vector: sparseVector returned nil")
+      (assert-equal 7.0d0 (nth 3 sparse) "assemble-input-vector: sparseVector index 3")
+      (assert-equal 0.0d0 (nth 0 sparse) "assemble-input-vector: sparseVector pads with zeros"))
+
+    ;; Domain form — previously unreachable.
+    (let ((domain (reality-engine-lsp::assemble-input-vector
+                   state (reality-engine-lsp::obj
+                          "domainVectors" (reality-engine-lsp::vectorize
+                                           (list (reality-engine-lsp::obj
+                                                  "offset" 2
+                                                  "values" (reality-engine-lsp::vectorize '(5.0d0 6.0d0)))))))))
+      (assert-true domain "assemble-input-vector: domainVectors returned nil")
+      (assert-equal 5.0d0 (nth 2 domain) "assemble-input-vector: domainVectors offset 2")
+      (assert-equal 6.0d0 (nth 3 domain) "assemble-input-vector: domainVectors offset 3"))
+
+    ;; No recognised input key at all still yields nil so the route 400s.
+    (assert-true (null (reality-engine-lsp::assemble-input-vector
+                        state (reality-engine-lsp::obj "unrelated" 1)))
+                 "assemble-input-vector: unknown body must yield nil"))
+
   (format t "~&RealityEngine_LSP core tests passed.~%")
   t)
