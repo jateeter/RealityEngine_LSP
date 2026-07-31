@@ -1,5 +1,119 @@
 (in-package #:reality-engine-lsp)
 
+;; ── Semantic guardrail metrics (docs/PE_METRICS_CONTRACT.md) ───────────────
+;; The semantic_* block must stay byte-identical across PE runtimes after
+;; normalizing the runtime label, so the writer below is deliberately literal:
+;; fixed HELP strings, labels sorted by key, integer values, label values
+;; sorted ascending. Counters are monotonic for the process lifetime and
+;; bumped where records are created, so ring-buffer eviction loses no count.
+
+(defparameter +metrics-runtime+ "lsp")
+(defvar *semantic-events* (make-hash-table :test #'equal))
+(defvar *semantic-events-joined* (make-hash-table :test #'equal))
+(defvar *semantic-escalations* (make-hash-table :test #'equal))
+(defvar *semantic-dispatch-total* 0)
+(defvar *semantic-dispatch-joined* 0)
+(defvar *semantic-audit-records* 0)
+(defvar *semantics-bases-cache* nil)   ; (mtime . hash-table)
+
+(defun semantics-manifest-file ()
+  "Resolve the corpus semantics manifest the same way the RE does."
+  (let ((explicit (env "SEMANTICS_MANIFEST" nil)))
+    (when (and explicit (> (length explicit) 0) (probe-file explicit))
+      (return-from semantics-manifest-file explicit)))
+  (let ((cursor (uiop:ensure-directory-pathname
+                 (env "MACHINES_DIR" "../RealityEngine_Machines/machines"))))
+    (loop repeat 6
+          while cursor
+          for candidate = (merge-pathnames "semantics/abox-manifest.json" cursor)
+          when (probe-file candidate)
+            do (return (namestring candidate))
+          do (let ((parent (uiop:pathname-parent-directory-pathname cursor)))
+               (setf cursor (and parent (not (equal parent cursor)) parent)))
+          finally (return nil))))
+
+(defun semantics-manifest-bases ()
+  "Machine name -> ABox base IRI, cached on the manifest's write date."
+  (let ((path (semantics-manifest-file)))
+    (if (null path)
+        (make-hash-table :test #'equal)
+        (let ((stamp (ignore-errors (file-write-date path))))
+          (if (and *semantics-bases-cache* (eql (car *semantics-bases-cache*) stamp))
+              (cdr *semantics-bases-cache*)
+              (let ((bases (make-hash-table :test #'equal)))
+                (ignore-errors
+                 (let ((manifest (parse-json (safe-read-file path))))
+                   (maphash (lambda (key entry)
+                              (declare (ignore key))
+                              (let ((name (jstring entry "name" nil))
+                                    (iri (jstring entry "iri" nil)))
+                                (when (and name iri)
+                                  (let ((hash (position #\# iri)))
+                                    (when hash
+                                      (setf (gethash name bases) (subseq iri 0 hash)))))))
+                            (jget manifest "machines"))))
+                (setf *semantics-bases-cache* (cons stamp bases))
+                bases))))))
+
+(defun record-perception-event (integration joined)
+  (incf (gethash integration *semantic-events* 0))
+  (incf (gethash integration *semantic-events-joined* 0) (if joined 1 0))
+  (setf *semantic-audit-records* (min 1000 (1+ *semantic-audit-records*))))
+
+(defun metric-line (name help kind labels value)
+  "One HELP/TYPE/sample triple. LABELS is an alist; runtime is appended and
+the whole set sorted by key, per the contract."
+  (let ((all (sort (append labels (list (cons "runtime" +metrics-runtime+)))
+                   #'string< :key #'car)))
+    (format nil "# HELP ~a ~a~%# TYPE ~a ~a~%~a{~{~a~^,~}} ~d~%"
+            name help name kind name
+            (mapcar (lambda (kv) (format nil "~a=\"~a\"" (car kv) (cdr kv))) all)
+            value)))
+
+(defun sorted-keys (table)
+  (let (keys) (maphash (lambda (k v) (declare (ignore v)) (push k keys)) table)
+       (sort keys #'string<)))
+
+(defun semantic-metrics-text (sources global-step vector-size last-push-ms)
+  (let ((bases (semantics-manifest-bases))
+        (out (make-string-output-stream)))
+    (write-string (metric-line "perception_engine_sources_total"
+                               "Total sensor/test/simulated sources registered." "gauge" nil sources) out)
+    (write-string (metric-line "perception_engine_global_step"
+                               "Engine globalStep counter (push count since start)." "gauge" nil global-step) out)
+    (write-string (metric-line "perception_engine_vector_size"
+                               "Configured vector dimension." "gauge" nil vector-size) out)
+    (write-string (metric-line "perception_engine_last_push_ms"
+                               "Wall-clock timestamp of the last successful push (0 if never)." "gauge" nil last-push-ms) out)
+    (write-string (metric-line "semantic_manifest_available"
+                               "Corpus OWL semantics manifest resolved (1/0)." "gauge" nil
+                               (if (> (hash-table-count bases) 0) 1 0)) out)
+    (write-string (metric-line "semantic_manifest_machines"
+                               "Machines carrying a semantic identity in the manifest." "gauge" nil
+                               (hash-table-count bases)) out)
+    (write-string (metric-line "semantic_audit_buffer_records"
+                               "re:PerceptionEvent records held in the audit ring buffer." "gauge" nil
+                               *semantic-audit-records*) out)
+    (dolist (k (sorted-keys *semantic-events*))
+      (write-string (metric-line "semantic_perception_events_total"
+                                 "re:PerceptionEvent records emitted, by originating integration." "counter"
+                                 (list (cons "integration" k)) (gethash k *semantic-events* 0)) out))
+    (dolist (k (sorted-keys *semantic-events-joined*))
+      (write-string (metric-line "semantic_perception_events_iri_joined_total"
+                                 "Perception events whose machine resolved to a corpus ABox IRI." "counter"
+                                 (list (cons "integration" k)) (gethash k *semantic-events-joined* 0)) out))
+    (write-string (metric-line "semantic_dispatch_records_total"
+                               "Dispatch records created with a semantics link." "counter" nil
+                               *semantic-dispatch-total*) out)
+    (write-string (metric-line "semantic_dispatch_records_iri_joined_total"
+                               "Dispatch records whose machine resolved to a corpus ABox IRI." "counter" nil
+                               *semantic-dispatch-joined*) out)
+    (dolist (k (sorted-keys *semantic-escalations*))
+      (write-string (metric-line "semantic_escalation_dispatches_total"
+                                 "Escalation-class actions dispatched, by RAG status of the determination." "counter"
+                                 (list (cons "rag" k)) (gethash k *semantic-escalations* 0)) out))
+    (get-output-stream-string out)))
+
 (defstruct perception-state
   engine reality-url localai-url localai-machine-dir push-records started-at
   integrations-config-path integrations-loaded-p integrations-load-error integrations source-mappings
@@ -1626,6 +1740,20 @@ it is accepted as an alternative to the body bridgeToken/token fields."
           (when (>= (length next-ps) (perception-engine-dimension engine))
             (update-from-perceptual-space engine next-ps))
           (incf (perception-engine-global-step engine))
+          ;; Semantic audit (SEMANTIC_AUDIT_CONTRACT.md): one re:PerceptionEvent
+          ;; per active source region written this push, attributed to the
+          ;; integration feeding it and joined to the corpus ABox when the
+          ;; source names a machine.
+          (let ((bases (semantics-manifest-bases)))
+            (maphash (lambda (id source)
+                       (declare (ignore id))
+                       (when (source-active-p source)
+                         (record-perception-event
+                          (or (source-origin source) (source-kind source) "unattributed")
+                          (and (source-machine-name source)
+                               (gethash (source-machine-name source) bases)
+                               t))))
+                     (perception-engine-sources engine)))
           (record-dispatch-envelopes-from-step state step)
           (setf (perception-engine-last-push engine) step)
           (let ((result (obj "success" t
@@ -1677,6 +1805,18 @@ it is accepted as an alternative to the body bridgeToken/token fields."
                                     (declare (ignore _ body query))
                                     (json-response (actor-ask actor (lambda (state)
                                                                       (perception-state-json (perception-state-engine state)))))))
+   ;; Prometheus exposition — docs/PE_METRICS_CONTRACT.md.
+   (make-route "GET" "/api/metrics" (lambda (_ body query)
+                                      (declare (ignore _ body query))
+                                      (text-response
+                                       (actor-ask actor
+                                                  (lambda (state)
+                                                    (let ((engine (perception-state-engine state)))
+                                                      (semantic-metrics-text
+                                                       (hash-table-count (perception-engine-sources engine))
+                                                       (or (perception-engine-global-step engine) 0)
+                                                       (or (perception-engine-dimension engine) 0)
+                                                       0)))))))
    (make-route "GET" "/api/integrations/status" (lambda (_ body query)
                                                   (declare (ignore _ body query))
                                                   (json-response (actor-ask actor #'integrations-status-json))))
