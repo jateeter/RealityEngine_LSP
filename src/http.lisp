@@ -58,6 +58,20 @@ Must be called on the request thread — the hunchentoot context is dynamic."
     ((listp routes) (mapcan #'flatten-routes routes))
     (t nil)))
 
+;; CORS — byte-identical to the Scala and C++ engines so a single Swagger UI
+;; origin can execute against any runtime.  Without these, Swagger served from
+;; http://127.0.0.1:8088 could not call LSP endpoints at all: normal responses
+;; carried no Access-Control-Allow-Origin and OPTIONS preflight 404'd.
+(defparameter +cors-allow-origin+ "*")
+(defparameter +cors-allow-methods+ "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+(defparameter +cors-allow-headers+ "Content-Type, Accept, Authorization")
+
+(defun set-cors-headers ()
+  "Stamp CORS headers on the current response. Must run on the request thread."
+  (setf (hunchentoot:header-out :access-control-allow-origin) +cors-allow-origin+
+        (hunchentoot:header-out :access-control-allow-methods) +cors-allow-methods+
+        (hunchentoot:header-out :access-control-allow-headers) +cors-allow-headers+))
+
 (defun dispatch-route (routes)
   (let* ((method (string-upcase (symbol-name (hunchentoot:request-method*))))
          (path (hunchentoot:script-name*))
@@ -65,13 +79,24 @@ Must be called on the request thread — the hunchentoot context is dynamic."
                            (and (string= method (route-method route))
                                 (match-pattern (route-pattern route) path)))
                          routes)))
-    (if route
-        (let ((params (match-pattern (route-pattern route) path)))
-          (handler-case
-              (funcall (route-handler route) params (request-body-json) (query-params))
-            (error (condition)
-              (error-response (princ-to-string condition) 500))))
-        (error-response (format nil "No route for ~a ~a" method path) 404))))
+    ;; Every response carries CORS headers, including errors — a 404 without
+    ;; them surfaces in the browser as an opaque CORS failure rather than the
+    ;; 404 it actually is.
+    (set-cors-headers)
+    (cond
+      ;; Preflight is answered for any path, matching the other runtimes:
+      ;; the browser asks before it knows whether the route exists.
+      ((string= method "OPTIONS")
+       (setf (hunchentoot:return-code*) 204)
+       (setf (hunchentoot:content-type*) nil)
+       "")
+      (route
+       (let ((params (match-pattern (route-pattern route) path)))
+         (handler-case
+             (funcall (route-handler route) params (request-body-json) (query-params))
+           (error (condition)
+             (error-response (princ-to-string condition) 500)))))
+      (t (error-response (format nil "No route for ~a ~a" method path) 404)))))
 
 (defun make-route (method pattern handler &rest grouped-routes)
   (let ((route (%make-route :method (string-upcase method) :pattern pattern :handler handler)))
