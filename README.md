@@ -24,6 +24,24 @@ The active machine and RE/PE operations contract is described in
 - SBCL
 - Quicklisp
 
+`quicklisp/` is **not tracked** in this repository, so a fresh checkout — a CI
+runner, a new laptop, a container — has none, and `start.sh` exits with
+"Missing Quicklisp." Bootstrap it once:
+
+```bash
+sudo apt-get install -y sbcl     # or: brew install sbcl
+scripts/bootstrap-quicklisp.sh
+```
+
+That installs Quicklisp into the repo-local `quicklisp/` (where `start.sh` and
+`make deps-check` look first) and pulls the ASDF dependencies, so the first
+engine start does not pay for the download. It is idempotent — re-running
+verifies and reuses an existing install. `--home` installs to `$HOME/quicklisp`
+instead, `--force` reinstalls, `--no-warm` skips the dependency prefetch.
+
+On a clean checkout the whole bootstrap takes well under a minute; both engines
+then start normally.
+
 The ASDF system depends on:
 
 - `alexandria`
