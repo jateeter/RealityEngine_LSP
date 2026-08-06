@@ -1125,7 +1125,9 @@ IRIs joined from the corpus semantics manifest."
 
 (defun machine-graph-json (state)
   (let (nodes edges)
-    (dolist (machine (reverse (machines-in-canonical-order (reality-state-machines state))))
+    ;; nodes are collected with push and the function ends with (nreverse
+    ;; nodes), so iterate in canonical order — reversing here too would undo it.
+    (dolist (machine (machines-in-canonical-order (reality-state-machines state)))
       (let ((id (machine-id machine)))
        (push (obj "id" id
                   "name" (machine-name machine)
@@ -1144,7 +1146,8 @@ IRIs joined from the corpus semantics manifest."
     ;; Canonical order here too — edges are pushed, so iterate reversed to end
     ;; up ordered, and the (source, target) pair order becomes deterministic
     ;; across runtimes rather than following hash iteration.
-    (let ((machine-list (reverse (machines-in-canonical-order (reality-state-machines state)))))
+    ;; Same here — edges are pushed and nreversed at the end.
+    (let ((machine-list (machines-in-canonical-order (reality-state-machines state))))
       (dolist (source machine-list)
         (when (machine-mapping source)
           (dolist (target machine-list)
