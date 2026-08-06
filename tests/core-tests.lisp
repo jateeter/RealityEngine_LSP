@@ -1461,5 +1461,31 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                         state (reality-engine-lsp::obj "unrelated" 1)))
                  "assemble-input-vector: unknown body must yield nil"))
 
+  ;; JSON false must survive a round trip as false, not collapse to null.
+  ;;
+  ;; yason maps both `false' and `null' to NIL unless booleans are parsed as
+  ;; symbols, and write-json renders NIL as `null'.  Every boolean false on the
+  ;; LSP surface therefore came back as null and disagreed with C++ and Scala —
+  ;; the cross-runtime byte-equivalence drift in RealityEngine_CI#91.
+  (let* ((source "{\"a\":false,\"b\":true,\"c\":null,\"d\":[false,true,null],\"e\":{\"f\":false},\"s\":\"false\"}")
+         (round-trip (with-output-to-string (stream)
+                       (reality-engine-lsp::write-json
+                        (reality-engine-lsp::parse-json source) stream))))
+    (assert-equal source round-trip
+                  "parse-json/write-json must round-trip false, true and null exactly")
+
+    (let ((parsed (reality-engine-lsp::parse-json source)))
+      ;; false and null must remain distinguishable after parsing.
+      (assert-true (eq (reality-engine-lsp::jget parsed "a")
+                       reality-engine-lsp::+json-false+)
+                   "parsed false must be +json-false+, not NIL")
+      (assert-true (null (reality-engine-lsp::jget parsed "c"))
+                   "parsed null must be NIL")
+      (assert-true (eq (reality-engine-lsp::jget parsed "b") t)
+                   "parsed true must be T")
+      ;; jbool reads the marker as false rather than as a truthy symbol.
+      (assert-true (null (reality-engine-lsp::jbool parsed "a" t))
+                   "jbool must read +json-false+ as false")))
+
   (format t "~&RealityEngine_LSP core tests passed.~%")
   t)

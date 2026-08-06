@@ -71,12 +71,38 @@ while an absent key is not."
       ((null value) nil)
       (t value))))
 
+(defun normalize-json-booleans (value)
+  "Fold YASON:TRUE / YASON:FALSE into this module's vocabulary — T and
++json-false+ — so write-json round-trips them and jbool reads them.
+
+Without *parse-json-booleans-as-symbols* yason maps JSON `false` and JSON
+`null` both to NIL, and write-json renders NIL as `null`.  A corpus `false`
+therefore came back out as `null`: every boolean false on the LSP surface was
+indistinguishable from a missing value, and differed from C++ and Scala.
+
+Arrays parse as vectors here, so NIL is unambiguously JSON null afterwards.
+Strings are vectors too and must not be walked."
+  (typecase value
+    (hash-table
+     (maphash (lambda (k v) (setf (gethash k value) (normalize-json-booleans v))) value)
+     value)
+    (string value)
+    (vector
+     (dotimes (i (length value) value)
+       (setf (aref value i) (normalize-json-booleans (aref value i)))))
+    (t
+     (cond ((eq value 'yason:true) t)
+           ((eq value 'yason:false) +json-false+)
+           (t value)))))
+
 (defun parse-json (text)
   (let ((yason:*parse-object-as* :hash-table)
-        (yason:*parse-json-arrays-as-vectors* t))
+        (yason:*parse-json-arrays-as-vectors* t)
+        ;; Keep false distinguishable from null; normalized immediately below.
+        (yason:*parse-json-booleans-as-symbols* t))
     (if (or (null text) (string= text ""))
         (obj)
-        (yason:parse text))))
+        (normalize-json-booleans (yason:parse text)))))
 
 (defun json-escape (string stream)
   (loop for ch across string
