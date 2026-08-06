@@ -13,6 +13,18 @@
   dimension sources match-algorithm last-push auto-running-p auto-interval-ms
   persistent-vector global-step)
 
+(defun make-perceptual-buffer (dimension)
+  "Adjustable double-float buffer of DIMENSION zeros.
+
+Deliberately an array rather than a list.  The perceptual space grows to
+cover machines whose perceptualMapping extends past the configured default —
+14384 for the current deployment corpus — and the previous list
+representation indexed with NTH made assembly O(n^2): a full-dimension list
+per source, each element written by walking the list from the head."
+  (make-array (max 0 dimension) :element-type 'double-float
+                                :initial-element 0.0d0
+                                :adjustable t))
+
 (defun make-perception-engine-state (dimension)
   (make-perception-engine :dimension dimension
                           :sources (make-hash-table :test #'equal)
@@ -20,8 +32,32 @@
                           :last-push nil
                           :auto-running-p nil
                           :auto-interval-ms 1000
-                          :persistent-vector (make-list dimension :initial-element 0.0d0)
+                          :persistent-vector (make-perceptual-buffer dimension)
                           :global-step 0))
+
+(defun ensure-perception-dimension (engine required-end &optional context)
+  "Grow the perceptual space so [0, REQUIRED-END) is addressable.
+
+The RE grows its space to fit every loaded machine's mapping, so the PE must
+too — otherwise a source whose region starts past the dimension is stored,
+counted and returned by /api/pe/sources, then silently dropped at assembly
+and its machine never receives input."
+  (let ((current (or (perception-engine-dimension engine) 0)))
+    (when (> required-end current)
+      (let ((pv (perception-engine-persistent-vector engine)))
+        (setf (perception-engine-persistent-vector engine)
+              (if (and pv (adjustable-array-p pv))
+                  (adjust-array pv required-end :initial-element 0.0d0)
+                  (let ((grown (make-perceptual-buffer required-end)))
+                    (when pv
+                      (loop for i from 0 below (min (length pv) required-end)
+                            do (setf (aref grown i) (elt pv i))))
+                    grown))))
+      (setf (perception-engine-dimension engine) required-end)
+      (format *error-output*
+              "~&[PerceptionEngine] perceptionDimension grew ~a -> ~a~@[ for ~a~]~%"
+              current required-end context)))
+  (perception-engine-dimension engine))
 
 (defun sensor-stale-p (source &optional (now (now-ms)))
   "Return true when a sensor source's last-updated timestamp is older than
@@ -108,16 +144,33 @@ machines downstream don't keep reading a value that was supposed to expire."
 (defun ensure-source-id (engine source)
   (unless (source-id source)
     (setf (source-id source) (make-id "source")))
+  ;; Grow to cover the source's region before registering it, so a machine
+  ;; whose perceptualMapping.input starts past the configured dimension still
+  ;; receives input on every push.
+  (let ((region (source-region source)))
+    (when region
+      (ensure-perception-dimension
+       engine
+       (+ (region-offset region) (region-length region))
+       (format nil "source '~a' region [~a,~a)"
+               (or (source-name source) (source-id source))
+               (region-offset region)
+               (+ (region-offset region) (region-length region))))))
   (setf (gethash (source-id source) (perception-engine-sources engine)) source)
   source)
 
 (defun sample-source (source dimension)
-  (let ((values (make-list dimension :initial-element 0.0d0)))
-    (when (source-active-p source)
-      (let* ((region (source-region source))
-             (offset (region-offset region))
-             (length (region-length region))
-             (payload
+  "Return (values PAYLOAD OFFSET LENGTH) for SOURCE, or NIL when inactive.
+
+Previously returned a freshly allocated DIMENSION-length list with the
+payload written at OFFSET, which cost O(dimension) allocation and O(n^2)
+writes per source.  Callers now place the payload themselves."
+  (declare (ignorable dimension))
+  (when (source-active-p source)
+    (let* ((region (source-region source))
+           (offset (region-offset region))
+           (length (region-length region))
+           (payload
                (cond
                  ((string= (source-kind source) "test")
                   (let ((inputs (source-inputs source)))
@@ -139,33 +192,50 @@ machines downstream don't keep reading a value that was supposed to expire."
                     (source-last-value source)))
                  (t
                   (make-list length :initial-element (or (source-dc-offset source) 0.0d0))))))
-        (loop for value in (or payload nil)
-              for i from offset
-              repeat length
-              when (< i dimension)
-                do (setf (nth i values) value))))
-    values))
+      (when payload
+        (values payload offset length)))))
 
 (defun update-from-perceptual-space (engine ps)
+  "Adopt the RE's post-merge perceptual space.
+
+The RE grows to fit every loaded machine's mapping, so PS may be longer than
+our dimension — grow to match rather than truncating to it."
+  (ensure-perception-dimension engine (length ps)
+                               "perceptual space returned by the Reality Engine")
   (let ((pv (perception-engine-persistent-vector engine))
         (dim (perception-engine-dimension engine)))
     (loop for i from 0 below dim do
-      (setf (nth i pv) (coerce (or (nth i ps) 0) 'double-float)))))
+      (setf (aref pv i) (coerce (or (elt ps i) 0) 'double-float)))))
 
 (defun assemble-perception-vector (engine)
   (let* ((dimension (perception-engine-dimension engine))
-         (assembled (copy-list (or (perception-engine-persistent-vector engine)
-                                   (make-list dimension :initial-element 0.0d0)))))
+         (pv (perception-engine-persistent-vector engine))
+         (assembled (make-array dimension :element-type 'double-float
+                                          :initial-element 0.0d0)))
+    (when pv
+      (loop for i from 0 below (min dimension (length pv))
+            do (setf (aref assembled i) (elt pv i))))
     (maphash
      (lambda (_ source)
        (declare (ignore _))
-       (let ((sample (sample-source source dimension)))
-         (loop for value in sample
-               for i from 0
-               when (not (zerop value))
-                 do (setf (nth i assembled) value))))
+       (multiple-value-bind (payload offset length) (sample-source source dimension)
+         (when payload
+           ;; Growth should make this unreachable; if a region still does not
+           ;; fit, say which machine lost its input rather than dropping it
+           ;; silently.
+           (when (> (+ offset length) dimension)
+             (format *error-output*
+                     "~&[PerceptionEngine] source '~a' region [~a,~a) exceeds perceptionDimension ~a — region not written (machineId=~a, sourceId=~a)~%"
+                     (or (source-name source) (source-id source))
+                     offset (+ offset length) dimension
+                     (or (source-machine-id source) "") (or (source-id source) "")))
+           (loop for value in payload
+                 for i from offset
+                 repeat length
+                 when (and (< i dimension) (not (zerop value)))
+                   do (setf (aref assembled i) (coerce value 'double-float))))))
      (perception-engine-sources engine))
-    assembled))
+    (coerce assembled 'list)))
 
 (defun perception-state-json (engine)
   (obj "dimension" (perception-engine-dimension engine)
