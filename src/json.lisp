@@ -135,16 +135,24 @@ Strings are vectors too and must not be walked."
     ((floatp value)   (format stream "~F" value))
     ((numberp value)  (princ value stream))
     ((hash-table-p* value)
+     ;; Keys are emitted in sorted order.  maphash walks the table in an
+     ;; arbitrary order that is not even stable across runs, and the three
+     ;; runtimes each produced a different key order for the same object —
+     ;; C++ sorts (its Json::Object is a std::map), Scala and LSP did not.
+     ;; Sorting is the canonical rule (RealityEngine_CI#91): it is the one
+     ;; ordering all four can agree on without declaring a field order for
+     ;; every object type.
      (write-char #\{ stream)
-     (let ((first t))
-       (maphash
-        (lambda (key item)
-          (unless first (write-char #\, stream))
-          (setf first nil)
-          (write-json (if (stringp key) key (princ-to-string key)) stream)
-          (write-char #\: stream)
-          (write-json item stream))
-        value))
+     (let ((first t)
+           (keys (let (ks)
+                   (maphash (lambda (k _) (declare (ignore _)) (push k ks)) value)
+                   (sort ks #'string< :key (lambda (k) (if (stringp k) k (princ-to-string k)))))))
+       (dolist (key keys)
+         (unless first (write-char #\, stream))
+         (setf first nil)
+         (write-json (if (stringp key) key (princ-to-string key)) stream)
+         (write-char #\: stream)
+         (write-json (gethash key value) stream)))
      (write-char #\} stream))
     ((vectorp value)
      (write-char #\[ stream)
