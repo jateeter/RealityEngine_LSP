@@ -111,6 +111,20 @@ machines downstream don't keep reading a value that was supposed to expire."
   (setf (gethash (source-id source) (perception-engine-sources engine)) source)
   source)
 
+(defun sources-in-canonical-order (engine)
+  "Sources ordered by (name, id).
+
+The sources table is keyed by id and ids are generated per runtime, so every
+PE listed sources differently — C++ by id, Scala and LSP by hash order,
+TypeScript by insertion order.  Four engines, four orderings, on an endpoint
+under byte comparison."
+  (sort (object-values (perception-engine-sources engine))
+        (lambda (a b)
+          (let ((na (or (source-name a) "")) (nb (or (source-name b) "")))
+            (cond ((string< na nb) t)
+                  ((string> na nb) nil)
+                  (t (and (string< (or (source-id a) "") (or (source-id b) "")) t)))))))
+
 (defun sample-source (source dimension)
   (let ((values (make-list dimension :initial-element 0.0d0)))
     (when (source-active-p source)
@@ -171,7 +185,7 @@ machines downstream don't keep reading a value that was supposed to expire."
   (obj "dimension" (perception-engine-dimension engine)
        "matchAlgorithm" (perception-engine-match-algorithm engine)
        "globalStep" (or (perception-engine-global-step engine) 0)
-       "sources" (vectorize (mapcar #'source-json (object-values (perception-engine-sources engine))))
+       "sources" (vectorize (mapcar #'source-json (sources-in-canonical-order engine)))
        "assembledVector" (vectorize (assemble-perception-vector engine))
        "lastPush" (or (perception-engine-last-push engine) +json-null+)
        "auto" (obj "running" (json-bool (perception-engine-auto-running-p engine))
