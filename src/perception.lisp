@@ -74,9 +74,10 @@ machines downstream don't keep reading a value that was supposed to expire."
 
 (defun source-json (source)
   (let* ((now (now-ms))
+         ;; `kind' was a duplicate of `type' unique to this runtime; the
+         ;; canonical source shape is the C++ one (RealityEngine_CI#91).
          (out (obj "id" (source-id source)
                    "type" (source-kind source)
-                   "kind" (source-kind source)
                    "name" (source-name source)
                    "active" (json-bool (source-active-p source))
                    "region" (region-json (source-region source)))))
@@ -88,7 +89,8 @@ machines downstream don't keep reading a value that was supposed to expire."
              (jget out "metadata") (or (source-sequence-metadata source) (obj))
              (jget out "sequence") (or (source-test-sequence source) (obj))
              (jget out "inputs") (vectorize (mapcar #'vectorize (source-inputs source)))
-             (jget out "cursor") (or (source-cursor source) 0)
+             ;; `cursor' is internal playback state, not part of the canonical
+             ;; source shape — no other runtime exposes it.
              (jget out "loop") (json-bool (source-loop-p source))))
       ((string= (source-kind source) "sensor")
        (let* ((last-updated (or (source-last-updated source) 0))
