@@ -1125,8 +1125,8 @@ IRIs joined from the corpus semantics manifest."
 
 (defun machine-graph-json (state)
   (let (nodes edges)
-    (maphash
-     (lambda (id machine)
+    (dolist (machine (reverse (machines-in-canonical-order (reality-state-machines state))))
+      (let ((id (machine-id machine)))
        (push (obj "id" id
                   "name" (machine-name machine)
                   "description" (machine-description machine)
@@ -1137,13 +1137,14 @@ IRIs joined from the corpus semantics manifest."
                                        (region-json (mapping-output (machine-mapping machine)))
                                        +json-null+)
                   "metadata" (or (machine-metadata machine) (obj)))
-             nodes))
-     (reality-state-machines state))
+             nodes)))
     ;; Edges: source output region overlaps target input region.
     ;; Mirrors Scala PerceptualSpaceSimulator.rebuildEdgeCache — interval
     ;; intersection test, one directed edge per overlapping (source, target) pair.
-    (let (machine-list)
-      (maphash (lambda (_ m) (push m machine-list)) (reality-state-machines state))
+    ;; Canonical order here too — edges are pushed, so iterate reversed to end
+    ;; up ordered, and the (source, target) pair order becomes deterministic
+    ;; across runtimes rather than following hash iteration.
+    (let ((machine-list (reverse (machines-in-canonical-order (reality-state-machines state)))))
       (dolist (source machine-list)
         (when (machine-mapping source)
           (dolist (target machine-list)
@@ -1351,7 +1352,7 @@ IRIs joined from the corpus semantics manifest."
                                                                        (mapcar (if summary-p
                                                                                    #'machine-summary-json
                                                                                    #'machine-json)
-                                                                               (object-values (reality-state-machines state)))))))))))
+                                                                               (machines-in-canonical-order (reality-state-machines state)))))))))))
    (make-route "GET" "/api/machines/:id" (lambda (params body query)
                                           (declare (ignore body query))
                                           (let ((machine (actor-ask actor (lambda (state) (gethash (gethash "id" params) (reality-state-machines state)))))))
@@ -1729,7 +1730,7 @@ IRIs joined from the corpus semantics manifest."
                                                                           (mapcar (if summary-p
                                                                                       #'machine-summary-json
                                                                                       #'machine-json)
-                                                                                  (object-values-sorted (reality-state-machines state))))))))))
+                                                                                  (machines-in-canonical-order (reality-state-machines state))))))))))
      (make-route "GET" "/api/buses/semantic" (lambda (_ body query)
                                                      (declare (ignore _ body query))
                                                      (handler-case
