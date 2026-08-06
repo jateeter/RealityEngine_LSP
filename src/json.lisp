@@ -109,7 +109,8 @@ Strings are vectors too and must not be walked."
         do (case ch
              (#\" (write-string "\\\"" stream))
              (#\\ (write-string "\\\\" stream))
-             (#\/ (write-string "\\/" stream))
+             ;; Solidus escaping is optional in JSON (RFC 8259 §7); C++ and Scala
+             ;; both emit it bare, so leave it unescaped to keep bytes identical.
              (#\Backspace (write-string "\\b" stream))
              (#\Page (write-string "\\f" stream))
              (#\Newline (write-string "\\n" stream))
