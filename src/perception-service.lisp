@@ -1981,9 +1981,8 @@ it is accepted as an alternative to the body bridgeToken/token fields."
                                                  (lambda (state)
                                                    (obj "sources" (vectorize
                                                                    (mapcar #'source-json
-                                                                           (object-values
-                                                                            (perception-engine-sources
-                                                                             (perception-state-engine state)))))))))))
+                                                                           (sources-in-canonical-order
+                                                                            (perception-state-engine state))))))))))
    (make-route "POST" "/api/sources" (lambda (_ body query)
                                       (declare (ignore _ query))
                                       (json-response

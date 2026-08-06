@@ -81,8 +81,49 @@
       (setf (jget out "replacedBy") (sequence-replaced-by sequence)))
     out))
 
+;; ── Canonical ordering ─────────────────────────────────────────────────────
+;;
+;; Machines and sequences live in hash tables keyed by id, and ids are
+;; generated per runtime — so iteration order differed between C++, LSP and
+;; Scala and the same corpus serialized to different bytes.  Ordering by
+;; content rather than by identity is what makes the comparison meaningful.
+;;
+;; Machines sort by (metadata.domain, name, id); sequences by (name, id).  The
+;; trailing id keeps the order total, and metadata.domain is absent on a
+;; handful of corpus machines, which sort first under an empty key.
+
+(defun machine-domain (machine)
+  "metadata.domain, or \"\" when absent."
+  (let ((meta (machine-metadata machine)))
+    (or (and meta (jstring meta "domain" nil)) "")))
+
+(defun string-triple< (a1 a2 a3 b1 b2 b3)
+  "Lexicographic compare of two 3-tuples of strings."
+  (cond ((string< a1 b1) t)
+        ((string> a1 b1) nil)
+        ((string< a2 b2) t)
+        ((string> a2 b2) nil)
+        (t (and (string< a3 b3) t))))
+
+(defun machines-in-canonical-order (machines)
+  "Machines from a hash table, ordered by (metadata.domain, name, id)."
+  (sort (object-values machines)
+        (lambda (a b)
+          (string-triple< (machine-domain a) (or (machine-name a) "") (or (machine-id a) "")
+                          (machine-domain b) (or (machine-name b) "") (or (machine-id b) "")))))
+
 (defun machine-sequence-list (machine)
-  (object-values-sorted (machine-sequences machine)))
+  "Sequences ordered by (name, id).
+
+Previously object-values-sorted, which orders by hash key — the sequence id —
+producing \"MEMORY ALERT SET\" before \"RESET\" on one runtime and after it on
+another."
+  (sort (object-values (machine-sequences machine))
+        (lambda (a b)
+          (let ((na (or (sequence-name a) "")) (nb (or (sequence-name b) "")))
+            (cond ((string< na nb) t)
+                  ((string> na nb) nil)
+                  (t (and (string< (or (sequence-id a) "") (or (sequence-id b) "")) t)))))))
 
 (defun machine-summary-json (machine)
   "Minimal projection used by the PE catalog refresher — id, name, metadata only.
