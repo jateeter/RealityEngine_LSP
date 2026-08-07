@@ -1165,8 +1165,13 @@ IRIs joined from the corpus semantics manifest."
                              "targetRegion" (region-json tgt-in)
                              "overlap"      t)
                         edges))))))))
+    ;; perceptualSpaceDimension mirrors C++ (Json::Object{..., {"perceptualSpaceDimension",
+    ;; space.dimension()}}), which is the canonical shape.  LSP omitted it, and
+    ;; that field was the entire remaining difference on GET /api/machine-graph
+    ;; once the solidus fix landed (RealityEngine_CI#91).
     (obj "nodes" (vectorize (nreverse nodes))
-         "edges" (vectorize (nreverse edges)))))
+         "edges" (vectorize (nreverse edges))
+         "perceptualSpaceDimension" (reality-state-dimension state))))
 
 (defun reality-routes (actor)
   (list
