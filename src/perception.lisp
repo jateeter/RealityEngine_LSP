@@ -254,7 +254,7 @@ our dimension — grow to match rather than truncating to it."
     (coerce assembled 'list)))
 
 (defun perception-state-json (engine)
-  (obj "dimension" (perception-engine-dimension engine)
+  (obj "perceptionDimension" (perception-engine-dimension engine)
        "matchAlgorithm" (perception-engine-match-algorithm engine)
        "globalStep" (or (perception-engine-global-step engine) 0)
        "sources" (vectorize (mapcar #'source-json (sources-in-canonical-order engine)))
