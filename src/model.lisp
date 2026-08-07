@@ -161,8 +161,27 @@ Omits sequences, vectors, and perceptualMapping to keep the response small."
         (reality-vector-predecessor-chain vector) nil)
   vector)
 
-(defun match-element (element input-value override)
-  (let* ((type (comparator-name (or override (vector-element-comparator element) "gte")))
+(defun match-element (element input-value override &optional vector-match-algorithm)
+  "Compare one element.  Comparator precedence is
+
+    explicit override > element comparatorType > vector matchAlgorithm > gte
+
+which is C++'s
+
+    overrideType.value_or(elem.comparatorType.value_or(matchAlgorithm))
+
+with the vector's matchAlgorithm inherited from its machine.  The per-element
+comparatorType still wins, so a machine that sets one comparator at machine
+level and a different one on an individual element keeps both.
+
+VECTOR-MATCH-ALGORITHM was previously not consulted at all -- the fallback was
+the literal \"gte\" -- so a machine declaring \"matchAlgorithm\": \"equals\"
+was evaluated with the weaker predicate no matter what the loader recorded
+(RealityEngine_LSP#31)."
+  (let* ((type (comparator-name (or override
+                                    (vector-element-comparator element)
+                                    vector-match-algorithm
+                                    "gte")))
          (expected (coerce (vector-element-value element) 'double-float))
          (actual (coerce input-value 'double-float))
          (threshold (or (vector-element-threshold element) 0.5d0)))
@@ -197,7 +216,9 @@ Omits sequences, vectors, and perceptualMapping to keep the response small."
               for element in elements
               for actual in input
               for index from 0
-              do (multiple-value-bind (ok score) (match-element element actual override)
+              do (multiple-value-bind (ok score)
+                     (match-element element actual override
+                                    (reality-vector-match-algorithm vector))
                    (unless ok
                      (return (values nil (/ total (max 1 (length elements)))
                                      (obj "failedAtIndex" index))))

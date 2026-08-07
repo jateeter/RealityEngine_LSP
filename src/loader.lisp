@@ -159,7 +159,20 @@
    :timestamp (or (jnumber item "timestamp" nil) 0)
    :provenance (jarray-list (or (jget item "provenance") (arr)))))
 
-(defun parse-reality-vector (item)
+(defun parse-reality-vector (item &optional machine-match-algorithm)
+  "Parse one reality vector.
+
+MACHINE-MATCH-ALGORITHM, when supplied, wins over anything on the vector
+itself.  That is what C++ does -- `rv.matchAlgorithm = machine.matchAlgorithm`
+is an unconditional assignment after the vector is built -- and C++ is the
+canonical definition.  Reading a per-vector value here instead meant every
+vector fell back to the \"gte\" default, so the two corpus machines that
+declare `\"matchAlgorithm\": \"equals\"` at machine level had all their vectors
+matching with the weaker predicate: LSP could advance a sequence where C++ and
+Scala would not, on identical input (RealityEngine_LSP#31).
+
+The optional argument keeps the API call sites working, which build a vector
+from a request body with no machine in scope."
   (let* ((id (or (jstring item "id" nil) (make-id "vector")))
          (initial-p (jbool item "isInitial" nil))
          (elements (mapcar #'parse-vector-element (jarray-list (or (jget item "elements") (arr)))))
@@ -169,14 +182,16 @@
                          :elements elements
                          :initial-p initial-p
                          :active-p initial-p
-                         :match-algorithm (comparator-name (jstring item "matchAlgorithm" "gte"))
+                         :match-algorithm (comparator-name
+                                           (or machine-match-algorithm
+                                               (jstring item "matchAlgorithm" "gte")))
                          :metadata (or (jget item "metadata") (obj))
                          :next-ids next-ids
                          :output-vectors outputs
                          :just-matched-p nil
                          :predecessor-chain nil)))
 
-(defun parse-sequence (item)
+(defun parse-sequence (item &optional machine-match-algorithm)
   (let ((vectors (make-hash-table :test #'equal))
         (sequence (make-ces :id (or (jstring item "id" nil) (make-id "sequence"))
                             :name (or (jstring item "name" nil) "unnamed")
@@ -186,7 +201,7 @@
                             :replaced-by (jstring item "replacedBy" nil)
                             :vectors nil)))
     (dolist (vector-json (jarray-list (or (jget item "vectors") (arr))))
-      (let ((vector (parse-reality-vector vector-json)))
+      (let ((vector (parse-reality-vector vector-json machine-match-algorithm)))
         (setf (gethash (reality-vector-id vector) vectors) vector)))
     (setf (sequence-vectors sequence) vectors)
     sequence))
@@ -222,7 +237,7 @@
     (when (jarray-present-p root "inputSequences")
       (setf (jget metadata "inputSequences") (jget root "inputSequences")))
     (dolist (sequence-json (jarray-list (or (jget root "sequences") (arr))))
-      (let ((sequence (parse-sequence sequence-json)))
+      (let ((sequence (parse-sequence sequence-json (machine-match-algorithm machine))))
         (setf (gethash (sequence-id sequence) sequences) sequence)))
     (setf (machine-sequences machine) sequences)
     machine))
