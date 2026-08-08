@@ -947,8 +947,13 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
               active-regions)))
     (let* ((event-bus (apply-event-bus state merge-batch))
            (step-number (reality-state-step-count state))
-           (step (obj "success" t
-                     "stepNumber" step-number
+           ;; No "success" inside the step. Every caller already wraps this as
+           ;; (obj "success" t "step" step), so it was a duplicate one level
+           ;; down, and neither the C++ nor the Scala step object carries it.
+           ;; It made the universal-vector parity signature differ from C++ on
+           ;; every event: the harness collects any object holding mergeBatch,
+           ;; so the step itself contributed a spurious {"success": true}.
+           (step (obj "stepNumber" step-number
                      "timestamp" (now-ms)
                      "inputVector" (vectorize input)
                      "machineResults" (if include-machine-results machine-results (obj))
