@@ -1726,10 +1726,23 @@ it is accepted as an alternative to the body bridgeToken/token fields."
 (defun push-perception (state include-machine-results &key compact)
   (let* ((engine (perception-state-engine state))
          (vector (assemble-perception-vector engine))
+         ;; Always ask the Reality Engine for the perceptual space and the
+         ;; machine results. The PE needs both to compute the next input
+         ;; vector, so what the caller wants *reported* must not decide what
+         ;; the engine gets to *know*.
+         ;;
+         ;; Gating the request on these flags made the state update below
+         ;; unreachable: with neither field returned, next-ps came out empty,
+         ;; the dimension guard rejected it, and the PE's perceptual space
+         ;; never advanced. Under compact — which is what the regression
+         ;; suite and the MQTT bridge both use — the PE was frozen at its
+         ;; initial state while C++ carried its space forward, so the two
+         ;; runtimes agreed on the first push and diverged on every one
+         ;; after it.  The response is trimmed after the fact instead.
          (payload (obj "vector" (vectorize vector)
                        "matchAlgorithm" (perception-engine-match-algorithm engine)
-                       "includeMachineResults" (json-bool include-machine-results)
-                       "includePerceptualSpace" (json-bool (not compact))
+                       "includeMachineResults" t
+                       "includePerceptualSpace" t
                        "compact" (json-bool compact))))
     (handler-case
         (let* ((step      (http-post-json (format nil "~a/api/perceive" (perception-state-reality-url state))
@@ -1755,6 +1768,17 @@ it is accepted as an alternative to the body bridgeToken/token fields."
                                t))))
                      (perception-engine-sources engine)))
           (record-dispatch-envelopes-from-step state step)
+          ;; Trim the reported step to what was asked for.  Done here, after
+          ;; the state update and the dispatch pass, so asking for less never
+          ;; means the engine does less.  The reported shape is the same as
+          ;; before: machine results emptied unless requested, and the
+          ;; perceptual space omitted under compact.
+          (when (jobject-p step)
+            (unless include-machine-results
+              (setf (jget step "machineResults") (obj)))
+            (when compact
+              (setf (jget step "machineResults") (obj))
+              (remhash "perceptualSpace" step)))
           (setf (perception-engine-last-push engine) step)
           (let ((result (obj "success" t
                              "step" step
