@@ -1368,10 +1368,15 @@ IRIs joined from the corpus semantics manifest."
                                                                                (machines-in-canonical-order (reality-state-machines state)))))))))))
    (make-route "GET" "/api/machines/:id" (lambda (params body query)
                                           (declare (ignore body query))
-                                          (let ((machine (actor-ask actor (lambda (state) (gethash (gethash "id" params) (reality-state-machines state)))))))
+                                          ;; The LET closed with an empty body here, which put the
+                                          ;; IF outside it referencing a free MACHINE — so every
+                                          ;; read of an existing machine answered HTTP 500 "The
+                                          ;; variable MACHINE is unbound" instead of the machine
+                                          ;; (#42).
+                                          (let ((machine (actor-ask actor (lambda (state) (gethash (gethash "id" params) (reality-state-machines state))))))
                                             (if machine
                                                 (json-response (obj "machine" (machine-json machine :full t)))
-                                                (error-response "Machine not found" 404)))))
+                                                (error-response "Machine not found" 404))))))
    (make-route "POST" "/api/machines" (lambda (_ body query)
                                        (declare (ignore _ query))
                                        (json-response
@@ -1793,12 +1798,14 @@ IRIs joined from the corpus semantics manifest."
                                                              (error-response (format nil "semantics manifest unavailable: ~a" e) 404)))))
      (make-route "GET" "/api/machines/:id" (lambda (params body query)
                                              (declare (ignore body query))
+                                             ;; Same empty-LET defect as the other machines/:id
+                                             ;; handler above (#42).
                                              (let ((machine (actor-ask actor (lambda (state)
                                                                                (gethash (gethash "id" params)
-                                                                                        (reality-state-machines state)))))))
+                                                                                        (reality-state-machines state))))))
                                                (if machine
                                                    (json-response (obj "machine" (machine-json machine :full t)))
-                                                   (error-response "Machine not found" 404))))
+                                                   (error-response "Machine not found" 404)))))
      (make-route "POST" "/api/machines" (lambda (_ body query)
                                           (declare (ignore _ query))
                                           (state-json (lambda (state)
