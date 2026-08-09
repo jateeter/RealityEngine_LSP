@@ -121,16 +121,62 @@ Must be called on the request thread — the hunchentoot context is dynamic."
       body
       (sb-ext:octets-to-string body :external-format :utf-8)))
 
+;; Outbound HTTP must be bounded.
+;;
+;; Drakma defaults to a 20-second connect timeout and *no* read timeout at
+;; all, so a peer that accepts a connection and then goes quiet blocks the
+;; caller forever.  That is not hypothetical: with Ollama absent,
+;; /api/integrations/ollama/status outlived the regression harness's request
+;; budget and the client aborted, while C++ answered the same probe promptly
+;; with reachable:false (#40).  A status endpoint must always answer.
+;;
+;; Applied to every helper rather than just the probe path — the same
+;; unbounded wait is one absent service away from stalling any integration
+;; call.  Override for genuinely slow providers, e.g. a local model doing a
+;; long completion:
+;;   RE_HTTP_CONNECT_TIMEOUT_SECONDS (default 3)
+;;   RE_HTTP_TOTAL_TIMEOUT_SECONDS   (default 10)
+
+(defun http-connect-timeout () (env-int "RE_HTTP_CONNECT_TIMEOUT_SECONDS" 3))
+(defun http-total-timeout   () (env-int "RE_HTTP_TOTAL_TIMEOUT_SECONDS" 10))
+
+;; Drakma's :connection-timeout covers the connect phase on SBCL, but its
+;; :read-timeout parameter exists only on LispWorks 7.1 — passing it here is a
+;; program error, not a no-op — so the read phase is bounded with
+;; sb-ext:with-timeout instead.
+;;
+;; Two bounds can fire here and both arrive as sb-ext:timeout — SBCL
+;; implements Drakma's connection-timeout as a deadline covering the whole
+;; request, and sb-sys:deadline-timeout is a subtype of sb-ext:timeout. The
+;; message therefore names both limits rather than claiming which one tripped.
+;;
+;; sb-ext:timeout is a serious-condition, not an error, so it would slip
+;; straight through the handler-case (error ...) that every caller uses. It is
+;; converted to a plain error here so callers keep working unchanged and a
+;; stalled peer reads as an ordinary failed probe.
+(defmacro with-bounded-http ((url) &body body)
+  (let ((u (gensym "URL")))
+    `(let ((,u ,url))
+       (handler-case (sb-ext:with-timeout (http-total-timeout) ,@body)
+         (sb-ext:timeout ()
+           (error "HTTP request to ~a timed out (connect ~a s, total ~a s)"
+                  ,u (http-connect-timeout) (http-total-timeout)))))))
+
 (defun http-get-json (url)
-  (parse-json (drakma-body-string (drakma:http-request url :method :get :close t))))
+  (with-bounded-http (url)
+    (parse-json (drakma-body-string
+                 (drakma:http-request url :method :get :close t
+                                      :connection-timeout (http-connect-timeout))))))
 
 (defun http-post-json (url payload)
-  (parse-json (drakma-body-string
-               (drakma:http-request url
-                                    :method :post
-                                    :content (json-stringify payload)
-                                    :content-type "application/json"
-                                    :close t))))
+  (with-bounded-http (url)
+    (parse-json (drakma-body-string
+                 (drakma:http-request url
+                                      :method :post
+                                      :content (json-stringify payload)
+                                      :content-type "application/json"
+                                      :close t
+                                      :connection-timeout (http-connect-timeout))))))
 
 (defun http-request-json (url &key (method :get) payload headers)
   (let ((args (list url :method method)))
@@ -139,4 +185,8 @@ Must be called on the request thread — the hunchentoot context is dynamic."
                                     :content-type "application/json"))))
     (when headers
       (setf args (append args (list :additional-headers headers))))
-    (parse-json (drakma-body-string (apply #'drakma:http-request (append args (list :close t)))))))
+    (with-bounded-http (url)
+      (parse-json (drakma-body-string
+                   (apply #'drakma:http-request
+                          (append args (list :close t
+                                             :connection-timeout (http-connect-timeout)))))))))
