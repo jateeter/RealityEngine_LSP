@@ -3,6 +3,16 @@
 (defun env (name &optional default)
   (or (uiop:getenv name) default))
 
+(defun env-set-p (name)
+  "True when NAME is present and non-empty in the environment.
+
+Distinguishes \"the operator asked for this\" from \"nothing was set\", which
+`env` cannot: a caller reading a default back has no way to tell whether the
+default or an identical explicit value produced it. Configuration precedence
+needs that distinction."
+  (let ((value (uiop:getenv name)))
+    (and value (plusp (length value)))))
+
 (defun env-int (name default)
   (handler-case
       (parse-integer (env name (write-to-string default)))
