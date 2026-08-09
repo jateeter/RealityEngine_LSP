@@ -469,10 +469,20 @@ Per-sequence boundaries live in metadata.segments for UI display."
                 (let ((kind (jstring item "kind" "")))
                   (cond
                     ((string= kind "ollama")
-                     (when (jstring item "baseUrl" nil)
+                     ;; The registry supplies defaults; an explicit environment
+                     ;; variable outranks them. This applied the file's values
+                     ;; unconditionally, so OLLAMA_BASE_URL and OLLAMA_MODEL
+                     ;; were silently discarded — including from an
+                     ;; integration entry marked "enabled": false. C++ and
+                     ;; Scala both let the environment win, so a lane pinning
+                     ;; one model across the three runtimes got two of them
+                     ;; (#44).
+                     (when (and (jstring item "baseUrl" nil)
+                                (not (env-set-p "OLLAMA_BASE_URL")))
                        (setf (perception-state-ollama-base-url state)
                              (trim-trailing-slashes (jstring item "baseUrl"))))
-                     (when (jstring item "model" nil)
+                     (when (and (jstring item "model" nil)
+                                (not (env-set-p "OLLAMA_MODEL")))
                        (setf (perception-state-ollama-model state) (jstring item "model")))
                      (when (jstring item "completionSourceMappingId" nil)
                        (setf (perception-state-ollama-completion-source-mapping-id state)
