@@ -1,10 +1,13 @@
 # RealityEngine_LSP
 
 Common Lisp implementation of the Reality Engine and Perception Engine
-service surface.  Black-box equivalent to [`RealityEngine_AI`](../RealityEngine_AI)
-(TypeScript, default) and [`RealityEngine_CPP`](../RealityEngine_CPP) (native
-C++) on the same machine JSON corpus, governance contracts, MQTT mapping
-registry, and Prometheus metrics shape.
+service surface.  Black-box equivalent to [`RealityEngine_Scala`](../RealityEngine_Scala)
+and [`RealityEngine_CPP`](../RealityEngine_CPP) (native C++) on the same machine
+JSON corpus, governance contracts, MQTT mapping registry, and Prometheus metrics
+shape. [`RealityEngine_AI`](../RealityEngine_AI) is the deprecated TypeScript
+prototype — retained as the behavioral reference for core RE/PE semantics, and
+replaced by [`RealityEngine_Scala`](../RealityEngine_Scala) for active runtime
+reference work.
 
 This implementation uses Common Lisp actors to mirror the actor mental
 model: state is owned by mailbox-driven service actors, messages are
