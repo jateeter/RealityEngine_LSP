@@ -1487,5 +1487,31 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
       (assert-true (null (reality-engine-lsp::jbool parsed "a" t))
                    "jbool must read +json-false+ as false")))
 
+  ;; Outbound HTTP must be bounded (#40).
+  ;;
+  ;; A listening socket that never accepts still completes the TCP handshake
+  ;; from the backlog, so the client connects and then waits on a reply that
+  ;; never comes — the exact shape that made /api/integrations/ollama/status
+  ;; outlive the regression harness's request budget. Drakma has no usable
+  ;; read timeout on SBCL, so without an explicit bound this call never
+  ;; returns and the test hangs rather than fails.
+  (let* ((listener (usocket:socket-listen "127.0.0.1" 0 :reuse-address t))
+         (port (usocket:get-local-port listener))
+         (url (format nil "http://127.0.0.1:~a/api/tags" port))
+         (start (get-internal-real-time)))
+    (unwind-protect
+         (progn
+           ;; Must be an ERROR, not a bare serious-condition: every caller
+           ;; wraps these in handler-case (error ...), and a timeout that is
+           ;; not an error would escape as a 500 instead of reachable:false.
+           (assert-error (lambda () (reality-engine-lsp::http-get-json url))
+                         "a peer that never answers must fail rather than hang")
+           (let ((elapsed (/ (float (- (get-internal-real-time) start))
+                             internal-time-units-per-second)))
+             (assert-true (< elapsed 30)
+                          (format nil "bounded request should give up promptly; took ~,1f s"
+                                  elapsed))))
+      (usocket:socket-close listener)))
+
   (format t "~&RealityEngine_LSP core tests passed.~%")
   t)
