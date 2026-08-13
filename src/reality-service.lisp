@@ -16,7 +16,11 @@
   checkpoints
   match-threshold
   sampler-running-p sampler-strategy sampler-interval-ms sampler-sample-count
-  sim-buffer sim-buffered-region sim-buffered-delay)
+  sim-buffer sim-buffered-region sim-buffered-delay
+  ;; Arbitration records for the most recent step (ARBITER_CONTRACT.md 6).
+  ;; A resolution nobody can observe is indistinguishable from no resolution,
+  ;; and a suppressed contribution has to stay attributable.
+  arbitration)
 
 (defun compose-key (producer-machine-id producer-sequence-id)
   (format nil "~a|~a" producer-machine-id producer-sequence-id))
@@ -935,16 +939,45 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
     (dolist (op merge-batch) (record-merge-coverage state op))
     (when compact
       (add-packed-merge-values state merge-batch))
-    (dolist (operation merge-batch)
-      (let ((region (make-region-from-json (jget operation "region")))
-            (values (numbers-from-json (jget operation "values"))))
-        (setf (reality-state-perceptual-space state)
-              (merge-region (reality-state-perceptual-space state) region values))
-        (push (obj "offset" (region-offset region)
-                   "length" (region-length region)
-                   "machineId" (jstring operation "machineId" "")
-                   "type" "output")
-              active-regions)))
+    ;; GATHER -> RESOLVE -> COMMIT (ARBITER_CONTRACT.md 2).
+    ;;
+    ;; merge-batch is canonically sorted, which made the previous
+    ;; apply-each-in-order loop deterministic — but determinism is not
+    ;; resolution. On a contended cell the last operation still won, and a stable
+    ;; wrong value reproduces perfectly and reads as correct. Gather turns each
+    ;; operation into per-cell contributions carrying the governance severity
+    ;; already resolved from triggerConfig (the 4.3.1 join), resolve reduces per
+    ;; cell under the declared rule, and commit writes exactly once per cell.
+    (let ((by-cell (make-hash-table :test #'eql)))
+      (dolist (operation merge-batch)
+        (let* ((region (make-region-from-json (jget operation "region")))
+               (values (numbers-from-json (jget operation "values")))
+               (governance (jget operation "governance"))
+               (rag (and governance (jstring governance "ragStatusCode" nil))))
+          (loop for i from 0 below (min (region-length region) (length values))
+                for cell = (+ (region-offset region) i)
+                do (push (make-contribution
+                          :cell cell
+                          :value (nth i values)
+                          :provider "machine"
+                          :origin-id (jstring operation "machineId" "")
+                          :ces-id (jstring operation "sequenceId" "")
+                          :output-vector-id (format nil "~a" (jnumber operation "outputIndex" 0))
+                          :rag-status-code rag)
+                         (gethash cell by-cell)))
+          (push (obj "offset" (region-offset region)
+                     "length" (region-length region)
+                     "machineId" (jstring operation "machineId" "")
+                     "type" "output")
+                active-regions)))
+      (multiple-value-bind (resolved records)
+          (resolve-all by-cell (reality-state-step-count state))
+        (dolist (pair resolved)
+          (setf (reality-state-perceptual-space state)
+                (merge-region (reality-state-perceptual-space state)
+                              (make-region :offset (car pair) :length 1)
+                              (list (cdr pair)))))
+        (setf (reality-state-arbitration state) records)))
     (let* ((event-bus (apply-event-bus state merge-batch))
            (step-number (reality-state-step-count state))
            ;; No "success" inside the step. Every caller already wraps this as
@@ -2209,6 +2242,11 @@ IRIs joined from the corpus semantics manifest."
                               #'re-sse-stream-handler)))))
 
 (defun start-reality-from-environment ()
-  (start-reality-service :port (env-int "REALITY_ENGINE_PORT" 5601)
-                         :machine-dir (env "MACHINES_DIR" "../RealityEngine_Machines/machines")
-                         :dimension (env-int "VECTOR_DIMENSION" 7680)))
+  (let ((machine-dir (env "MACHINES_DIR" "../RealityEngine_Machines/machines")))
+    ;; Declares how each contended universal-vector position resolves. Loaded
+    ;; before the corpus so the first step already arbitrates rather than
+    ;; falling back (ARBITER_CONTRACT.md 5).
+    (load-arbitration-registry machine-dir)
+    (start-reality-service :port (env-int "REALITY_ENGINE_PORT" 5601)
+                           :machine-dir machine-dir
+                           :dimension (env-int "VECTOR_DIMENSION" 7680))))
