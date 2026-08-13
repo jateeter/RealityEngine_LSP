@@ -1513,5 +1513,67 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                                   elapsed))))
       (usocket:socket-close listener)))
 
+  ;; ── Output arbiter conformance (ARBITER_CONTRACT.md) ──────────────────────
+  ;;
+  ;; These cover the properties no live probe can establish: that resolution
+  ;; does not depend on the order contributions arrive in. That is the whole
+  ;; basis for accumulating them in an actor mailbox, and a violation would be
+  ;; invisible in any single run.
+  (flet ((contrib (value provider origin &optional rag)
+           (reality-engine-lsp::make-contribution
+            :cell 1 :value value :provider provider :origin-id origin
+            :ces-id "seq" :output-vector-id "ov" :rag-status-code rag))
+         (entry (rule &optional within)
+           (reality-engine-lsp::make-arbitration-entry
+            :cell 1 :rule rule :within-rank within)))
+
+    ;; An unregistered surface must not outrank a reading by default.
+    (assert-equal :generated (reality-engine-lsp::determinism-of "some-future-surface")
+                  "unregistered provider classifies as generated")
+    (assert-equal :deterministic (reality-engine-lsp::determinism-of "machine")
+                  "machine is deterministic")
+
+    ;; The generated value is larger, so a MAX-based merge would take it.
+    (multiple-value-bind (value record)
+        (reality-engine-lsp::resolve-cell
+         1 0 (list (contrib 0 "machine" "m1") (contrib 1 "acp" "a1")) (entry "PRECEDENCE"))
+      (assert-equal 0 value "PRECEDENCE: generated never overrides deterministic")
+      (assert-equal 1 (length (reality-engine-lsp::arbitration-record-suppressed record))
+                    "the generated contribution is recorded as suppressed"))
+
+    ;; Two machine determinations plus an agent: RED asserts 0, AMBER asserts 1.
+    ;; MAX would take 1; SEVERITY within the winning class must take 0.
+    (assert-equal 0 (reality-engine-lsp::resolve-cell
+                     1 0 (list (contrib 1 "machine" "m-amber" "AMBER")
+                               (contrib 0 "machine" "m-red" "RED")
+                               (contrib 1 "acp" "a1"))
+                     (entry "PRECEDENCE" "SEVERITY"))
+                  "withinRank SEVERITY is applied rather than falling back to MAX")
+
+    (assert-equal 0 (reality-engine-lsp::resolve-cell
+                     1 0 (list (contrib 1 "machine" "a" "AMBER") (contrib 0 "machine" "b" "RED"))
+                     (entry "SEVERITY"))
+                  "SEVERITY resolves by RAG rank before value")
+
+    ;; A single contributor resolves to itself and emits no record (contract 4.5).
+    (multiple-value-bind (value record)
+        (reality-engine-lsp::resolve-cell 1 0 (list (contrib 0.42d0 "acp" "a1")) nil)
+      (assert-equal 0.42d0 value "a single contributor resolves to itself")
+      (assert-true (null record) "a single contributor emits no record"))
+
+    ;; Acceptance criteria 2 and 4 — the externally visible form of the
+    ;; commutative-monoid requirement, and the property most likely to break
+    ;; once sources arrive asynchronously.
+    (let* ((base (list (contrib 1 "machine" "m-amber" "AMBER")
+                       (contrib 0 "machine" "m-red" "RED")
+                       (contrib 0.7d0 "acp" "a1")
+                       (contrib 0.3d0 "mqtt" "s1")))
+           (e (entry "PRECEDENCE" "SEVERITY"))
+           (first-result (reality-engine-lsp::resolve-cell 1 0 base e)))
+      (dotimes (i 24)
+        (let ((shuffled (sort (copy-list base) #'< :key (lambda (c) (random 1000)))))
+          (assert-equal first-result (reality-engine-lsp::resolve-cell 1 0 shuffled e)
+                        "resolution is invariant under contribution order")))))
+
   (format t "~&RealityEngine_LSP core tests passed.~%")
   t)

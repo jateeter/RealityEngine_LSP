@@ -24,6 +24,7 @@
                  (:file "perception")
                  (:file "http")
                  (:file "ws")           ; SSE broadcast surface (GET /api/events)
+                 (:file "arbiter")       ; output arbiter (ARBITER_CONTRACT.md)
                  (:file "reality-service")
                  (:file "vector-aggregator") ; PE machine output aggregator
                  (:file "perception-service")
