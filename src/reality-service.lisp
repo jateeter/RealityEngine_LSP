@@ -1161,6 +1161,38 @@ IRIs joined from the corpus semantics manifest."
         :test #'string=
         :key (lambda (bus) (jstring bus "id" ""))))
 
+(defun arbitration-contribution-json (c)
+  (obj "provider" (contribution-provider c)
+       "determinism" (determinism-name (determinism-of (contribution-provider c)))
+       "originId" (contribution-origin-id c)
+       "cesId" (if (string= (contribution-ces-id c) "") :null (contribution-ces-id c))
+       "outputVectorId" (if (string= (contribution-output-vector-id c) "")
+                            :null (contribution-output-vector-id c))
+       "ragStatusCode" (or (contribution-rag-status-code c) :null)
+       "value" (contribution-value c)))
+
+(defun arbitration-json (state)
+  "GET /api/arbitration — records from the most recent step."
+  (let ((records (reality-state-arbitration state)))
+    (obj "registryEntries" (arbitration-registry-size)
+         "registrySource" (or *arbitration-source* :null)
+         "shards" (arbiter-shards)
+         "count" (length records)
+         "records"
+         (apply #'arr
+                (mapcar (lambda (r)
+                          (obj "instant" (arbitration-record-instant r)
+                               "cell" (arbitration-record-cell r)
+                               "rule" (arbitration-record-rule r)
+                               "resolved" (arbitration-record-resolved r)
+                               "contributors"
+                               (apply #'arr (mapcar #'arbitration-contribution-json
+                                                    (arbitration-record-contributors r)))
+                               "suppressed"
+                               (apply #'arr (mapcar #'arbitration-contribution-json
+                                                    (arbitration-record-suppressed r)))))
+                        records)))))
+
 (defun machine-graph-json (state)
   (let (nodes edges)
     ;; nodes are collected with push and the function ends with (nreverse
@@ -1517,6 +1549,22 @@ IRIs joined from the corpus semantics manifest."
    (make-route "GET" "/api/machine-graph" (lambda (_ body query)
                                            (declare (ignore _ body query))
                                            (json-response (actor-ask actor #'machine-graph-json))))
+   ;; Arbitration records for the most recent step (ARBITER_CONTRACT.md 6).
+   ;;
+   ;; The records were produced and stored on the state all along; nothing
+   ;; served them, so from outside the process a resolution was
+   ;; indistinguishable from no resolution, and acceptance criteria 8 and 9
+   ;; could not be checked. A suppressed contribution has to stay attributable
+   ;; — "the agent's answer was discarded" is the operational fact the domain
+   ;; bus exists to surface.
+   ;;
+   ;; Wire shape matches the Scala and C++ runtimes exactly; cross-runtime
+   ;; parity is the acceptance test for this contract, so a divergent shape
+   ;; here would defeat the endpoint's own purpose.
+   (make-route "GET" "/api/arbitration"
+               (lambda (_ body query)
+                 (declare (ignore _ body query))
+                 (json-response (actor-ask actor #'arbitration-json))))
    (make-route "POST" "/api/perceptual-simulation/step" (lambda (_ body query)
                                                          (declare (ignore _ body query))
                                                          (json-response (actor-ask actor (lambda (state)

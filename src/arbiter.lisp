@@ -82,6 +82,25 @@ prevents the situation arising.")
 (defun arbitration-registry-size ()
   (hash-table-count *arbitration-entries*))
 
+(defun determinism-name (class)
+  "The contract's spelling of the determinism class.
+Serialised by GET /api/arbitration, so it is wire contract rather than a debug
+string, and must match the other runtimes exactly."
+  (case class
+    (:deterministic "deterministic")
+    (:measured "measured")
+    (t "generated")))
+
+(defun arbiter-shards ()
+  "Shard count the resolve would use here.
+Reported so a parallelism difference between runtimes is visible rather than
+inferred. Correctness does not depend on it — every rule is a commutative
+monoid, which is what makes any partitioning safe (contract acceptance
+criterion 3) — but a run that cannot say how it partitioned cannot demonstrate
+that criterion either."
+  (let ((env (env "ARBITER_SHARDS" nil)))
+    (if env (max 1 (or (parse-integer env :junk-allowed t) 1)) 1)))
+
 (defun load-arbitration-registry (machines-dir)
   "Load domains/arbitration-registry.json, trying ARBITRATION_REGISTRY then
 paths beside MACHINES-DIR."
