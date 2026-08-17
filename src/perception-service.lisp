@@ -332,7 +332,16 @@ Per-sequence boundaries live in metadata.segments for UI display."
                     (and (jobject-p metadata)
                          (jarray-list (or (jget metadata "inputSequences") (arr))))))
               (cond
-                ((or (null mid) (gethash mid existing)
+                ;; A corpus machine is (re)loaded whether or not a source
+                ;; already claims to describe it. `ensure-source-id` keys on
+                ;; test-<machineId>, so a reload replaces in place rather than
+                ;; duplicating. Nothing in an existing source says whether its
+                ;; machine still has the same CESs, interconnections or regions
+                ;; — a redefined machine may replace the old one entirely — so
+                ;; skipping the rebuild keeps a source describing a machine
+                ;; that no longer exists. PE_SOURCE_MERGE=true restores the skip.
+                ((or (null mid)
+                     (and (env-bool "PE_SOURCE_MERGE" nil) (gethash mid existing))
                      (not (jobject-p input-region))
                      (null input-sequences))
                  (incf skipped))
@@ -355,7 +364,14 @@ Per-sequence boundaries live in metadata.segments for UI display."
                                     :id (format nil "test-~a" mid)
                                     :kind "test"
                                     :name (format nil "~a / ~a" mname label)
-                                    :active-p nil
+                                    ;; Inactive by default. Activating every
+                                    ;; machine source made all three runtimes
+                                    ;; replay their input sequences on every
+                                    ;; push and the divergence went three-way
+                                    ;; rather than away (RealityEngine_Scala#43).
+                                    ;; PE_SOURCE_ACTIVATE_ON_LOAD=true turns it
+                                    ;; on for a deliberate experiment.
+                                    :active-p (env-bool "PE_SOURCE_ACTIVATE_ON_LOAD" nil)
                                     :region (make-region
                                              :offset (truncate (or (jnumber input-region "offset" 0) 0))
                                              :length (truncate (or (jnumber input-region "length" 0) 0)))
@@ -1782,15 +1798,19 @@ it is accepted as an alternative to the body bridgeToken/token fields."
           (record-dispatch-envelopes-from-step state step)
           ;; Trim the reported step to what was asked for.  Done here, after
           ;; the state update and the dispatch pass, so asking for less never
-          ;; means the engine does less.  The reported shape is the same as
-          ;; before: machine results emptied unless requested, and the
-          ;; perceptual space omitted under compact.
+          ;; means the engine does less.
+          ;;
+          ;; Shape fixed by SURFACE_SPEC.md, "POST /api/push response shape":
+          ;; compact omits machineResults and nothing else. This used to empty
+          ;; machineResults rather than remove it — an empty object is not an
+          ;; absent key to a consumer walking the response — and to drop
+          ;; perceptualSpace entirely, so a compact push returned no reality
+          ;; vector at all. The engine computed the right answer and did not
+          ;; report it, which the cross-runtime parity stage read as engine
+          ;; divergence (RealityEngine_Scala#43).
           (when (jobject-p step)
-            (unless include-machine-results
-              (setf (jget step "machineResults") (obj)))
-            (when compact
-              (setf (jget step "machineResults") (obj))
-              (remhash "perceptualSpace" step)))
+            (when (or compact (not include-machine-results))
+              (remhash "machineResults" step)))
           (setf (perception-engine-last-push engine) step)
           (let ((result (obj "success" t
                              "step" step
