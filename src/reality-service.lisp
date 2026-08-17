@@ -898,6 +898,10 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
            (reality-state-latched-event-bits state)))
 
 (defun process-perceptual-input (state input &key override include-machine-results include-perceptual-space compact)
+  ;; include-perceptual-space is accepted and ignored: SURFACE_SPEC.md makes
+  ;; perceptualSpace unconditional in the push response. Kept in the lambda list
+  ;; so existing callers (and RE_INCLUDE_PERCEPTUAL_SPACE) do not become errors.
+  (declare (ignore include-perceptual-space))
   (ensure-space-length state (max (reality-state-dimension state) (length input)))
   (setf (reality-state-perceptual-space state)
         (append input (make-list (max 0 (- (reality-state-dimension state) (length input)))
@@ -986,17 +990,31 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
            ;; It made the universal-vector parity signature differ from C++ on
            ;; every event: the harness collects any object holding mergeBatch,
            ;; so the step itself contributed a spurious {"success": true}.
+           ;; Key set fixed by SURFACE_SPEC.md, "POST /api/push response shape".
+           ;;
+           ;; No "inputVector": this was the only runtime that emitted one. The
+           ;; Perception Engine assembled that vector and sent it, so echoing it
+           ;; back is redundant, and C++'s SimulationStep has no step-level
+           ;; input vector to echo.
+           ;;
+           ;; machineResults is omitted under compact rather than emitted empty.
+           ;; An empty object is not the same as an absent key to a consumer
+           ;; walking the response, and the other two omit it.
            (step (obj "stepNumber" step-number
                      "timestamp" (now-ms)
-                     "inputVector" (vectorize input)
-                     "machineResults" (if include-machine-results machine-results (obj))
                      "mergeBatch" (vectorize merge-batch)
                      "eventBus" (vectorize event-bus)
                      "activeRegions" (vectorize (nreverse active-regions)))))
       (setf (reality-state-step-count state) (1+ step-number))
-      (when include-perceptual-space
-        (setf (jget step "perceptualSpace") (vectorize (reality-state-perceptual-space state))
-              (jget step "perceptualSpaceIsDebugProjection") t))
+      (when include-machine-results
+        (setf (jget step "machineResults") machine-results))
+      ;; Always present, compact or not. This was gated on
+      ;; include-perceptual-space, so a compact push returned no reality vector
+      ;; at all — the engine computed the right answer and did not report it,
+      ;; which is what the cross-runtime parity stage read as divergence
+      ;; (RealityEngine_Scala#43).
+      (setf (jget step "perceptualSpace") (vectorize (reality-state-perceptual-space state))
+            (jget step "perceptualSpaceIsDebugProjection") t)
       (record-history state step)
       step)))
 

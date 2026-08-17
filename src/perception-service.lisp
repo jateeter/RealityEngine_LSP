@@ -1798,15 +1798,19 @@ it is accepted as an alternative to the body bridgeToken/token fields."
           (record-dispatch-envelopes-from-step state step)
           ;; Trim the reported step to what was asked for.  Done here, after
           ;; the state update and the dispatch pass, so asking for less never
-          ;; means the engine does less.  The reported shape is the same as
-          ;; before: machine results emptied unless requested, and the
-          ;; perceptual space omitted under compact.
+          ;; means the engine does less.
+          ;;
+          ;; Shape fixed by SURFACE_SPEC.md, "POST /api/push response shape":
+          ;; compact omits machineResults and nothing else. This used to empty
+          ;; machineResults rather than remove it — an empty object is not an
+          ;; absent key to a consumer walking the response — and to drop
+          ;; perceptualSpace entirely, so a compact push returned no reality
+          ;; vector at all. The engine computed the right answer and did not
+          ;; report it, which the cross-runtime parity stage read as engine
+          ;; divergence (RealityEngine_Scala#43).
           (when (jobject-p step)
-            (unless include-machine-results
-              (setf (jget step "machineResults") (obj)))
-            (when compact
-              (setf (jget step "machineResults") (obj))
-              (remhash "perceptualSpace" step)))
+            (when (or compact (not include-machine-results))
+              (remhash "machineResults" step)))
           (setf (perception-engine-last-push engine) step)
           (let ((result (obj "success" t
                              "step" step
