@@ -1549,22 +1549,6 @@ IRIs joined from the corpus semantics manifest."
    (make-route "GET" "/api/machine-graph" (lambda (_ body query)
                                            (declare (ignore _ body query))
                                            (json-response (actor-ask actor #'machine-graph-json))))
-   ;; Arbitration records for the most recent step (ARBITER_CONTRACT.md 6).
-   ;;
-   ;; The records were produced and stored on the state all along; nothing
-   ;; served them, so from outside the process a resolution was
-   ;; indistinguishable from no resolution, and acceptance criteria 8 and 9
-   ;; could not be checked. A suppressed contribution has to stay attributable
-   ;; — "the agent's answer was discarded" is the operational fact the domain
-   ;; bus exists to surface.
-   ;;
-   ;; Wire shape matches the Scala and C++ runtimes exactly; cross-runtime
-   ;; parity is the acceptance test for this contract, so a divergent shape
-   ;; here would defeat the endpoint's own purpose.
-   (make-route "GET" "/api/arbitration"
-               (lambda (_ body query)
-                 (declare (ignore _ body query))
-                 (json-response (actor-ask actor #'arbitration-json))))
    (make-route "POST" "/api/perceptual-simulation/step" (lambda (_ body query)
                                                          (declare (ignore _ body query))
                                                          (json-response (actor-ask actor (lambda (state)
@@ -2137,6 +2121,21 @@ IRIs joined from the corpus semantics manifest."
      (make-route "GET" "/api/machine-graph" (lambda (_ body query)
                                               (declare (ignore _ body query))
                                               (state-json #'machine-graph-json)))
+     ;; Arbitration records for the most recent step (ARBITER_CONTRACT.md 6).
+     ;;
+     ;; Registered in the *live* reality-routes. The function is defined twice
+     ;; and the second shadows the first; #48's addition went into the shadowed
+     ;; one, so the endpoint 404'd while looking present in the source. The
+     ;; hosted arbiter stage caught it:
+     ;;   FAIL lsp:lsp-1: GET /api/arbitration -> 404 No route for GET /api/arbitration
+     ;;
+     ;; A suppressed contribution has to stay attributable — "the agent's answer
+     ;; was discarded" is the operational fact the domain bus exists to surface.
+     ;; Wire shape matches the Scala, C++ and TS runtimes exactly; byte
+     ;; equivalence is this contract's acceptance test.
+     (make-route "GET" "/api/arbitration" (lambda (_ body query)
+                                            (declare (ignore _ body query))
+                                            (state-json #'arbitration-json)))
      ;; ── Perceptual simulation ─────────────────────────────────────────────────
      (make-route "POST" "/api/perceptual-simulation/step" (lambda (_ body query)
                                                             (declare (ignore _ body query))
