@@ -364,12 +364,14 @@ Per-sequence boundaries live in metadata.segments for UI display."
                                     :id (format nil "test-~a" mid)
                                     :kind "test"
                                     :name (format nil "~a / ~a" mname label)
-                                    ;; Active on successful load. A machine that
-                                    ;; loaded is one the deployment asked for;
-                                    ;; leaving its source inactive made the PE's
-                                    ;; account of the corpus differ from the
-                                    ;; Reality Engine's, and differ per runtime.
-                                    :active-p (not (env-bool "PE_SOURCE_MERGE" nil))
+                                    ;; Inactive by default. Activating every
+                                    ;; machine source made all three runtimes
+                                    ;; replay their input sequences on every
+                                    ;; push and the divergence went three-way
+                                    ;; rather than away (RealityEngine_Scala#43).
+                                    ;; PE_SOURCE_ACTIVATE_ON_LOAD=true turns it
+                                    ;; on for a deliberate experiment.
+                                    :active-p (env-bool "PE_SOURCE_ACTIVATE_ON_LOAD" nil)
                                     :region (make-region
                                              :offset (truncate (or (jnumber input-region "offset" 0) 0))
                                              :length (truncate (or (jnumber input-region "length" 0) 0)))
