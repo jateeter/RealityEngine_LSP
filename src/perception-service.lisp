@@ -332,7 +332,16 @@ Per-sequence boundaries live in metadata.segments for UI display."
                     (and (jobject-p metadata)
                          (jarray-list (or (jget metadata "inputSequences") (arr))))))
               (cond
-                ((or (null mid) (gethash mid existing)
+                ;; A corpus machine is (re)loaded whether or not a source
+                ;; already claims to describe it. `ensure-source-id` keys on
+                ;; test-<machineId>, so a reload replaces in place rather than
+                ;; duplicating. Nothing in an existing source says whether its
+                ;; machine still has the same CESs, interconnections or regions
+                ;; — a redefined machine may replace the old one entirely — so
+                ;; skipping the rebuild keeps a source describing a machine
+                ;; that no longer exists. PE_SOURCE_MERGE=true restores the skip.
+                ((or (null mid)
+                     (and (env-bool "PE_SOURCE_MERGE" nil) (gethash mid existing))
                      (not (jobject-p input-region))
                      (null input-sequences))
                  (incf skipped))
@@ -355,7 +364,12 @@ Per-sequence boundaries live in metadata.segments for UI display."
                                     :id (format nil "test-~a" mid)
                                     :kind "test"
                                     :name (format nil "~a / ~a" mname label)
-                                    :active-p nil
+                                    ;; Active on successful load. A machine that
+                                    ;; loaded is one the deployment asked for;
+                                    ;; leaving its source inactive made the PE's
+                                    ;; account of the corpus differ from the
+                                    ;; Reality Engine's, and differ per runtime.
+                                    :active-p (not (env-bool "PE_SOURCE_MERGE" nil))
                                     :region (make-region
                                              :offset (truncate (or (jnumber input-region "offset" 0) 0))
                                              :length (truncate (or (jnumber input-region "length" 0) 0)))
