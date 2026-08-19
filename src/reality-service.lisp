@@ -2,6 +2,19 @@
 
 (defstruct reality-state
   dimension machines machine-dir perceptual-space history history-limit include-machine-results-p
+  ;; Audit trail for POST /api/engine/process — what GET /api/engine/history
+  ;; serves, here and on every other runtime.
+  ;;
+  ;; These records used to be pushed onto `history` alongside step records, and
+  ;; both endpoints served that one list. So /api/engine/history returned step
+  ;; records this runtime alone put there, and /api/perceptual-simulation/history
+  ;; returned engine-process envelopes interleaved with the steps. Two surfaces,
+  ;; one list, neither meaning what it does on C++ (RealityEngine_CI#148).
+  ;; `history` is now the step history only, and this is the audit trail.
+  engine-history
+  ;; Trajectory histories — see SURFACE_SPEC.md, "Trajectory histories".
+  ;; Oldest-first, capped at +trajectory-capacity+.
+  isre-history orev-history
   include-perceptual-space-p vector-store sequences qdrant-url collection-name started-at
   event-bus-subscriptions latched-event-bits step-count mapping-version
   ;; CES coverage counters — mirror RealityEngine_AI/CesCoverageRegistry and
@@ -158,6 +171,9 @@ domain subdirectories load by filename (corpus filenames are unique)."
            :machine-dir machine-dir
            :perceptual-space (make-list dimension :initial-element 0.0d0)
            :history nil
+           :engine-history nil
+           :isre-history nil
+           :orev-history nil
            :history-limit (env-int "RE_HISTORY_LIMIT" 250)
            :include-machine-results-p (env-bool "RE_INCLUDE_MACHINE_RESULTS" t)
            :include-perceptual-space-p (env-bool "RE_INCLUDE_PERCEPTUAL_SPACE" t)
@@ -194,6 +210,51 @@ domain subdirectories load by filename (corpus filenames are unique)."
   (when (> (length (reality-state-history state)) (reality-state-history-limit state))
     (setf (reality-state-history state)
           (subseq (reality-state-history state) 0 (reality-state-history-limit state)))))
+
+;; Newest-first and capped at 256, matching C++'s record_engine_history.
+(defconstant +engine-history-capacity+ 256)
+
+(defun record-engine-history (state item)
+  (push item (reality-state-engine-history state))
+  (when (> (length (reality-state-engine-history state)) +engine-history-capacity+)
+    (setf (reality-state-engine-history state)
+          (subseq (reality-state-engine-history state) 0 +engine-history-capacity+))))
+
+(defconstant +trajectory-capacity+ 1024)
+
+;; Dense vector -> sparse trajectory entry. A cell absent from `nonZero` is
+;; zero; `length` keeps the dense width so the reconstruction is exact.
+(defun sparse-trajectory (step-number dense)
+  (let ((cells nil)
+        (index 0))
+    (dolist (value dense)
+      (unless (zerop value)
+        (push (obj "index" index "value" value) cells))
+      (incf index))
+    (obj "stepNumber" step-number
+         "length" (length dense)
+         "nonZero" (vectorize (nreverse cells)))))
+
+;; Appends ISRE(n) and OREV(n) together. They are captured at their own
+;; observation points inside the step and recorded in one action, so no observer
+;; can see a step whose trajectories are half-written.
+;;
+;; Oldest-first. The step history is newest-first because it is read as "what
+;; just happened"; these are read as sequences to be compared element by element,
+;; and the index of the first disagreement is the answer they exist to give.
+(defun record-trajectory (state isre orev)
+  (setf (reality-state-isre-history state)
+        (last (append (reality-state-isre-history state) (list isre)) +trajectory-capacity+)
+        (reality-state-orev-history state)
+        (last (append (reality-state-orev-history state) (list orev)) +trajectory-capacity+)))
+
+;; Ascending stepNumber. `from` is the first stepNumber to include; `limit` caps
+;; the entries returned from there (0 or nil = all).
+(defun trajectory-window (entries from limit)
+  (let ((selected (remove-if (lambda (entry) (< (jnumber entry "stepNumber" 0) from)) entries)))
+    (vectorize (if (and limit (> limit 0))
+                   (subseq selected 0 (min limit (length selected)))
+                   selected))))
 
 (defun required-dimension (state)
   (let ((required (reality-state-dimension state)))
@@ -240,6 +301,9 @@ domain subdirectories load by filename (corpus filenames are unique)."
   (setf (reality-state-perceptual-space state)
         (make-list (reality-state-dimension state) :initial-element 0.0d0)
         (reality-state-history state) nil
+        (reality-state-engine-history state) nil
+        (reality-state-isre-history state) nil
+        (reality-state-orev-history state) nil
         (reality-state-latched-event-bits state) (make-hash-table :test #'equal)
         (reality-state-step-count state) 0
         (reality-state-cov-matched    state) (make-hash-table :test #'equal)
@@ -907,7 +971,16 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
         (append input (make-list (max 0 (- (reality-state-dimension state) (length input)))
                                  :initial-element 0.0d0)))
   (apply-latched-event-bits state)
-  (let ((machine-results (make-hash-table :test #'equal))
+  ;; ISRE(n) observation point. This is the input space reality event the corpus
+  ;; is about to be presented with: every extract-region below reads exactly this
+  ;; state, so capturing it here — after the latched bits are re-applied and
+  ;; before the first extract — records what the corpus read rather than an
+  ;; approximation of it. The arbitration feedback from step n-1 is already
+  ;; merged in; the gap between this and the seed is what arbitration did.
+  (let ((isre (sparse-trajectory (reality-state-step-count state)
+                                 (reality-state-perceptual-space state)))
+        (orev nil)
+        (machine-results (make-hash-table :test #'equal))
         (merge-batch nil)
         (active-regions nil))
     (dolist (machine (object-values-sorted (reality-state-machines state)))
@@ -976,11 +1049,23 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                 active-regions)))
       (multiple-value-bind (resolved records)
           (resolve-all by-cell (reality-state-step-count state))
-        (dolist (pair resolved)
-          (setf (reality-state-perceptual-space state)
-                (merge-region (reality-state-perceptual-space state)
-                              (make-region :offset (car pair) :length 1)
-                              (list (cdr pair)))))
+        ;; OREV(n) observation point. The corpus's output for this step exists as
+        ;; a single-valued vector at exactly one instant: after resolution, as it
+        ;; is committed. Recording it in the same loop as the writes is what makes
+        ;; the entry and the space agree by construction rather than by a later
+        ;; read that could observe a different state.
+        (let ((cells nil))
+          (dolist (pair resolved)
+            (setf (reality-state-perceptual-space state)
+                  (merge-region (reality-state-perceptual-space state)
+                                (make-region :offset (car pair) :length 1)
+                                (list (cdr pair))))
+            (unless (zerop (cdr pair))
+              (push (obj "index" (car pair) "value" (cdr pair)) cells)))
+          (setf orev (obj "stepNumber" (reality-state-step-count state)
+                          "length" (length (reality-state-perceptual-space state))
+                          "nonZero" (vectorize (sort (nreverse cells) #'<
+                                                     :key (lambda (c) (jnumber c "index" 0)))))))
         (setf (reality-state-arbitration state) records)))
     (let* ((event-bus (apply-event-bus state merge-batch))
            (step-number (reality-state-step-count state))
@@ -1015,6 +1100,7 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
       ;; (RealityEngine_Scala#43).
       (setf (jget step "perceptualSpace") (vectorize (reality-state-perceptual-space state))
             (jget step "perceptualSpaceIsDebugProjection") t)
+      (record-trajectory state isre orev)
       (record-history state step)
       step)))
 
@@ -1414,9 +1500,28 @@ IRIs joined from the corpus semantics manifest."
                                                (actor-ask actor
                                                           (lambda (state)
                                                             (obj "history" (vectorize (if (and limit (> limit 0))
-                                                                                          (subseq (reality-state-history state)
-                                                                                                  0 (min limit (length (reality-state-history state))))
-                                                                                          (reality-state-history state))))))))))
+                                                                                          (subseq (reality-state-engine-history state)
+                                                                                                  0 (min limit (length (reality-state-engine-history state))))
+                                                                                          (reality-state-engine-history state))))))))))
+   ;; Trajectory histories — SURFACE_SPEC.md, "Trajectory histories".
+   (make-route "GET" "/api/engine/orev-history" (lambda (_ body query)
+                                                  (declare (ignore _ body))
+                                                  (json-response
+                                                   (actor-ask actor
+                                                              (lambda (state)
+                                                                (obj "history" (trajectory-window
+                                                                                (reality-state-orev-history state)
+                                                                                (or (parse-integer (or (gethash "from" query) "0") :junk-allowed t) 0)
+                                                                                (parse-integer (or (gethash "limit" query) "0") :junk-allowed t))))))))
+   (make-route "GET" "/api/engine/isre-history" (lambda (_ body query)
+                                                  (declare (ignore _ body))
+                                                  (json-response
+                                                   (actor-ask actor
+                                                              (lambda (state)
+                                                                (obj "history" (trajectory-window
+                                                                                (reality-state-isre-history state)
+                                                                                (or (parse-integer (or (gethash "from" query) "0") :junk-allowed t) 0)
+                                                                                (parse-integer (or (gethash "limit" query) "0") :junk-allowed t))))))))
    (make-route "POST" "/api/engine/process" (lambda (_ body query)
                                              (declare (ignore _ query))
                                              (json-response
@@ -1434,7 +1539,7 @@ IRIs joined from the corpus semantics manifest."
                                                              (let ((result (obj "inputVector" (vectorize input)
                                                                                 "timestamp" (now-ms)
                                                                                 "outputs" (vectorize (nreverse outputs)))))
-                                                               (record-history state (obj "type" "engine-process" "result" result))
+                                                               (record-engine-history state (obj "type" "engine-process" "result" result))
                                                                (obj "result" result))))))))
    (make-route "GET" "/api/machines" (lambda (_ body query)
                                       (declare (ignore _ body))
@@ -1813,11 +1918,26 @@ IRIs joined from the corpus semantics manifest."
                                                                 (let ((result (obj "inputVector" (vectorize input)
                                                                                    "timestamp" (now-ms)
                                                                                    "outputs" (vectorize (nreverse outputs)))))
-                                                                  (record-history state (obj "type" "engine-process" "result" result))
+                                                                  (record-engine-history state (obj "type" "engine-process" "result" result))
                                                                   (obj "result" result)))))))
      (make-route "GET" "/api/engine/history" (lambda (_ body query)
                                                (declare (ignore _ body query))
-                                               (state-json (lambda (state) (obj "history" (vectorize (reality-state-history state)))))))
+                                               (state-json (lambda (state) (obj "history" (vectorize (reality-state-engine-history state)))))))
+     ;; Trajectory histories — SURFACE_SPEC.md, "Trajectory histories".
+     (make-route "GET" "/api/engine/orev-history" (lambda (_ body query)
+                                                    (declare (ignore _ body))
+                                                    (state-json (lambda (state)
+                                                                  (obj "history" (trajectory-window
+                                                                                  (reality-state-orev-history state)
+                                                                                  (or (parse-integer (or (gethash "from" query) "0") :junk-allowed t) 0)
+                                                                                  (parse-integer (or (gethash "limit" query) "0") :junk-allowed t)))))))
+     (make-route "GET" "/api/engine/isre-history" (lambda (_ body query)
+                                                    (declare (ignore _ body))
+                                                    (state-json (lambda (state)
+                                                                  (obj "history" (trajectory-window
+                                                                                  (reality-state-isre-history state)
+                                                                                  (or (parse-integer (or (gethash "from" query) "0") :junk-allowed t) 0)
+                                                                                  (parse-integer (or (gethash "limit" query) "0") :junk-allowed t)))))))
      (make-route "GET" "/api/engine/active" (lambda (_ body query)
                                               (declare (ignore _ body query))
                                               (state-json (lambda (state) (obj "activeVectors" (active-vectors-json state))))))
