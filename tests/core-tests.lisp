@@ -1071,6 +1071,54 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
       (assert-true (reality-engine-lsp::jbool js "stale" nil) "stale sensor reports stale=true in JSON")
       (assert-true (> (reality-engine-lsp::jnumber js "ageMs" 0) 0) "stale sensor reports positive ageMs")))
 
+  ;; ── Assembled vector: a source owns its region (#53) ──────────────────
+  ;; Zero-valued cells used to be skipped, so a cell a source drove low kept
+  ;; whatever the persistent vector held from the previous step. The RE was
+  ;; then handed an input the source never published, and a CES needing a cell
+  ;; to go low never matched again — no output, no error. Measured against the
+  ;; DLX011 req/ack handshake, this runtime fired nothing across six pushes
+  ;; where C++ and Scala each fired twice.
+  (let* ((engine (reality-engine-lsp::make-perception-engine-state 4))
+         (now (reality-engine-lsp::now-ms))
+         (source (reality-engine-lsp::make-source
+                  :id "s-region" :kind "sensor" :name "region owner"
+                  :active-p t
+                  :region (reality-engine-lsp::make-region :offset 0 :length 2)
+                  :sensor-id "region-sid"
+                  :last-value (list 1.0d0 0.0d0)
+                  :last-updated now :ttl-ms 60000)))
+    (reality-engine-lsp::ensure-source-id engine source)
+    ;; Stale state under the region, exactly as adopting the RE's post-merge
+    ;; perceptual space leaves it.
+    (reality-engine-lsp::update-from-perceptual-space engine (list 1.0d0 1.0d0 0.0d0 0.0d0))
+    (let ((vec (reality-engine-lsp::assemble-perception-vector engine)))
+      (assert-equal 1.0d0 (nth 0 vec) "source's 1.0 is written")
+      (assert-equal 0.0d0 (nth 1 vec) "source's 0.0 overwrites stale 1.0 rather than being skipped"))
+    ;; The handshake step that used to be impossible: drive the region low
+    ;; where it was high.
+    (setf (reality-engine-lsp::source-last-value source) (list 0.0d0 1.0d0)
+          (reality-engine-lsp::source-last-updated source) (reality-engine-lsp::now-ms))
+    (let ((vec (reality-engine-lsp::assemble-perception-vector engine)))
+      (assert-equal 0.0d0 (nth 0 vec) "a cell driven low reaches the RE as low")
+      (assert-equal 1.0d0 (nth 1 vec) "the cell driven high reaches the RE as high")))
+
+  ;; Cells are clamped to [0,1], as C++ and Scala both do. An unclamped 2.0
+  ;; reaching a comparator whose threshold is above 1.0 makes the same machine
+  ;; decide differently per runtime.
+  (let* ((engine (reality-engine-lsp::make-perception-engine-state 3))
+         (source (reality-engine-lsp::make-source
+                  :id "s-clamp" :kind "sensor" :name "clamp"
+                  :active-p t
+                  :region (reality-engine-lsp::make-region :offset 0 :length 3)
+                  :sensor-id "clamp-sid"
+                  :last-value (list 2.5d0 -1.0d0 0.4d0)
+                  :last-updated (reality-engine-lsp::now-ms) :ttl-ms 60000)))
+    (reality-engine-lsp::ensure-source-id engine source)
+    (let ((vec (reality-engine-lsp::assemble-perception-vector engine)))
+      (assert-equal 1.0d0 (nth 0 vec) "above-range value clamps to 1.0")
+      (assert-equal 0.0d0 (nth 1 vec) "below-range value clamps to 0.0")
+      (assert-equal 0.4d0 (nth 2 vec) "in-range value passes through unchanged")))
+
   ;; ── MQTT mapping registry parity ──────────────────────────────────────
   (let* ((json-text "{\"mappings\":[
                        {\"id\":\"zone-temp\",

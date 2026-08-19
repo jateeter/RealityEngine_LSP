@@ -223,6 +223,11 @@ our dimension — grow to match rather than truncating to it."
     (loop for i from 0 below dim do
       (setf (aref pv i) (coerce (or (elt ps i) 0) 'double-float)))))
 
+(defun clamp-cell (value)
+  "Coerce VALUE to a perceptual cell: double-float in [0,1]."
+  (let ((v (coerce (or value 0) 'double-float)))
+    (max 0.0d0 (min 1.0d0 v))))
+
 (defun assemble-perception-vector (engine)
   (let* ((dimension (perception-engine-dimension engine))
          (pv (perception-engine-persistent-vector engine))
@@ -245,11 +250,29 @@ our dimension — grow to match rather than truncating to it."
                      (or (source-name source) (source-id source))
                      offset (+ offset length) dimension
                      (or (source-machine-id source) "") (or (source-id source) "")))
+           ;; Every cell of the region is written, zeros included, and clamped
+           ;; to [0,1] — the same rule C++ (PerceptionEngine::assemble_vector)
+           ;; and Scala (PerceptionEngine.assembleVector) apply. A source owns
+           ;; its region: what it publishes is what the RE must see.
+           ;;
+           ;; This used to skip zero-valued cells, so a cell a source drove low
+           ;; kept whatever the persistent vector held from the previous step,
+           ;; and the RE was handed an input the source never published. A CES
+           ;; needing a cell to go low then never matched again — silently, with
+           ;; no output and no error. DLX011's req/ack handshake needs
+           ;; [1,0,0,0] then [0,1,0,0]; this runtime presented [1,1,0,0] at the
+           ;; second step and fired nothing across six pushes where C++ and
+           ;; Scala each fired twice (#53).
+           ;;
+           ;; Clamping was absent for the same reason the zeros were: the write
+           ;; was treated as an overlay rather than as the region's value. An
+           ;; unclamped 2.0 reaching a comparator whose threshold is above 1.0
+           ;; makes the same machine decide differently per runtime.
            (loop for value in payload
                  for i from offset
                  repeat length
-                 when (and (< i dimension) (not (zerop value)))
-                   do (setf (aref assembled i) (coerce value 'double-float))))))
+                 when (< i dimension)
+                   do (setf (aref assembled i) (clamp-cell value))))))
      (perception-engine-sources engine))
     (coerce assembled 'list)))
 
