@@ -995,7 +995,40 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
            (record-machine-coverage state machine (transition-result-json result))
            (record-semantic-audit state machine (transition-result-json result))
            (when include-machine-results
-             (setf (gethash id machine-results) (transition-result-json result)))
+             ;; Canonical entry shape, matching C++ and Scala:
+             ;;   {machineId, machineName, inputRegion, inputVector,
+             ;;    outputRegion, outputVector, transitionResult}
+             ;;
+             ;; This used to emit the transition result *itself* as the entry, so
+             ;; the object carried arbiterMetadata/sequenceResults/machineOutput
+             ;; at the top level and had no machineName, no outputRegion and no
+             ;; outputVector at all. Two consequences, both silent:
+             ;;
+             ;;   * `machineResults` had a different key set per runtime on a
+             ;;     surface SURFACE_SPEC.md governs as uniform.
+             ;;   * This runtime's own PE aggregator reads
+             ;;     transitionResult.arbiterMetadata.shouldOutput, outputRegion
+             ;;     and outputVector to merge machine outputs into the next
+             ;;     InputSpaceVector. None of those keys existed here, so the
+             ;;     aggregator matched nothing and merged nothing — machine
+             ;;     outputs never fed back into the perceptual space, and the
+             ;;     divergence showed up as a cell where two machines' outputs
+             ;;     disagreed (cell 3969, AgHarvestReadinessAssessor [3967:3971]
+             ;;     vs AGX055 [3959:3971] — RealityEngine_CI corpus parity
+             ;;     sweep, 2026-08-19).
+             (let* ((out-mapping (mapping-output mapping))
+                    (machine-out (transition-result-machine-output result))
+                    (out-values  (and machine-out (output-vector-vector machine-out))))
+               (setf (gethash id machine-results)
+                     (obj "machineId"        id
+                          "machineName"      (or (machine-name machine) "")
+                          "inputRegion"      (region-json (mapping-input mapping))
+                          "inputVector"      (vectorize machine-input)
+                          "outputRegion"     (if out-mapping
+                                                (region-json out-mapping)
+                                                +json-null+)
+                          "outputVector"     (vectorize (or out-values nil))
+                          "transitionResult" (transition-result-json result)))))
            (push (obj "offset" (region-offset (mapping-input mapping))
                       "length" (region-length (mapping-input mapping))
                       "machineId" id

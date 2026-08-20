@@ -35,6 +35,44 @@ per source, each element written by walking the list from the head."
                           :persistent-vector (make-perceptual-buffer dimension)
                           :global-step 0))
 
+(defun reset-perception-engine (engine)
+  "Reset playback state in place, keeping the registered sources.
+
+Resets what a run accumulates — global step, the persistent vector, and every
+source's playback cursor — and re-arms test sources, matching C++
+`PerceptionEngine::reset` and Scala `PerceptionEngine.reset()`.
+
+Sources deliberately survive. Replacing the engine struct wholesale (the
+previous behaviour) discarded them, so `POST /api/reset` silently emptied the
+PE: after a reset this runtime assembled all-zero vectors and contributed
+nothing, while C++ and Scala kept replaying their sequences. Three runtimes
+given the same corpus then presented three different inputs, and the trajectory
+comparison reported it as engine divergence (RealityEngine_CI corpus parity
+sweep, 2026-08-19).
+
+Removing a source is a separate operation and is still supported: `DELETE
+/api/sources/:id`, and the corpus-driven path that drops a machine's source when
+the machine leaves the dynamic corpus. Reset means \"start this run again\",
+not \"forget what is connected\".
+
+Left alone on purpose: dimension, match algorithm, and the auto-push settings.
+Those are configuration rather than run state, and C++ and Scala do not clear
+them either — the previous implementation reset the match algorithm to \"gte\"
+and the auto interval to 1000ms as a side effect of rebuilding the struct."
+  (setf (perception-engine-global-step engine) 0)
+  (setf (perception-engine-last-push engine) nil)
+  (let ((pv (perception-engine-persistent-vector engine)))
+    (when pv (fill pv 0.0d0)))
+  (let ((sources (perception-engine-sources engine)))
+    (when sources
+      (maphash (lambda (id source)
+                 (declare (ignore id))
+                 (setf (source-cursor source) 0)
+                 (when (string= (source-kind source) "test")
+                   (setf (source-active-p source) t)))
+               sources)))
+  engine)
+
 (defun ensure-perception-dimension (engine required-end &optional context)
   "Grow the perceptual space so [0, REQUIRED-END) is addressable.
 
@@ -175,8 +213,45 @@ under byte comparison."
                   ((string> na nb) nil)
                   (t (and (string< (or (source-id a) "") (or (source-id b) "")) t)))))))
 
+(defun advance-perception-engine (engine)
+  "Advance playback by one step: global step, and each active test source's cursor.
+
+Called once per push, after the vector has been assembled and sent — matching
+`PerceptionEngine::advance` (C++) and `PerceptionEngine.advance()` (Scala).
+
+The cursor used to advance inside SAMPLE-SOURCE, which is called from
+ASSEMBLE-PERCEPTION-VECTOR, which is called by `/api/state` as well as by the
+push path. Reading the engine therefore advanced its playback: a caller that
+polled state before each push consumed two vectors per push, so this runtime
+walked a machine's interned sequence at a different rate from C++ and Scala and
+its trajectory diverged from theirs. Observation must not mutate the thing
+observed (RealityEngine_CI corpus parity sweep, 2026-08-19)."
+  (incf (perception-engine-global-step engine))
+  (let ((sources (perception-engine-sources engine)))
+    (when sources
+      (maphash
+       (lambda (id source)
+         (declare (ignore id))
+         (when (and (source-active-p source)
+                    (string= (source-kind source) "test"))
+           (let* ((inputs (source-inputs source))
+                  (count  (length inputs))
+                  (cursor (or (source-cursor source) 0)))
+             (when (plusp count)
+               (if (< (1+ cursor) count)
+                   (setf (source-cursor source) (1+ cursor))
+                   (progn
+                     (setf (source-cursor source) 0)
+                     (unless (source-loop-p source)
+                       (setf (source-active-p source) nil))))))))
+       sources)))
+  engine)
+
 (defun sample-source (source dimension)
   "Return (values PAYLOAD OFFSET LENGTH) for SOURCE, or NIL when inactive.
+
+A pure read: it reports what the source currently publishes and does not
+advance it. ADVANCE-PERCEPTION-ENGINE does that, once per push.
 
 Previously returned a freshly allocated DIMENSION-length list with the
 payload written at OFFSET, which cost O(dimension) allocation and O(n^2)
@@ -192,13 +267,8 @@ writes per source.  Callers now place the payload themselves."
                   (let ((inputs (source-inputs source)))
                     (when inputs
                       (let* ((cursor (or (source-cursor source) 0))
-                             (index (min cursor (1- (length inputs))))
-                             (selected (nth index inputs)))
-                        (if (< (1+ cursor) (length inputs))
-                            (incf (source-cursor source))
-                            (when (source-loop-p source)
-                              (setf (source-cursor source) 0)))
-                        selected))))
+                             (index (min cursor (1- (length inputs)))))
+                        (nth index inputs)))))
                  ((string= (source-kind source) "sensor")
                   ;; TTL eviction — when a sensor source has gone stale we
                   ;; drop its contribution to the assembled vector.  Matches
@@ -236,9 +306,20 @@ our dimension — grow to match rather than truncating to it."
     (when pv
       (loop for i from 0 below (min dimension (length pv))
             do (setf (aref assembled i) (elt pv i))))
-    (maphash
-     (lambda (_ source)
-       (declare (ignore _))
+    ;; Canonical order, not hash order. Two machines may declare the same input
+    ;; region — AGX032 and AGX054 both map [228:232] — and a source owns its
+    ;; region, so where regions overlap the last writer wins. Iterating the
+    ;; sources table with MAPHASH made that winner depend on hash order, which is
+    ;; unspecified and differs per runtime; C++ walked a std::map keyed by
+    ;; source id and Scala walked a Map in its own hash order, so the three
+    ;; runtimes assembled different input vectors from identical corpora
+    ;; (RealityEngine_CI corpus parity sweep, 2026-08-19).
+    ;;
+    ;; SOURCES-IN-CANONICAL-ORDER sorts by (name, id) — the same order already
+    ;; used for the listing endpoints, and derived from corpus-declared names
+    ;; rather than runtime-minted ids.
+    (dolist (source (sources-in-canonical-order engine))
+     (let ()
        (multiple-value-bind (payload offset length) (sample-source source dimension)
          (when payload
            ;; Growth should make this unreachable; if a region still does not
@@ -272,8 +353,7 @@ our dimension — grow to match rather than truncating to it."
                  for i from offset
                  repeat length
                  when (< i dimension)
-                   do (setf (aref assembled i) (clamp-cell value))))))
-     (perception-engine-sources engine))
+                   do (setf (aref assembled i) (clamp-cell value)))))))
     (coerce assembled 'list)))
 
 (defun perception-state-json (engine)

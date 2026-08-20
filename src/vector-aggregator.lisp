@@ -7,8 +7,20 @@
 ;;;
 ;;; Gating:      only machines whose transitionResult.arbiterMetadata.shouldOutput
 ;;;              is true contribute to the merge.
-;;; Merge order: deterministic — records collected via maphash are sorted by
-;;;              machineId string before writing (maphash order is not guaranteed).
+;;; Merge order: deterministic *and* identical across runtimes — records are
+;;;              sorted by machineName, which the corpus declares and which is
+;;;              globally unique across it.
+;;;
+;;;              Sorting by machineId was deterministic within one runtime and
+;;;              different between them: the corpus declares no id, so each
+;;;              runtime mints its own (machine-1787…, machine-1U358SX…). Where
+;;;              two machines' output regions overlap the merge is last-writer-
+;;;              wins, so the winner was decided by an id that differs per
+;;;              engine, and the merged vector — the next InputSpaceVector —
+;;;              diverged. Seen on AgHarvestReadinessAssessor, whose output
+;;;              [3967:3971] overlaps AGX055's [3959:3971]: ISRE cell 3968 read
+;;;              1.0 on C++/LSP and 0.0 on Scala while every OREV agreed
+;;;              (RealityEngine_CI corpus parity sweep, 2026-08-19).
 ;;;
 ;;; This is a thin, stateless function so the aggregation restriction (all machine
 ;;; outputs must be present before the next input vector is assembled) can be
@@ -21,7 +33,7 @@
   (unless (jobject-p machine-results)
     (return-from aggregate-machine-outputs base-vector))
 
-  ;; Collect (machineId offset length vec) records where shouldOutput = t
+  ;; Collect (sort-key offset length vec) records where shouldOutput = t
   (let ((records nil))
     (maphash
      (lambda (machine-id result)
@@ -38,10 +50,15 @@
                  (length (jnumber out-region "length" nil))
                  (vec    (numbers-from-json out-vec-raw)))
              (when (and offset length vec (> length 0))
-               (push (list machine-id (round offset) (round length) vec) records))))))
+               ;; machineName is the corpus-declared handle and is stable across
+               ;; runtimes; machine-id is minted locally. Fall back to the id
+               ;; only if a result carries no name, which keeps a malformed
+               ;; payload ordered rather than unordered.
+               (let ((sort-key (or (jstring result "machineName" nil) machine-id)))
+                 (push (list sort-key (round offset) (round length) vec) records)))))))
      machine-results)
 
-    ;; Sort by machineId for deterministic merge order
+    ;; Sort by machineName — deterministic and identical on every runtime.
     (setf records (sort records #'string< :key #'car))
 
     ;; Use a simple-vector for O(1) random write access

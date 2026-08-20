@@ -1780,7 +1780,11 @@ it is accepted as an alternative to the body bridgeToken/token fields."
                (ts        (now-ms)))
           (when (>= (length next-ps) (perception-engine-dimension engine))
             (update-from-perceptual-space engine next-ps))
-          (incf (perception-engine-global-step engine))
+          ;; Advance playback once per push, after the vector was assembled and
+          ;; sent. This also increments global-step. Cursors used to advance
+          ;; inside assembly, which made `/api/state` advance them too — see
+          ;; advance-perception-engine.
+          (advance-perception-engine engine)
           ;; Semantic audit (SEMANTIC_AUDIT_CONTRACT.md): one re:PerceptionEvent
           ;; per active source region written this push, attributed to the
           ;; integration feeding it and joined to the corpus ABox when the
@@ -2026,9 +2030,12 @@ it is accepted as an alternative to the body bridgeToken/token fields."
                                     (json-response
                                      (actor-ask actor
                                                 (lambda (state)
-                                                  (setf (perception-state-engine state)
-                                                        (make-perception-engine-state
-                                                         (perception-engine-dimension (perception-state-engine state))))
+                                                  ;; Reset run state in place. Rebuilding the engine
+                                                  ;; struct here discarded every registered source,
+                                                  ;; which is a different operation — see
+                                                  ;; reset-perception-engine.
+                                                  (reset-perception-engine
+                                                   (perception-state-engine state))
                                                   (obj "success" t))))))
    (make-route "GET" "/api/sources" (lambda (_ body query)
                                      (declare (ignore _ body query))
