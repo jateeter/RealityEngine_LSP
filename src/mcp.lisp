@@ -159,10 +159,11 @@
            (obj "type" "object" "properties" (obj))
            (lambda (args)
              (declare (ignore args))
+             ;; Reset cursors in place. Rebuilding the engine struct discarded
+             ;; every registered source, which this tool's own description says
+             ;; it does not do — see reset-perception-engine.
              (actor-tell actor (lambda (s)
-                                 (setf (perception-state-engine s)
-                                       (make-perception-engine-state
-                                        (perception-engine-dimension (perception-state-engine s))))))
+                                 (reset-perception-engine (perception-state-engine s))))
              (broadcast (obj "type" "state-update"))
              (mcp-text (json-stringify (obj "success" t "globalStep" 0)))))
 
