@@ -2215,8 +2215,12 @@ IRIs joined from the corpus semantics manifest."
                                                                                                               (unregister-compose-subscriptions state mid)
                                                                                                               (remhash mid (reality-state-machines state))
                                                                                                               (put-machine state (gethash "machine" cp))
-                                                                                                              (obj "success" t))))))))
-                                                                                 (if result (json-response result) (error-response "Checkpoint not found" 404)))))
+                                                                                                              (obj "success" t)))))))
+                                                                                 ;; Inside the LET, not after it. One closing paren too many above
+                                                                                 ;; ended the LET at the binding, so RESULT here was outside its own
+                                                                                 ;; scope and every restore answered 500 "RESULT is unbound" — while
+                                                                                 ;; the restore itself had already been applied by the actor (#57).
+                                                                                 (if result (json-response result) (error-response "Checkpoint not found" 404))))))
      (make-route "DELETE" "/api/machines/:machineId/checkpoints/:cpId" (lambda (params body query)
                                                                          (declare (ignore body query))
                                                                          (state-json (lambda (state)
