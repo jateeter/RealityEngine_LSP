@@ -181,7 +181,22 @@ from a request body with no machine in scope."
     (make-reality-vector :id id
                          :elements elements
                          :initial-p initial-p
-                         :active-p initial-p
+                         ;; Honour a serialised isActive when the document
+                         ;; carries one, and fall back to isInitial when it does
+                         ;; not.
+                         ;;
+                         ;; Corpus machine JSON declares no isActive, so loading
+                         ;; from the corpus is unchanged and still satisfies the
+                         ;; rule that every initial RE is active. A checkpoint,
+                         ;; though, round-trips the machine through
+                         ;; machine-json/machine-from-json to snapshot it, and
+                         ;; deriving activation from isInitial there discarded
+                         ;; exactly what the checkpoint exists to preserve:
+                         ;; restore returned the machine to its *initial*
+                         ;; activation rather than to the step it was captured
+                         ;; at, silently dropping every RE the run had armed
+                         ;; (#57).
+                         :active-p (jbool item "isActive" initial-p)
                          :match-algorithm (comparator-name
                                            (or machine-match-algorithm
                                                (jstring item "matchAlgorithm" "gte")))
