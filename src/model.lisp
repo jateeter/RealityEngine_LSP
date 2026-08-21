@@ -8,8 +8,69 @@
   id elements initial-p active-p match-algorithm metadata next-ids output-vectors just-matched-p predecessor-chain)
 (defstruct (ces (:constructor make-ces) (:conc-name sequence-))
   id name metadata schema-version deprecated-at replaced-by vectors)
-(defstruct machine id name description metadata mapping match-algorithm arbiter-rule sequences)
-(defstruct transition-result input-vector timestamp sequence-results sequence-outputs machine-output arbiter-metadata)
+(defstruct machine id name description metadata mapping match-algorithm arbiter-rule
+                   output-merge-transformation
+                   ;; Interlock on the transformation above. Initialised LOCKED:
+                   ;; the transformation is a training variable, and a run that
+                   ;; retunes one by accident is a run whose results mean nothing
+                   ;; and which nothing distinguishes from a valid one. Changing
+                   ;; it requires unlocking first, deliberately and separately.
+                   ;;
+                   ;; Runtime state, not a corpus property — a machine's declared
+                   ;; transformation travels with it, but whether this deployment
+                   ;; is currently allowed to change it does not. Every restart
+                   ;; comes up locked.
+                   (output-merge-locked t)
+                   sequences)
+
+(defun output-merge-name (value)
+  "Normalise a declared outputMergeTransformation. NIL/absent means \"or\".
+
+The transformation names the n-input gate the Reality Engine folds a machine's
+collection of potential outputs with, at the completion boundary of the atomic
+matching action. Declared per machine and read when the machine is interned.
+See RealityEngine_Machines semantics/ontology/re-core.ttl."
+  (string-downcase (or value "or")))
+
+(defun fold-output-vectors (vectors transformation)
+  "Fold VECTORS — a machine's collection of potential outputs — into one.
+
+An n-input gate applied to the whole collection at once, not a chain of
+two-input gates: the truth table is a function of K, how many contributions
+assert a cell, and N, how many contributions there are.
+
+    or(k,n)  = k >= 1    and(k,n)  = k = n    xor(k,n)  = k odd
+    nor(k,n) = k = 0     nand(k,n) = k < n
+
+Chaining two-input gates would not be equivalent — NOR and NAND are commutative
+but not associative — which is why this is written over counts.
+
+NIL for an empty collection: a machine that completed no Reality Event presents
+no output, which is not the same as presenting a vector of zeros.
+
+CONTESTED, not settled: it has been asserted that any transformation added later
+must likewise be a function of K and N alone. That generalisation is disputed.
+What is established is that these five gates are each symmetric, verified by
+exhaustion in RealityEngine_Machines tests/contracts/owl_semantics_test.py."
+  (when vectors
+    (let* ((n (length vectors))
+           (width (reduce #'max vectors :key #'length :initial-value 0))
+           (name (output-merge-name transformation)))
+      (loop for i from 0 below width
+            collect (let ((k (count-if (lambda (v)
+                                         (let ((cell (nth i v)))
+                                           (and cell (not (zerop cell)))))
+                                       vectors)))
+                      (if (cond ((string= name "or")   (>= k 1))
+                                ((string= name "and")  (= k n))
+                                ((string= name "xor")  (oddp k))
+                                ((string= name "nor")  (= k 0))
+                                ((string= name "nand") (< k n))
+                                (t (>= k 1)))
+                          1.0d0
+                          0.0d0))))))
+(defstruct transition-result input-vector timestamp sequence-results sequence-outputs
+                             machine-output merged-output arbiter-metadata)
 
 (defun comparator-name (value)
   (string-downcase (or value "gte")))
@@ -143,6 +204,9 @@ Omits sequences, vectors, and perceptualMapping to keep the response small."
          "name" (machine-name machine)
          "description" (or (machine-description machine) "")
          "matchAlgorithm" (machine-match-algorithm machine)
+         "outputMergeTransformation" (output-merge-name
+                                      (machine-output-merge-transformation machine))
+         "outputMergeLocked" (json-bool (machine-output-merge-locked machine))
          "arbiterRule" (machine-arbiter-rule machine)
          "sequenceCount" (length sequences)
          "totalVectors" total-vectors
@@ -316,12 +380,25 @@ was evaluated with the weaker predicate no matter what the loader recorded
                                 :metadata (obj "arbiter" t "combinedFrom" (length all-outputs))
                                 :timestamp (now-ms)
                                 :provenance (output-vector-provenance first))))))
+      ;; ALL-OUTPUTS is the collection: one potential output per completed
+      ;; Reality Event. MACHINE-OUTPUT above takes the first of it, and which
+      ;; member "first" is has differed per runtime — the same corpus presented
+      ;; one runtime's pick to its PE and another's to its own
+      ;; (RealityEngine_CI#154).
+      ;;
+      ;; The fold is the machine's actual output: the collection put through the
+      ;; n-input gate the machine declares. Computed here, where the collection
+      ;; is complete and the machine's own work has finished. MACHINE-OUTPUT is
+      ;; left as it was so nothing reading it today changes.
       (make-transition-result
        :input-vector input
        :timestamp (now-ms)
        :sequence-results sequence-results
        :sequence-outputs sequence-outputs
        :machine-output machine-output
+       :merged-output (fold-output-vectors
+                       (mapcar #'output-vector-vector all-outputs)
+                       (machine-output-merge-transformation machine))
        :arbiter-metadata (obj "rule" rule
                               "totalInputs" total
                               "sequencesWithOutput" sequences-with-output

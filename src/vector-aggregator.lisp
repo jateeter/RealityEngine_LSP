@@ -43,8 +43,22 @@
               (should-out  (and (jobject-p arb-meta)
                                 (jbool arb-meta "shouldOutput" nil)))
               (out-region  (and should-out (jget result "outputRegion")))
+              ;; Prefer mergedOutputVector: the machine's collection of
+              ;; potential outputs folded under its own
+              ;; outputMergeTransformation. Presenting that fold is the Reality
+              ;; Engine's job and the last thing it does in the step, so it is
+              ;; the machine's actual output.
+              ;;
+              ;; outputVector is one arbitrarily chosen member of that
+              ;; collection, and which member differed per runtime — reading it
+              ;; here is what carried the RE's disagreement into the perceptual
+              ;; space (RealityEngine_CI#154). Falling back to it keeps this
+              ;; working against a Reality Engine not yet updated.
               (out-vec-raw (and (jobject-p out-region)
-                                (jget result "outputVector"))))
+                                (let ((merged (jget result "mergedOutputVector")))
+                                  (if (jarray-p merged)
+                                      merged
+                                      (jget result "outputVector"))))))
          (when (and should-out (jobject-p out-region) (jarray-p out-vec-raw))
            (let ((offset (jnumber out-region "offset" nil))
                  (length (jnumber out-region "length" nil))

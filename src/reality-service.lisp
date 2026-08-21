@@ -1016,9 +1016,24 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
              ;;     disagreed (cell 3969, AgHarvestReadinessAssessor [3967:3971]
              ;;     vs AGX055 [3959:3971] — RealityEngine_CI corpus parity
              ;;     sweep, 2026-08-19).
+             ;; Presenting the machine's output is the Reality Engine's job and
+             ;; the last thing it does in the step. Folded here, inside the
+             ;; actor, so it runs once the machine's own work has completed and
+             ;; nothing concurrent is in flight.
+             ;;
+             ;; `potential-outputs` is the collection: one entry per completed
+             ;; Reality Event. `machine-output` is a single member of it chosen
+             ;; by the arbiter, and which member that is has differed per
+             ;; runtime — the same corpus presented one runtime's pick to its PE
+             ;; and another's to its own (RealityEngine_CI#154). The fold
+             ;; replaces the pick; outputVector keeps the pick so nothing that
+             ;; reads it today changes.
              (let* ((out-mapping (mapping-output mapping))
                     (machine-out (transition-result-machine-output result))
-                    (out-values  (and machine-out (output-vector-vector machine-out))))
+                    (out-values  (and machine-out (output-vector-vector machine-out)))
+                    (transformation (output-merge-name
+                                     (machine-output-merge-transformation machine)))
+                    (merged (transition-result-merged-output result)))
                (setf (gethash id machine-results)
                      (obj "machineId"        id
                           "machineName"      (or (machine-name machine) "")
@@ -1027,6 +1042,8 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                           "outputRegion"     (if out-mapping
                                                 (region-json out-mapping)
                                                 +json-null+)
+                          "mergedOutputVector" (if merged (vectorize merged) +json-null+)
+                          "outputMergeTransformation" transformation
                           "outputVector"     (vectorize (or out-values nil))
                           "transitionResult" (transition-result-json result)))))
            (push (obj "offset" (region-offset (mapping-input mapping))
@@ -2167,6 +2184,89 @@ IRIs joined from the corpus semantics manifest."
                                                          (json-response (obj "version" "1.0.0"
                                                                              "machine" (machine-json machine :full t)))
                                                          (error-response "Machine not found" 404)))))
+     ;; The merge knob, readable always and settable only while unlocked.
+     ;;
+     ;; Declared on the machine (`outputMergeTransformation`, default "or") so it
+     ;; is carried from the moment the machine is interned, and mutable here so a
+     ;; run can be retuned between steps without reloading the corpus. It is a
+     ;; training variable; both properties are needed.
+     ;;
+     ;; The interlock starts LOCKED. Retuning a training variable by accident
+     ;; produces a run whose results mean nothing and which nothing
+     ;; distinguishes from a valid one, so unlocking is a separate act.
+     (make-route "GET" "/api/machines/:id/output-merge"
+                 (lambda (params body query)
+                   (declare (ignore body query))
+                   (json-response
+                    (actor-ask actor
+                               (lambda (state)
+                                 (let ((machine (gethash (gethash "id" params)
+                                                         (reality-state-machines state))))
+                                   (if machine
+                                       (obj "machineId" (machine-id machine)
+                                            "machineName" (or (machine-name machine) "")
+                                            "outputMergeTransformation"
+                                            (output-merge-name
+                                             (machine-output-merge-transformation machine))
+                                            "locked" (json-bool (machine-output-merge-locked machine))
+                                            "available" (vectorize (list "or" "and" "xor" "nor" "nand")))
+                                       +json-null+)))))))
+     (make-route "PUT" "/api/machines/:id/output-merge"
+                 (lambda (params body query)
+                   (declare (ignore query))
+                   (let ((outcome
+                           (actor-ask actor
+                                      (lambda (state)
+                                        (let* ((machine (gethash (gethash "id" params)
+                                                                 (reality-state-machines state)))
+                                               (requested (jstring body "outputMergeTransformation" nil)))
+                                          (cond
+                                            ((null machine) (obj "%status" 404 "error" "Machine not found"))
+                                            ((null requested)
+                                             (obj "%status" 400 "error" "outputMergeTransformation must be a string"))
+                                            ((not (member (string-downcase requested)
+                                                          '("or" "and" "xor" "nor" "nand") :test #'string=))
+                                             (obj "%status" 400 "error"
+                                                  (format nil "Unknown output merge transformation: ~a" requested)))
+                                            ;; 423 rather than 403: the refusal is about the
+                                            ;; resource's current state and is cleared by
+                                            ;; unlocking, not about who is asking.
+                                            ((machine-output-merge-locked machine)
+                                             (obj "%status" 423 "error"
+                                                  "outputMergeTransformation is locked; unlock it before changing a training variable"))
+                                            (t
+                                             (setf (machine-output-merge-transformation machine)
+                                                   (output-merge-name requested))
+                                             (obj "%status" 200 "success" t
+                                                  "machineId" (machine-id machine)
+                                                  "outputMergeTransformation"
+                                                  (machine-output-merge-transformation machine)
+                                                  "locked" (json-bool (machine-output-merge-locked machine))))))))))
+                     (let ((status (jnumber outcome "%status" 200)))
+                       (remhash "%status" outcome)
+                       (if (= status 200)
+                           (json-response outcome)
+                           (error-response (jstring outcome "error" "error") status))))))
+     (make-route "PUT" "/api/machines/:id/output-merge/lock"
+                 (lambda (params body query)
+                   (declare (ignore query))
+                   (let ((outcome
+                           (actor-ask actor
+                                      (lambda (state)
+                                        (let ((machine (gethash (gethash "id" params)
+                                                                (reality-state-machines state))))
+                                          (if (null machine)
+                                              (obj "%status" 404 "error" "Machine not found")
+                                              (let ((locked (jbool body "locked" t)))
+                                                (setf (machine-output-merge-locked machine) locked)
+                                                (obj "%status" 200 "success" t
+                                                     "machineId" (machine-id machine)
+                                                     "locked" (json-bool locked)))))))))
+                     (let ((status (jnumber outcome "%status" 200)))
+                       (remhash "%status" outcome)
+                       (if (= status 200)
+                           (json-response outcome)
+                           (error-response (jstring outcome "error" "error") status))))))
      (make-route "GET" "/api/machines/:id/checkpoints" (lambda (params body query)
                                                          (declare (ignore body query))
                                                          (state-json (lambda (state)

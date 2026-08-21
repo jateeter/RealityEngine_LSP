@@ -248,6 +248,11 @@ from a request body with no machine in scope."
                    :mapping (parse-mapping (jget root "perceptualMapping"))
                    :match-algorithm (comparator-name (jstring root "matchAlgorithm" "gte"))
                    :arbiter-rule (arbiter-name (jstring root "arbiterRule" "passthrough"))
+                   ;; Read at intern time so the machine carries it from the
+                   ;; moment it is loaded. Absent means "or", which is what
+                   ;; every runtime already does.
+                   :output-merge-transformation
+                   (output-merge-name (jstring root "outputMergeTransformation" "or"))
                    :sequences nil)))
     (when (jarray-present-p root "inputSequences")
       (setf (jget metadata "inputSequences") (jget root "inputSequences")))
