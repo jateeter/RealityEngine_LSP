@@ -410,11 +410,16 @@ IRIs are attached at read time by the /api/audit/semantics route."
 
 (defun record-merge-coverage (state operation)
   "Bump paging-decision and deprecated-fire counters from one merge-batch
-entry.  Called for each operation in the sorted merge batch."
+entry.  Called for each operation in the sorted merge batch.
+
+The two counters move differently now that an operation covers a whole machine.
+The paging decision is recorded ONCE per operation, with the joined governance:
+its totals drop from per-firing to per-machine-per-step, which is expected and
+not a regression — dashboards reading it will step down. The deprecated-fire
+counter is bumped once per deprecated CONTRIBUTOR, which keeps it counting
+firings exactly as it did before the fold moved."
   (let ((gov (jget operation "governance"))
-        (dep (jget operation "deprecation"))
         (mid (jstring operation "machineId" ""))
-        (sid (jstring operation "sequenceId" ""))
         (mname (jstring operation "machineName" "")))
     (when (jobject-p gov)
       (coverage-bump (reality-state-cov-paging state)
@@ -422,10 +427,11 @@ entry.  Called for each operation in the sorted merge batch."
                                    (jstring gov "processStatus" "unknown")
                                    (jstring gov "ragStatusCode" "unknown")
                                    mid)))
-    (when (jobject-p dep)
+    (dolist (fire (jarray-list (jget operation "%deprecatedFires")))
       (coverage-bump (reality-state-cov-deprecated state)
-                     (coverage-key mid mname sid
-                                   (jstring dep "replacedBy" ""))))))
+                     (coverage-key mid mname
+                                   (jstring fire "sequenceId" "")
+                                   (jstring fire "replacedBy" ""))))))
 
 ;; ── Prometheus text exposition ──────────────────────────────────────────────
 ;; Render the coverage counters in the standard Prometheus text-format so the
@@ -890,20 +896,169 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
          "widthHistogram" width-histogram
          "perMachine" (vectorize (nreverse per-machine)))))
 
-(defun merge-operation-json (machine sequence output output-index)
-  (let* ((values (output-vector-vector output))
-         (governance (resolve-governance machine (sequence-id sequence) values))
-         (deprecation (sequence-deprecation-json sequence))
+(defun join-governance (machine pending-outputs)
+  "The PagingDecision for a folded contribution: the join over its contributors'
+severity ranks.
+
+Governance is resolved per contributing sequence against THAT sequence's own
+asserted values, exactly as it was when each asserted output was its own merge
+operation. It is deliberately NOT resolved against the folded value: a
+triggerConfig rule is written for one CES's output and need not match the fold,
+and changing the matching semantics is not part of moving the fold. 135 of 1328
+corpus machines have an `outputMatches` pattern that maps to more than one RAG
+code, so the sequence filter is doing real work — matching on the folded values
+alone would be genuinely ambiguous for them.
+
+Selection is by highest `severity-rank`, ties broken by lexicographically
+smallest sequence id. `severity-rank` is an ordered chain
+(GREEN/absent 0 < AMBER 1 < RED 2 < life-safety 3), so the maximum over it is
+the same lattice join the fold vocabulary already defines — deterministic,
+symmetric (a maximum over a set does not depend on enumeration order), closed
+(it returns a contributor's rank rather than inventing one) and
+safety-preserving: a RED-governed firing cannot be hidden by a GREEN one that
+folded alongside it. That last property is what SEVERITY arbitration exists to
+guarantee, so taking the join preserves its intent rather than approximating it.
+
+The winner's decision travels WHOLE. Composing one from the ragStatusCode of one
+rule and the ownerTeam of another would describe no rule that exists, and would
+page a team for a status it never declared.
+
+Note the fold and this join can disagree by construction — `meet` can select a
+value from a low-severity contributor while a high-severity one also fired. That
+is intended: the value is the machine's, the severity is the evidence's."
+  (let ((best nil)
+        (best-rank -1)
+        (best-sequence-id nil))
+    (dolist (po pending-outputs)
+      (let ((decision (resolve-governance machine
+                                          (pending-output-sequence-id po)
+                                          (pending-output-values po))))
+        (when decision
+          (let ((rank (severity-rank (jstring decision "ragStatusCode" nil)))
+                (sequence-id (pending-output-sequence-id po)))
+            (when (or (> rank best-rank)
+                      (and (= rank best-rank)
+                           (string< sequence-id best-sequence-id)))
+              (setf best decision
+                    best-rank rank
+                    best-sequence-id sequence-id))))))
+    best))
+
+(defun deprecated-contributor-fires (machine pending-outputs)
+  "One entry per contributing output whose sequence is deprecated.
+
+Per contributing OUTPUT rather than per distinct sequence: a sequence that
+asserted twice in a step bumped `ces_deprecated_fires_total` twice before the
+fold moved, and the counter is a count of firings. Collapsing it to the
+sequence set would quietly halve it for those machines."
+  (let ((fires nil))
+    (dolist (po pending-outputs)
+      (let ((sequence (sequence-by-id machine (pending-output-sequence-id po))))
+        (when (and sequence (sequence-deprecated-at sequence))
+          (push (obj "sequenceId" (sequence-id sequence)
+                     "replacedBy" (or (sequence-replaced-by sequence) ""))
+                fires))))
+    (nreverse fires)))
+
+(defun machine-contribution-record (machine pending-outputs)
+  "What MACHINE's completed Reality Events amount to, before any fold.
+
+Deliberately separate from the merge operation, because the two answer different
+questions and one of them can be absent while the other is not. This record says
+WHICH CESs completed; the merge operation says WHAT VALUE the machine presents
+because of them. A fold refusal withdraws the value without retracting the
+firings, so the event bus is driven from this record and arbitration from the
+operation.
+
+Without the split the two contract clauses cannot both hold: a refusing machine
+emits no operation, so a bus reading the batch would silently stop delivering
+every subscription that machine feeds — and those subscriptions write into the
+perceptual space, so meta machines downstream of a refusing producer would go
+quiet with nothing in the response to show it."
+  (obj "machineId" (machine-id machine)
+       "sequenceIds"
+       (vectorize (sort (remove-duplicates (mapcar #'pending-output-sequence-id pending-outputs)
+                                           :test #'string= :from-end t)
+                        #'string<))
+       ;; Order-preserved union: first occurrence wins, in the contributor order
+       ;; PROCESS-MACHINE-INPUT enumerated. The provenance chain is the evidence
+       ;; trail, and reordering it would make the same step render differently
+       ;; for no reason.
+       "provenance"
+       (vectorize (remove-duplicates (loop for po in pending-outputs
+                                           append (jarray-list (pending-output-provenance po)))
+                                     :test #'equal :from-end t))))
+
+(defun joined-ces-id (sequence-ids)
+  "The arbitration key for a folded contribution: SEQUENCE-IDS joined with
+commas, no spaces — \"aihr-hw-degradation,aihr-net-fault\".
+
+This is an OPAQUE KEY, not a sequence identifier. Nothing may look a sequence up
+by it, and nothing in this runtime does: both SEQUENCE-BY-ID call sites take a
+`pending-output-sequence-id`, which is always one real id. Its readers are the
+MEAN tie-order key and the `/api/arbitration` serialisation, both of which treat
+it as an opaque string (FOLD_PLACEMENT.md A3).
+
+SEQUENCE-IDS arrives sorted and deduplicated from MACHINE-CONTRIBUTION-RECORD,
+so the join inherits both properties and is stable across runtimes. A one-element
+set renders as the bare id, which is what keeps single-contributor machines
+unchanged on the wire; an empty set renders as the empty string, which
+ARBITRATION-CONTRIBUTION-JSON already reports as null.
+
+Taking one member instead — the smallest, say — would render identically for the
+overwhelming majority and silently discard the rest exactly where the evidence
+matters most: a cell contested by a machine that reached its value from several
+CESs. C++ joins, so a runtime that picked would disagree with it on precisely
+those contributions."
+  (format nil "~{~a~^,~}" sequence-ids))
+
+(defun merge-operation-json (machine contribution pending-outputs values)
+  "One merge operation: MACHINE's whole contribution to its output region.
+
+The batch used to carry one entry per asserted output, so a machine with seven
+completed Reality Events put seven values into the same cell and the per-cell
+arbiter resolved contention that belonged to the machine. FallDetection made
+that concrete — its seven sequences assert 0,1,2,3,4,4,0 on output index 0, and
+the resolved value was 2.0 on C++/LSP and 0.0 on Scala, neither the maximum nor
+the minimum, because only a subset fires on any step and the answer depended on
+which subset plus each runtime's tie-break. Folding first leaves one determinate
+value per cell, so no arbiter rule, tie-break or shard ordering can make the
+runtimes differ on it (RealityEngine_CI#154, #158).
+
+VALUES is the folded vector, computed once in PROCESS-MACHINE-INPUT and shared
+with the PE-facing `mergedOutputVector`. `sequenceIds` replaces the scalar
+`sequenceId`: the machine presents one output and the evidence for it is the set
+of CESs that completed."
+  (let* ((governance (join-governance machine pending-outputs))
+         (fires (deprecated-contributor-fires machine pending-outputs))
+         ;; Attached when ANY contributor is deprecated, reported from the
+         ;; lexicographically smallest deprecated sequence so the choice is
+         ;; deterministic rather than dependent on which one happened to fire
+         ;; first.
+         (deprecation
+           (when fires
+             (sequence-deprecation-json
+              (sequence-by-id machine
+                              (first (sort (mapcar (lambda (fire) (jstring fire "sequenceId" ""))
+                                                   fires)
+                                           #'string<))))))
+         ;; The identity and evidence fields are taken from CONTRIBUTION rather
+         ;; than recomputed, so the set the event bus fans out over and the set
+         ;; the batch reports are the same set by construction.
          (out (obj "region" (region-json (mapping-output (machine-mapping machine)))
-                   "machineId" (machine-id machine)
-                   "sequenceId" (sequence-id sequence)
-                   "outputIndex" output-index
+                   "machineId" (jstring contribution "machineId" "")
+                   "sequenceIds" (jget contribution "sequenceIds")
                    "values" (vectorize values)
-                   "provenance" (vectorize (output-vector-provenance output)))))
+                   "provenance" (jget contribution "provenance"))))
     (when governance
       (setf (jget out "governance") governance))
     (when deprecation
       (setf (jget out "deprecation") deprecation))
+    ;; Internal, stripped before the batch is serialised — same `%`-prefixed
+    ;; idiom TRANSITION-SEQUENCE uses for `%outputs`. The deprecated-fire
+    ;; counter is per firing and the reported `deprecation` block is one record,
+    ;; so the counter cannot be driven from the wire shape.
+    (setf (jget out "%deprecatedFires") fires)
     out))
 
 (defun sorted-event-bus-writes (writes)
@@ -923,30 +1078,52 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
               ((not (string= lm rm)) (string< lm rm))
               (t (string< lq rq)))))))
 
-(defun apply-event-bus (state merge-batch)
+(defun apply-event-bus (state contributions)
+  "Fan the step's CONTRIBUTIONS out to compose/meta subscriptions.
+
+Subscriptions are keyed on (producer machine, producer sequence), so this is the
+one consumer of per-sequence identity whose behaviour must be IDENTICAL after
+the fold moved rather than merely analogous: it writes into the perceptual
+space, and a meta machine that quietly stops firing is a corpus change, not a
+reporting difference.
+
+Driven from the contributor records, NOT from the merge batch. The bus asks
+which CESs completed, and that is independent of whether the machine's fold
+produced a presentable value: a machine whose declared transformation refuses
+contributes no merge operation, and a bus reading the batch would then drop
+every subscription that machine feeds. Withdrawing a value must not retract the
+firings that produced it.
+
+Each record carries the contributing SET, so the lookup iterates it and keys per
+element. Every (producer machine, producer sequence) subscription that would
+have fired before still fires; reading one arbitrarily chosen member would leave
+meta machines observing a producer they never subscribed to. The dedup key
+already included the sequence, so it needs no change — two asserted outputs from
+one sequence collapsed to a single write before, and the set is deduplicated, so
+they still do."
   (let ((writes nil)
         (seen (make-hash-table :test #'equal)))
-    (dolist (operation merge-batch)
-      (let* ((key (compose-key (jstring operation "machineId" "")
-                               (jstring operation "sequenceId" "")))
-             (subscriptions (gethash key (reality-state-event-bus-subscriptions state))))
-        (dolist (subscription subscriptions)
-          (let* ((bit (truncate (or (jnumber subscription "bitOffset" 0) 0)))
-                 (dedup (format nil "~a|~a|~a|~a"
-                                (jstring subscription "subscriberMachineId" "")
-                                bit
-                                (jstring operation "machineId" "")
-                                (jstring operation "sequenceId" ""))))
-            (unless (gethash dedup seen)
-              (setf (gethash dedup seen) t)
-              (push (obj "producerMachineId" (jstring operation "machineId" "")
-                         "producerSequenceId" (jstring operation "sequenceId" "")
-                         "subscriberMachineId" (jstring subscription "subscriberMachineId" "")
-                         "bitOffset" bit
-                         "value" 1.0d0
-                         "provenance" (jget operation "provenance"))
-                    writes)
-              (setf (gethash bit (reality-state-latched-event-bits state)) t))))))
+    (dolist (operation contributions)
+      (dolist (sequence-id (jarray-list (jget operation "sequenceIds")))
+        (let* ((key (compose-key (jstring operation "machineId" "") sequence-id))
+               (subscriptions (gethash key (reality-state-event-bus-subscriptions state))))
+          (dolist (subscription subscriptions)
+            (let* ((bit (truncate (or (jnumber subscription "bitOffset" 0) 0)))
+                   (dedup (format nil "~a|~a|~a|~a"
+                                  (jstring subscription "subscriberMachineId" "")
+                                  bit
+                                  (jstring operation "machineId" "")
+                                  sequence-id)))
+              (unless (gethash dedup seen)
+                (setf (gethash dedup seen) t)
+                (push (obj "producerMachineId" (jstring operation "machineId" "")
+                           "producerSequenceId" sequence-id
+                           "subscriberMachineId" (jstring subscription "subscriberMachineId" "")
+                           "bitOffset" bit
+                           "value" 1.0d0
+                           "provenance" (jget operation "provenance"))
+                      writes)
+                (setf (gethash bit (reality-state-latched-event-bits state)) t)))))))
     (let ((sorted (sorted-event-bus-writes writes)))
       (dolist (write sorted)
         (let ((bit (truncate (or (jnumber write "bitOffset" 0) 0))))
@@ -982,6 +1159,11 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
         (orev nil)
         (machine-results (make-hash-table :test #'equal))
         (merge-batch nil)
+        ;; One record per machine that completed at least one Reality Event,
+        ;; whether or not its fold produced a value. Kept separate from
+        ;; MERGE-BATCH because a refusal removes the machine from the batch and
+        ;; must not remove it from the event bus.
+        (contributions nil)
         (active-regions nil))
     (dolist (machine (object-values-sorted (reality-state-machines state)))
       (let ((id (machine-id machine)))
@@ -1016,9 +1198,30 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
              ;;     disagreed (cell 3969, AgHarvestReadinessAssessor [3967:3971]
              ;;     vs AGX055 [3959:3971] — RealityEngine_CI corpus parity
              ;;     sweep, 2026-08-19).
+             ;; Presenting the machine's output is the Reality Engine's job and
+             ;; the last thing it does in the step. Folded here, inside the
+             ;; actor, so it runs once the machine's own work has completed and
+             ;; nothing concurrent is in flight.
+             ;;
+             ;; `pending-outputs` is the collection: one entry per completed
+             ;; Reality Event. `machine-output` is a single member of it chosen
+             ;; by the arbiter, and which member that is has differed per
+             ;; runtime — the same corpus presented one runtime's pick to its PE
+             ;; and another's to its own (RealityEngine_CI#154). The fold
+             ;; replaces the pick; outputVector keeps the pick so nothing that
+             ;; reads it today changes.
+             ;;
+             ;; `merged` below is read straight off the transition result and is
+             ;; the SAME value the merge operation carries — one computation
+             ;; feeding both the PE-facing field and arbitration. Recomputing it
+             ;; here would let the value the PE reads drift from the value the
+             ;; corpus resolved, and nothing in a single step would show it.
              (let* ((out-mapping (mapping-output mapping))
                     (machine-out (transition-result-machine-output result))
-                    (out-values  (and machine-out (output-vector-vector machine-out))))
+                    (out-values  (and machine-out (output-vector-vector machine-out)))
+                    (transformation (output-merge-name
+                                     (machine-output-merge-transformation machine)))
+                    (merged (transition-result-merged-output result)))
                (setf (gethash id machine-results)
                      (obj "machineId"        id
                           "machineName"      (or (machine-name machine) "")
@@ -1027,6 +1230,8 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                           "outputRegion"     (if out-mapping
                                                 (region-json out-mapping)
                                                 +json-null+)
+                          "mergedOutputVector" (if merged (vectorize merged) +json-null+)
+                          "outputMergeTransformation" transformation
                           "outputVector"     (vectorize (or out-values nil))
                           "transitionResult" (transition-result-json result)))))
            (push (obj "offset" (region-offset (mapping-input mapping))
@@ -1034,19 +1239,46 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                       "machineId" id
                       "type" "input")
                  active-regions)
-           (when (jbool (transition-result-arbiter-metadata result) "shouldOutput" nil)
-             (dolist (sequence-id (object-keys-sorted (transition-result-sequence-outputs result)))
-               (let ((sequence (sequence-by-id machine sequence-id))
-                     (outputs (gethash sequence-id (transition-result-sequence-outputs result)))
-                     (index 0))
-                 (dolist (output outputs)
-                   (when sequence
-                     (push (merge-operation-json machine sequence output index) merge-batch)
-                     (incf index))))))))))
-    (setf merge-batch (sorted-merge-operations merge-batch))
+           ;; ONE operation per machine per output region. The machine's fold is
+           ;; its single contribution: the arbiter now resolves only genuine
+           ;; contention — between machines, and between machines and
+           ;; integrations — which is what SEVERITY was for. Intra-machine cell
+           ;; contention was never contention at all; two CESs share a position
+           ;; only where the constructor established that the position is
+           ;; identical across every fold configuration, so the arbiter
+           ;; resolving it was the defect (RealityEngine_CI#154).
+           ;;
+           ;; A NIL merged output contributes no VALUE, and that covers two cases
+           ;; that mean the same thing for arbitration: the machine completed no
+           ;; Reality Event, and the machine's declared transformation refused
+           ;; because no chain top was supplied. Neither is a vector of zeros —
+           ;; zeros would be a positive claim about every cell in the region.
+           ;;
+           ;; The contributor record is collected regardless, because a refusal
+           ;; withdraws the value without retracting the firings: the event bus
+           ;; asks which CESs completed, and every subscription that would have
+           ;; fired before must still fire.
+           (let ((pending (transition-result-pending-outputs result))
+                 (merged (transition-result-merged-output result)))
+             (when pending
+               (let ((contribution (machine-contribution-record machine pending)))
+                 (push contribution contributions)
+                 (when merged
+                   (push (merge-operation-json machine contribution pending merged)
+                         merge-batch)))))))))
+    (setf merge-batch (sorted-merge-operations merge-batch)
+          ;; Sorted on the same key for the same reason: the bus dedups and
+          ;; re-sorts its writes, so this cannot change the result, but a step
+          ;; whose intermediate order depends on hash iteration is one whose
+          ;; determinism has to be argued rather than read.
+          contributions (sorted-merge-operations contributions))
     ;; Paging + deprecation coverage is per-merge-entry; counted after sort
-    ;; so the bump order matches AI/CPP exactly.
-    (dolist (op merge-batch) (record-merge-coverage state op))
+    ;; so the bump order matches AI/CPP exactly.  `%deprecatedFires` is the
+    ;; internal per-firing detail the counter needs and the wire must not see,
+    ;; so it is stripped in the same pass that consumes it.
+    (dolist (op merge-batch)
+      (record-merge-coverage state op)
+      (remhash "%deprecatedFires" op))
     (when compact
       (add-packed-merge-values state merge-batch))
     ;; GATHER -> RESOLVE -> COMMIT (ARBITER_CONTRACT.md 2).
@@ -1071,8 +1303,18 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                           :value (nth i values)
                           :provider "machine"
                           :origin-id (jstring operation "machineId" "")
-                          :ces-id (jstring operation "sequenceId" "")
-                          :output-vector-id (format nil "~a" (jnumber operation "outputIndex" 0))
+                          ;; A folded contribution has no single CES, so `cesId`
+                          ;; carries the whole set as an opaque comma-joined key
+                          ;; (FOLD_PLACEMENT.md A3). One contributor renders as
+                          ;; the bare id, so nothing changes for the machines
+                          ;; that have one. `outputIndex` is gone, so the id it
+                          ;; used to render is pinned at its single remaining
+                          ;; value; both fields feed the MEAN tie-order and the
+                          ;; arbitration record's attribution, and `origin-id`
+                          ;; alone is now unique per cell per machine, so
+                          ;; neither can affect a resolution.
+                          :ces-id (joined-ces-id (jarray-list (jget operation "sequenceIds")))
+                          :output-vector-id "0"
                           :rag-status-code rag)
                          (gethash cell by-cell)))
           (push (obj "offset" (region-offset region)
@@ -1100,7 +1342,7 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                           "nonZero" (vectorize (sort (nreverse cells) #'<
                                                      :key (lambda (c) (jnumber c "index" 0)))))))
         (setf (reality-state-arbitration state) records)))
-    (let* ((event-bus (apply-event-bus state merge-batch))
+    (let* ((event-bus (apply-event-bus state contributions))
            (step-number (reality-state-step-count state))
            ;; No "success" inside the step. Every caller already wraps this as
            ;; (obj "success" t "step" step), so it was a duplicate one level
@@ -1299,6 +1541,16 @@ IRIs joined from the corpus semantics manifest."
         :key (lambda (bus) (jstring bus "id" ""))))
 
 (defun arbitration-contribution-json (c)
+  "One contributor as GET /api/arbitration reports it.
+
+`cesId` is emitted verbatim and is an OPAQUE KEY: since the fold moved into the
+machine's atomic step a machine contributes the fold of every CES that
+completed, so the field carries their comma-joined, sorted, deduplicated set —
+`\"a,b\"` — and reduces to a bare id only when one CES contributed
+(FOLD_PLACEMENT.md A3). A reader wanting the individual CESs must split on the
+comma; it must not pass this value anywhere a sequence id is expected. Machines
+with a single contributing sequence, which is nearly all of them, are unchanged
+on this surface."
   (obj "provider" (contribution-provider c)
        "determinism" (determinism-name (determinism-of (contribution-provider c)))
        "originId" (contribution-origin-id c)
@@ -2167,6 +2419,93 @@ IRIs joined from the corpus semantics manifest."
                                                          (json-response (obj "version" "1.0.0"
                                                                              "machine" (machine-json machine :full t)))
                                                          (error-response "Machine not found" 404)))))
+     ;; The merge knob, readable always and settable only while unlocked.
+     ;;
+     ;; Declared on the machine (`outputMergeTransformation`, default "or") so it
+     ;; is carried from the moment the machine is interned, and mutable here so a
+     ;; run can be retuned between steps without reloading the corpus. It is a
+     ;; training variable; both properties are needed.
+     ;;
+     ;; The interlock starts LOCKED. Retuning a training variable by accident
+     ;; produces a run whose results mean nothing and which nothing
+     ;; distinguishes from a valid one, so unlocking is a separate act.
+     (make-route "GET" "/api/machines/:id/output-merge"
+                 (lambda (params body query)
+                   (declare (ignore body query))
+                   (json-response
+                    (actor-ask actor
+                               (lambda (state)
+                                 (let ((machine (gethash (gethash "id" params)
+                                                         (reality-state-machines state))))
+                                   (if machine
+                                       (obj "machineId" (machine-id machine)
+                                            "machineName" (or (machine-name machine) "")
+                                            "outputMergeTransformation"
+                                            (output-merge-name
+                                             (machine-output-merge-transformation machine))
+                                            "locked" (json-bool (machine-output-merge-locked machine))
+                                            ;; Advertised from the same list the
+                                            ;; PUT validates against, so the two
+                                            ;; cannot drift as transformations
+                                            ;; are added.
+                                            "available" (vectorize +output-merge-transformations+))
+                                       +json-null+)))))))
+     (make-route "PUT" "/api/machines/:id/output-merge"
+                 (lambda (params body query)
+                   (declare (ignore query))
+                   (let ((outcome
+                           (actor-ask actor
+                                      (lambda (state)
+                                        (let* ((machine (gethash (gethash "id" params)
+                                                                 (reality-state-machines state)))
+                                               (requested (jstring body "outputMergeTransformation" nil)))
+                                          (cond
+                                            ((null machine) (obj "%status" 404 "error" "Machine not found"))
+                                            ((null requested)
+                                             (obj "%status" 400 "error" "outputMergeTransformation must be a string"))
+                                            ((not (member (string-downcase requested)
+                                                          +output-merge-transformations+ :test #'string=))
+                                             (obj "%status" 400 "error"
+                                                  (format nil "Unknown output merge transformation: ~a" requested)))
+                                            ;; 423 rather than 403: the refusal is about the
+                                            ;; resource's current state and is cleared by
+                                            ;; unlocking, not about who is asking.
+                                            ((machine-output-merge-locked machine)
+                                             (obj "%status" 423 "error"
+                                                  "outputMergeTransformation is locked; unlock it before changing a training variable"))
+                                            (t
+                                             (setf (machine-output-merge-transformation machine)
+                                                   (output-merge-name requested))
+                                             (obj "%status" 200 "success" t
+                                                  "machineId" (machine-id machine)
+                                                  "outputMergeTransformation"
+                                                  (machine-output-merge-transformation machine)
+                                                  "locked" (json-bool (machine-output-merge-locked machine))))))))))
+                     (let ((status (jnumber outcome "%status" 200)))
+                       (remhash "%status" outcome)
+                       (if (= status 200)
+                           (json-response outcome)
+                           (error-response (jstring outcome "error" "error") status))))))
+     (make-route "PUT" "/api/machines/:id/output-merge/lock"
+                 (lambda (params body query)
+                   (declare (ignore query))
+                   (let ((outcome
+                           (actor-ask actor
+                                      (lambda (state)
+                                        (let ((machine (gethash (gethash "id" params)
+                                                                (reality-state-machines state))))
+                                          (if (null machine)
+                                              (obj "%status" 404 "error" "Machine not found")
+                                              (let ((locked (jbool body "locked" t)))
+                                                (setf (machine-output-merge-locked machine) locked)
+                                                (obj "%status" 200 "success" t
+                                                     "machineId" (machine-id machine)
+                                                     "locked" (json-bool locked)))))))))
+                     (let ((status (jnumber outcome "%status" 200)))
+                       (remhash "%status" outcome)
+                       (if (= status 200)
+                           (json-response outcome)
+                           (error-response (jstring outcome "error" "error") status))))))
      (make-route "GET" "/api/machines/:id/checkpoints" (lambda (params body query)
                                                          (declare (ignore body query))
                                                          (state-json (lambda (state)

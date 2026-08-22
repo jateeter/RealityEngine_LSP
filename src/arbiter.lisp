@@ -53,6 +53,12 @@ failure contract 4.3a exists to prevent."
   (value 0)
   (provider "machine" :type string)
   (origin-id "" :type string)
+  ;; OPAQUE KEY, not a sequence identifier. A machine contributes the fold of
+  ;; every CES that completed, so this is their comma-joined, sorted,
+  ;; deduplicated set — "a,b" — and only renders as a bare id when exactly one
+  ;; contributed (FOLD_PLACEMENT.md A3). Every reader here treats it as a
+  ;; string: the MEAN tie-order concatenates it, and /api/arbitration emits it
+  ;; verbatim. Do NOT look a sequence up by it.
   (ces-id "" :type string)
   (output-vector-id "" :type string)
   (rag-status-code nil)
@@ -179,6 +185,15 @@ assessment has to stay attributable (contract 6)."
                  ;; MEAN would not be order-independent. The canonical order
                  ;; makes it deterministic; the sum is serial within a cell and
                  ;; cells stay independent.
+                 ;;
+                 ;; The key concatenates three opaque strings and compares them
+                 ;; with STRING<, so `ces-id` carrying a comma-joined CES set
+                 ;; rather than one id is immaterial here — it needs to be
+                 ;; deterministic and identical across runtimes, not parseable
+                 ;; (FOLD_PLACEMENT.md A3). Since the fold, a machine
+                 ;; contributes at most once per cell, so `origin-id` already
+                 ;; separates every machine contribution and the remaining two
+                 ;; components only order machine against integration.
                  (let* ((ordered (sort (copy-list contributions) #'string<
                                        :key (lambda (c)
                                               (concatenate 'string (contribution-origin-id c)
@@ -206,6 +221,12 @@ assessment has to stay attributable (contract 6)."
                       (%pick at-top #'contribution-value nil))
                      (t (%pick at-top #'contribution-value t)))))))
             (resolved (contribution-value (first winners)))
+            ;; Suppression is decided by object identity, not by comparing
+            ;; identifiers — WINNERS holds the very structs %PICK selected out of
+            ;; CONTRIBUTIONS. So it never reads `ces-id` and is unaffected by
+            ;; that field carrying a joined CES set (FOLD_PLACEMENT.md A3). It is
+            ;; also why two contributions that agreed on every field would still
+            ;; be told apart, which an id comparison would not manage.
             (suppressed (remove-if (lambda (c) (member c winners :test #'eq)) contributions)))
        (values resolved
                (make-arbitration-record :instant instant :cell cell :rule rule
