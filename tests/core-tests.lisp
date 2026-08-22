@@ -159,6 +159,21 @@
         :key (lambda (op) (reality-engine-lsp::jstring op "machineId" ""))
         :test #'string=))
 
+(defun merge-sequence-ids (op)
+  "The contributing CES set carried by one merge operation, as a list."
+  (reality-engine-lsp::jarray-list (reality-engine-lsp::jget op "sequenceIds")))
+
+(defun merge-values (op)
+  "The folded values one merge operation carries, as integers.
+
+The operation carries the FOLD, and the fold returns double-floats: 1.0d0 where
+the corpus JSON parsed to the integer 1.  The wire is unchanged — write-json
+renders a whole double without a fractional part, so both emit `1` — and the
+packed-cell path takes either.  Only a Lisp-level EQUAL sees the difference, so
+these assertions compare the numbers rather than their representation."
+  (mapcar #'round (reality-engine-lsp::numbers-from-json
+                   (reality-engine-lsp::jget op "values"))))
+
 (defun envelope-for (machine sequence-id values)
   "Build the envelope-field bundle the dispatcher would emit, or NIL on miss.
    Mirrors envelopeFor in AiTriggerDispatch.test.ts."
@@ -284,8 +299,9 @@
                  (reality-engine-lsp::mapping-output
                   (reality-engine-lsp::machine-mapping machine)))
        "machineId" (reality-engine-lsp::machine-id machine)
-       "sequenceId" sequence-id
-       "outputIndex" 0
+       ;; One machine, one operation, carrying the contributing set — the shape
+       ;; the RE emits since the fold moved into the machine's atomic step.
+       "sequenceIds" (reality-engine-lsp::vectorize (list sequence-id))
        "values" (reality-engine-lsp::vectorize values)
        "governance" governance))))
 
@@ -429,6 +445,697 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
     (loop for x in +tier1-normal-input+ for i from 228 do (setf (nth i v) x))
     v))
 
+;; ── output merge fold ────────────────────────────────────────────────────────
+;; The Boolean gates are pinned here cell for cell. 1273 binary corpus machines
+;; fold with them, so a silent change to one is a change to every result they
+;; have ever produced, and the corpus walk further down counts outputs without
+;; looking at their values.
+;;
+;; The five multi-valued transformations are checked against the properties the
+;; fold contract requires — closure, symmetry, determinism — by exhaustion over
+;; the chain rather than by assertion, the way the reference implementation at
+;; RealityEngine_CI scripts/experiment-mv-transforms.py checks itself. The full
+;; 6820-fold differential against that reference (5 transformations x chain
+;; {0..3} x n=1..5, zero differences, matching what C++ reported) needs Python
+;; on the box and is run out of band; what is kept here stands alone.
+
+(defun merge-fold (collection name &key chain-top)
+  (reality-engine-lsp::fold-output-vectors collection name :chain-top chain-top))
+
+(defun merge-fold1 (values name &key chain-top)
+  "Fold a single cell — one contribution per member of VALUES."
+  (round (first (merge-fold (mapcar #'list values) name :chain-top chain-top))))
+
+(defun merge-tuples (alphabet n)
+  "Every length-N tuple over ALPHABET."
+  (if (zerop n)
+      (list nil)
+      (loop for item in alphabet
+            append (mapcar (lambda (rest) (cons item rest))
+                           (merge-tuples alphabet (1- n))))))
+
+(defun merge-permutations (values)
+  "Every distinct permutation of VALUES."
+  (if (null (cdr values))
+      (list (copy-list values))
+      (loop for item in (remove-duplicates values)
+            append (mapcar (lambda (rest) (cons item rest))
+                           (merge-permutations (remove item values :count 1))))))
+
+(defparameter +mv-names+
+  '("meet" "join" "strong-conjunction" "strong-disjunction" "discrete-median"))
+
+(defun output-merge-tests ()
+  ;; An empty collection presents no output. Not a vector of zeros — a machine
+  ;; that completed no Reality Event asserted nothing, which is a different
+  ;; claim from asserting zero.
+  (assert-equal nil (merge-fold nil "or") "empty collection folds to no output")
+  (assert-equal nil (merge-fold nil "meet") "empty collection folds to no output under MV too")
+
+  ;; Boolean gates, unchanged. k per cell is 2, 1, 1 over this collection.
+  (let ((collection '((1 0 1) (1 1 0))))
+    (assert-equal '(1.0d0 1.0d0 1.0d0) (merge-fold collection "or")   "or(k>=1)")
+    (assert-equal '(1.0d0 0.0d0 0.0d0) (merge-fold collection "and")  "and(k=n)")
+    (assert-equal '(0.0d0 1.0d0 1.0d0) (merge-fold collection "xor")  "xor(k odd)")
+    (assert-equal '(0.0d0 0.0d0 0.0d0) (merge-fold collection "nor")  "nor(k=0)")
+    (assert-equal '(0.0d0 1.0d0 1.0d0) (merge-fold collection "nand") "nand(k<n)")
+    (assert-equal (merge-fold collection "or") (merge-fold collection nil)
+                  "an undeclared transformation is or")
+    (assert-equal (merge-fold collection "or") (merge-fold collection "not-a-gate")
+                  "an unknown transformation falls back to or, as before")
+    ;; A contribution shorter than the widest asserts nothing in the cells it
+    ;; does not reach, under both families.
+    (assert-equal '(1.0d0 0.0d0 0.0d0) (merge-fold '((1 0 1) (1)) "and")
+                  "a missing cell does not assert")
+    (assert-equal '(1.0d0 0.0d0 0.0d0) (merge-fold '((1 2 3) (1)) "meet" :chain-top 3)
+                  "a missing cell is the chain bottom"))
+
+  ;; The worked examples from the specification, chain {0..3}.
+  (assert-equal 3 (merge-fold1 '(1 1 1) "strong-disjunction" :chain-top 3)
+                "three weak indicators accumulate to confirmed")
+  (assert-equal 2 (merge-fold1 '(3 3 2) "strong-conjunction" :chain-top 3)
+                "near-unanimous high agreement survives")
+  (assert-equal 0 (merge-fold1 '(3 3 0) "strong-conjunction" :chain-top 3)
+                "one absolute disagreement extinguishes")
+  (assert-equal 3 (merge-fold1 '(3 3 0 3) "discrete-median" :chain-top 3)
+                "a transient dropout is filtered")
+  (assert-equal 0 (merge-fold1 '(3 3 0 3) "meet" :chain-top 3) "a single 0 vetoes the meet")
+  (assert-equal 3 (merge-fold1 '(3 3 0 3) "join" :chain-top 3) "the join is the envelope")
+  ;; For an even n the median is the LOWER middle element — floor(median) over
+  ;; integers, a selection and never a division. 2 here, not 2.5 and not 3.
+  (assert-equal 2 (merge-fold1 '(1 2 3 4) "discrete-median" :chain-top 4)
+                "even n takes the lower middle element")
+
+  ;; An early exit stops the arithmetic for a cell but must still leave every
+  ;; cursor sitting on the next cell, or the contributions it skipped read one
+  ;; cell behind for the rest of the fold. Only visible past the first cell, so
+  ;; each of these is a collection wide enough to show it, chosen so that the
+  ;; second cell differs if the skipped contributions were not advanced.
+  (assert-equal '(0.0d0 1.0d0) (merge-fold '((3 2) (0 1) (0 3)) "meet" :chain-top 3)
+                "meet advances the cursors it skipped when the chain bottom absorbs")
+  (assert-equal '(3.0d0 3.0d0) (merge-fold '((0 0) (3 1) (1 3)) "join" :chain-top 3)
+                "join advances the cursors it skipped when it reaches the chain top")
+  (assert-equal '(2.0d0 2.0d0) (merge-fold '((2 0) (1 1) (0 3)) "strong-disjunction" :chain-top 2)
+                "strong-disjunction advances the cursors it skipped when it saturates")
+
+  ;; Cells are stored as double-floats but an MV value is a position on a chain,
+  ;; so the conversion is explicit and rounds ties AWAY FROM ZERO. CL's ROUND is
+  ;; round-half-to-even and would fold 2.5 to 2, while C++ llround and Scala both
+  ;; fold it to 3. This assertion is the tripwire on anyone simplifying
+  ;; MV-CELL-INTEGER back to a bare ROUND.
+  (assert-equal 3 (merge-fold1 '(2.5d0 3.0d0) "meet" :chain-top 3)
+                "2.5 rounds away from zero to 3, not half-to-even to 2")
+  (assert-equal 4 (merge-fold1 '(3.5d0 4.0d0) "meet" :chain-top 4)
+                "3.5 rounds away from zero to 4, which half-to-even would also give")
+  (assert-equal 2 (merge-fold1 '(2.4d0 3.0d0) "meet" :chain-top 3) "2.4 rounds to 2")
+  (assert-equal 0 (merge-fold1 '(-1.0d0 3.0d0) "meet" :chain-top 3)
+                "below the chain bottom clamps to the bottom")
+
+  ;; Exhaustive over the chain {0..3} for collections to n=4.
+  (let ((alphabet '(0 1 2 3))
+        (k 3))
+    (dolist (name +mv-names+)
+      (loop for n from 1 to 4
+            do (dolist (tuple (merge-tuples alphabet n))
+                 (let ((got (merge-fold1 tuple name :chain-top k)))
+                   ;; Closure — the fold may not leave the chain.
+                   (assert-true (member got alphabet)
+                                (format nil "~a ~s -> ~a left the chain" name tuple got))
+                   ;; Symmetry — the collection carries no order, so the fold
+                   ;; may not depend on one. This is the property that broke
+                   ;; when the arbiter's pick stood in for the fold and each
+                   ;; runtime picked a different member (RealityEngine_CI#154).
+                   (dolist (permutation (merge-permutations tuple))
+                     (assert-equal got (merge-fold1 permutation name :chain-top k)
+                                   (format nil "~a ~s is order dependent" name tuple)))
+                   ;; Meet, join and median return a contributor — stronger than
+                   ;; closure. Bitwise or of 1 and 2 is 3: inside the chain but
+                   ;; asserted by nobody, which on an ordinal severity ladder
+                   ;; invents a rung.
+                   (when (member name '("meet" "join" "discrete-median") :test #'string=)
+                     (assert-true (member got tuple)
+                                  (format nil "~a ~s -> ~a fabricated a value" name tuple got)))))
+               ;; Idempotence where it is claimed, and only there.
+               (when (member name '("meet" "join" "discrete-median") :test #'string=)
+                 (dolist (x alphabet)
+                   (assert-equal x (merge-fold1 (make-list n :initial-element x) name :chain-top k)
+                                 (format nil "~a is not idempotent at ~a" name x))))))
+    ;; The strong operations are NOT idempotent, by design — x (+) x saturates
+    ;; and x (.) x extinguishes, which is the point of them. Asserted so that
+    ;; "fixing" it later has to be deliberate.
+    (assert-equal 2 (merge-fold1 '(1 1) "strong-disjunction" :chain-top 3)
+                  "strong-disjunction accumulates rather than repeating")
+    (assert-equal 0 (merge-fold1 '(1 1) "strong-conjunction" :chain-top 3)
+                  "strong-conjunction extinguishes rather than repeating")
+
+    ;; De Morgan duality under ¬x = k − x, as specified.
+    (loop for n from 1 to 4
+          do (dolist (tuple (merge-tuples alphabet n))
+               (assert-equal (merge-fold1 tuple "strong-conjunction" :chain-top k)
+                             (- k (merge-fold1 (mapcar (lambda (x) (- k x)) tuple)
+                                               "strong-disjunction" :chain-top k))
+                             (format nil "de Morgan fails at ~s" tuple)))))
+
+  ;; The median is a quickselect, not a sort. Cross-checked against a sort over
+  ;; random collections, including the all-equal and already-ordered columns
+  ;; that are a partition scheme's worst cases.
+  (dotimes (trial 400)
+    (let* ((n (1+ (random 9)))
+           (values (loop repeat n collect (random 6)))
+           (expected (nth (floor (1- n) 2) (sort (copy-list values) #'<))))
+      (assert-equal expected (merge-fold1 values "discrete-median")
+                    (format nil "quickselect disagrees with a sort at ~s" values))))
+  (dolist (values '((2 2 2 2 2) (0 1 2 3 4) (4 3 2 1 0) (1 1 2 2) (5)))
+    (assert-equal (nth (floor (1- (length values)) 2) (sort (copy-list values) #'<))
+                  (merge-fold1 values "discrete-median")
+                  (format nil "quickselect disagrees with a sort at ~s" values)))
+
+  ;; An absent chain top: the two strong operations REFUSE and the machine
+  ;; presents nothing. Isolated to MV-FOLD-REFUSES-P and pinned here, because a
+  ;; guessed k is unsound in both directions and neither direction is loud.
+  ;; Folding at k=1 clamps FallDetection's ladder [0,1,2,3,4,4,0] to 1 under (+)
+  ;; — the flattening the MV vocabulary exists to prevent — and yields 8 under
+  ;; (.), outside both the chain {0,1} and the machine's alphabet {0..4}. All
+  ;; three runtimes refuse.
+  (let ((collection '((1 0 1) (1 1 0))))
+    (assert-equal nil (merge-fold collection "strong-disjunction")
+                  "strong-disjunction refuses without a chain top")
+    (assert-equal nil (merge-fold collection "strong-conjunction")
+                  "strong-conjunction refuses without a chain top")
+    ;; Refusal is about the missing parameter, not about the data: supply k and
+    ;; the same collection folds.
+    (assert-true (merge-fold collection "strong-disjunction" :chain-top 1)
+                 "strong-disjunction folds once a chain top is supplied"))
+  ;; The smallest witness that (.) does not clamp — 3 is outside {0,1}. Asserted
+  ;; so that anyone reinstating a k=1 fallback has to walk past it.
+  (assert-equal 3 (merge-fold1 '(2 2) "strong-conjunction" :chain-top 1)
+                "strong-conjunction leaves the chain when k understates the alphabet")
+  ;; The other three take no k, or take one only as an optimisation, and stay
+  ;; total without it. join in particular stays the plain maximum, and stays
+  ;; symmetric even where the data has left the chain it was told about.
+  (assert-equal 0 (merge-fold1 '(3 3 0 3) "meet") "meet needs no chain top")
+  (assert-equal 3 (merge-fold1 '(3 3 0 3) "discrete-median") "discrete-median needs no chain top")
+  (assert-equal 5 (merge-fold1 '(1 3 5) "join") "join without a chain top is the maximum")
+  (assert-equal 5 (merge-fold1 '(5 3 1) "join") "join without a chain top is order independent")
+
+  ;; Every name the endpoints advertise is a name the fold implements.
+  (dolist (name reality-engine-lsp::+output-merge-transformations+)
+    (assert-true (merge-fold '((1)) name :chain-top 1)
+                 (format nil "~a is advertised but does not fold" name)))
+  (assert-equal 10 (length reality-engine-lsp::+output-merge-transformations+)
+                "five Boolean gates and five multi-valued transformations")
+  t)
+
+;; ── fold placement ───────────────────────────────────────────────────────────
+;; The fold used to sit beside the machine's atomic step rather than in it: it
+;; produced `mergedOutputVector` for the Perception Engine to read, and
+;; arbitration went on resolving the unfolded collection. So a machine with
+;; seven completed Reality Events put seven values into the same cell and the
+;; per-cell arbiter resolved contention that belonged to the machine — which is
+;; how FallDetection's ladder resolved to 2.0 on C++/LSP and 0.0 on Scala,
+;; neither the maximum nor the minimum (RealityEngine_CI#154, #158).
+;;
+;; These cover the four properties of the move that no live probe can establish,
+;; because each is a statement about what the engine does NOT do: contribute per
+;; sequence, resolve governance against the fold, drop a subscription, or emit
+;; zeros where it refused.
+
+(defun fold-sequence-json (sequence-id output-values &optional (output-count 1))
+  "One CES completing on the machine's single input cell, emitting OUTPUT-VALUES.
+
+Every sequence of a fixture keys on the same cell so that one push completes all
+of them at once — which is the case the fold exists for.  They cannot be given
+separate input cells: the default comparator tests binary AGREEMENT per cell
+rather than `>=`, so a sequence declaring 0 where a sibling declares 1 requires
+that cell to be low and the two can never complete on the same input.
+
+OUTPUT-COUNT above 1 gives the CES several output vectors, so it asserts several
+times in one step.  That is the only way to put a repeated sequence id into the
+contributor list: declaring the same id twice in a machine's `sequences` does
+not do it, because the loader keys sequences by id and the second declaration
+replaces the first."
+  (reality-engine-lsp::obj
+   "id" sequence-id
+   "name" sequence-id
+   "vectors" (reality-engine-lsp::vectorize
+              (list
+               (reality-engine-lsp::obj
+                "id" (format nil "~a-vector" sequence-id)
+                "isInitial" t
+                "elements" (reality-engine-lsp::vectorize
+                            (list (reality-engine-lsp::obj "value" 1 "threshold" 0.5)))
+                "outputVectors" (reality-engine-lsp::vectorize
+                                 (loop for i from 0 below output-count
+                                       collect (reality-engine-lsp::obj
+                                                "id" (format nil "~a-out-~a" sequence-id i)
+                                                "vector" (reality-engine-lsp::vectorize
+                                                          output-values)))))))))
+
+(defun fold-machine (id sequences &key (input-offset 0) (output-offset 16)
+                                       transformation chain-top metadata)
+  "A machine whose SEQUENCES all write the SAME output region.
+
+SEQUENCES is a list of (sequence-id output-values [output-count]), all completing
+together on the machine's one input cell.  Overlapping output positions within one machine
+are the case the fold exists for — the constructor assigns two CESs the same
+position only where that position is identical across every fold configuration,
+so it is the machine's own composition rather than contention the arbiter should
+ever have seen."
+  (let* ((output-length (reduce #'max sequences :key (lambda (s) (length (second s)))
+                                                :initial-value 0))
+         (mapping (reality-engine-lsp::obj
+                   "input" (reality-engine-lsp::obj "offset" input-offset
+                                                    "length" 1)
+                   "output" (reality-engine-lsp::obj "offset" output-offset
+                                                     "length" output-length))))
+    (when chain-top
+      (setf (reality-engine-lsp::jget mapping "outputAlphabetTop") chain-top))
+    (machine-from-json
+     (reality-engine-lsp::obj
+      "id" id
+      "name" id
+      "arbiterRule" "passthrough"
+      "metadata" (or metadata (reality-engine-lsp::obj))
+      "outputMergeTransformation" (or transformation "or")
+      "perceptualMapping" mapping
+      "sequences" (reality-engine-lsp::vectorize
+                   (mapcar (lambda (spec)
+                             (fold-sequence-json (first spec) (second spec)
+                                                 (or (third spec) 1)))
+                           sequences))))))
+
+(defun governance-rule (sequence-id output-matches rag process-status owner-team)
+  (reality-engine-lsp::obj
+   "sequenceId" sequence-id
+   "outputMatches" (reality-engine-lsp::vectorize output-matches)
+   "ragStatusCode" rag
+   "processStatus" process-status
+   "description" (format nil "rule for ~a" sequence-id)
+   "governance" (reality-engine-lsp::obj "ownerTeam" owner-team)))
+
+(defun governance-metadata (&rest rules)
+  (reality-engine-lsp::obj
+   "triggerConfig" (reality-engine-lsp::obj
+                    "rules" (reality-engine-lsp::vectorize rules))))
+
+(defun fold-step (state input)
+  (reality-engine-lsp::process-perceptual-input state input
+                                                :include-machine-results t
+                                                :include-perceptual-space t))
+
+(defun fold-batch (step)
+  (coerce (reality-engine-lsp::jget step "mergeBatch") 'list))
+
+(defun fold-placement-tests ()
+  ;; ── §8 — a single contributing sequence must read exactly as it did ────────
+  ;;
+  ;; This is the property that keeps the corpus unaffected: 1326 of its 1328
+  ;; machines assert only 0/1 and fold with `or`, and the remaining two declare
+  ;; `join` — and every one of those transformations is the identity on a
+  ;; one-element collection. `sequenceIds` becomes a one-element array and the
+  ;; joined governance is that sequence's own.
+  (let ((state (make-test-state 32)))
+    (reality-engine-lsp::put-machine
+     state
+     (fold-machine "machine-solo" '(("seq-solo" (1 0 1)))
+                   :metadata (governance-metadata
+                              (governance-rule "seq-solo" '(1 0 1) "AMBER" "warning" "team-solo"))))
+    (let* ((batch (fold-batch (fold-step state (list 1))))
+           (op (first batch)))
+      (assert-equal 1 (length batch) "one machine contributes exactly one operation")
+      (assert-equal '("seq-solo") (merge-sequence-ids op)
+                    "a single contributor yields a one-element sequenceIds")
+      (assert-equal '(1 0 1) (merge-values op)
+                    "the folded value of one contributor is that contributor")
+      (assert-equal '("seq-solo-vector")
+                    (coerce (reality-engine-lsp::jget op "provenance") 'list)
+                    "provenance of one contributor is that contributor's chain")
+      (assert-true (null (reality-engine-lsp::jget op "outputIndex"))
+                   "outputIndex is gone — one operation covers the machine")
+      (let ((gov (reality-engine-lsp::jget op "governance")))
+        (assert-equal "AMBER" (reality-engine-lsp::jstring gov "ragStatusCode" "")
+                      "the join over one contributor is that contributor's decision")
+        (assert-equal "team-solo" (reality-engine-lsp::jstring gov "ownerTeam" "")
+                      "and it travels whole"))))
+
+  ;; The general form of the property above, stated over the transformations
+  ;; rather than over one fixture: folding a one-element collection returns that
+  ;; element. True for `or`, `and` and `xor` on {0,1} and for all five
+  ;; multi-valued transformations — which is every transformation the corpus
+  ;; uses, since all 1328 machines fold with `or`.
+  (dolist (name '("or" "and" "xor" "meet" "join" "discrete-median"
+                  "strong-conjunction" "strong-disjunction"))
+    (assert-equal '(1.0d0 0.0d0 1.0d0) (merge-fold '((1 0 1)) name :chain-top 1)
+                  (format nil "~a is not the identity on a single contributor" name)))
+
+  ;; Where it is NOT the identity, pinned rather than assumed — these are the
+  ;; two boundaries of §8's byte-identity claim, and both are reachable only by
+  ;; a machine the corpus does not currently contain.
+  ;;
+  ;;   nor and nand invert a lone contributor: nor(k=1,n=1) is false and
+  ;;   nand(k=0,n=1) is true. No corpus machine declares either.
+  (assert-equal '(0.0d0 1.0d0) (merge-fold '((1 0)) "nor")
+                "nor inverts a single contributor — byte-identity does not hold for it")
+  (assert-equal '(0.0d0 1.0d0) (merge-fold '((1 0)) "nand")
+                "nand inverts a single contributor — byte-identity does not hold for it")
+  ;;   and a Boolean gate answers only "asserted or not", so it binarises a
+  ;;   contributor that asserted an ordinal value. Exactly two corpus machines
+  ;;   assert outside {0,1} — FallDetection and FallSensorMotionPreaggregator —
+  ;;   and they are the machines this whole line of work is about (#158).
+  (assert-equal '(1.0d0 1.0d0) (merge-fold '((4 3)) "or")
+                "a Boolean gate binarises a non-binary contributor")
+  (assert-equal '(4.0d0 3.0d0) (merge-fold '((4 3)) "join" :chain-top 4)
+                "a multi-valued transformation preserves the ordinal value")
+
+  ;; ── §3 — governance is the join over contributors, resolved per sequence ──
+  ;;
+  ;; The severity chain GREEN/absent 0 < AMBER 1 < RED 2 is already ordered, so
+  ;; the join is a maximum over it: deterministic, symmetric, and
+  ;; safety-preserving — a RED-governed firing cannot be hidden by a GREEN one
+  ;; that folded beside it, which is exactly what SEVERITY arbitration exists to
+  ;; guarantee.
+  ;;
+  ;; Both fixtures fold to (1 1), which matches NO rule. That is deliberate: it
+  ;; demonstrates the resolution is per contributing sequence against that
+  ;; sequence's own asserted values, and never against the folded value.
+  (let ((state (make-test-state 32)))
+    (reality-engine-lsp::put-machine
+     state
+     (fold-machine "machine-severity" '(("seq-a-amber" (1 0)) ("seq-b-red" (0 1)))
+                   :metadata (governance-metadata
+                              (governance-rule "seq-a-amber" '(1 0) "AMBER" "warning" "team-amber")
+                              (governance-rule "seq-b-red"   '(0 1) "RED"   "error"   "team-red"))))
+    (let* ((op (first (fold-batch (fold-step state (list 1)))))
+           (gov (reality-engine-lsp::jget op "governance")))
+      (assert-equal '("seq-a-amber" "seq-b-red") (merge-sequence-ids op)
+                    "sequenceIds is the sorted contributing set")
+      (assert-equal '(1 1) (merge-values op)
+                    "the machine contributes one folded value, not one per firing")
+      (assert-equal "RED" (reality-engine-lsp::jstring gov "ragStatusCode" "")
+                    "the join takes the highest severity rank among contributors")
+      ;; Whole, not composed: every field comes from the RED rule. A record
+      ;; mixing one rule's status with another's owner describes no rule that
+      ;; exists, and would page a team for a status it never declared.
+      (assert-equal "error" (reality-engine-lsp::jstring gov "processStatus" "")
+                    "the winning contributor's processStatus travels with it")
+      (assert-equal "team-red" (reality-engine-lsp::jstring gov "ownerTeam" "")
+                    "the winning contributor's ownerTeam travels with it")
+      (assert-equal "rule for seq-b-red" (reality-engine-lsp::jstring gov "description" "")
+                    "the winning contributor's description travels with it")
+      (assert-equal "seq-b-red" (reality-engine-lsp::jstring gov "sequenceId" "")
+                    "the decision names the sequence it was resolved for")))
+
+  ;; The tie. Equal severity ranks are broken by lexicographically smallest
+  ;; sequence id, so the answer does not depend on which contributor happened to
+  ;; fire first or on the order the machine enumerated them.
+  (let ((state (make-test-state 32)))
+    (reality-engine-lsp::put-machine
+     state
+     (fold-machine "machine-tie" '(("seq-z-amber" (0 1)) ("seq-a-amber" (1 0)))
+                   :metadata (governance-metadata
+                              (governance-rule "seq-z-amber" '(0 1) "AMBER" "warning" "team-z")
+                              (governance-rule "seq-a-amber" '(1 0) "AMBER" "info"    "team-a"))))
+    (let* ((op (first (fold-batch (fold-step state (list 1)))))
+           (gov (reality-engine-lsp::jget op "governance")))
+      (assert-equal '("seq-a-amber" "seq-z-amber") (merge-sequence-ids op)
+                    "both sequences contributed")
+      (assert-equal "seq-a-amber" (reality-engine-lsp::jstring gov "sequenceId" "")
+                    "an AMBER/AMBER tie resolves to the lexicographically smallest id")
+      (assert-equal "team-a" (reality-engine-lsp::jstring gov "ownerTeam" "")
+                    "and that contributor's decision travels whole")
+      (assert-equal "info" (reality-engine-lsp::jstring gov "processStatus" "")
+                    "not composed from the other tied rule")))
+
+  ;; No contributor resolves a rule — absent, not an empty decision.
+  (let ((state (make-test-state 32)))
+    (reality-engine-lsp::put-machine
+     state
+     (fold-machine "machine-ungoverned" '(("seq-ungoverned" (1)))))
+    (let ((op (first (fold-batch (fold-step state (list 1))))))
+      (assert-true (null (reality-engine-lsp::jget op "governance"))
+                   "no contributor resolved governance, so the operation carries none")))
+
+  ;; ── §4 — deprecation attaches when ANY contributor is deprecated ──────────
+  (let* ((state (make-test-state 32))
+         (machine (fold-machine "machine-dep-join"
+                                '(("seq-z-dep" (0 1)) ("seq-a-dep" (1 0))))))
+    (dolist (spec '(("seq-z-dep" "2026-01-01" "seq-z-new")
+                    ("seq-a-dep" "2026-01-02" "seq-a-new")))
+      (let ((sequence (gethash (first spec) (reality-engine-lsp::machine-sequences machine))))
+        (setf (reality-engine-lsp::sequence-deprecated-at sequence) (second spec)
+              (reality-engine-lsp::sequence-replaced-by sequence) (third spec))))
+    (reality-engine-lsp::put-machine state machine)
+    (let* ((op (first (fold-batch (fold-step state (list 1)))))
+           (dep (reality-engine-lsp::jget op "deprecation")))
+      (assert-equal "seq-a-new" (reality-engine-lsp::jstring dep "replacedBy" "")
+                    "the reported deprecation is the lexicographically smallest deprecated contributor")
+      ;; The counter still counts firings, not machines: both deprecated
+      ;; contributors bump it, under their own sequence ids.
+      (assert-equal 2 (let ((total 0))
+                        (maphash (lambda (_ n) (declare (ignore _)) (incf total n))
+                                 (reality-engine-lsp::reality-state-cov-deprecated state))
+                        total)
+                    "record-deprecated-fire runs once per deprecated contributor")
+      (assert-true (null (reality-engine-lsp::jget op "%deprecatedFires"))
+                   "the internal per-firing detail must not reach the wire")))
+
+  ;; ── §5 — the event bus fires for EVERY contributing sequence ──────────────
+  ;;
+  ;; The one consumer whose behaviour must be identical rather than analogous:
+  ;; subscriptions are keyed on (producer machine, producer sequence) and the
+  ;; write goes into the perceptual space, so a meta machine that stops firing
+  ;; is a corpus change, not a reporting difference. Reading one arbitrarily
+  ;; chosen member of the set would fire one of these two subscribers and
+  ;; silently drop the other.
+  (let ((state (make-test-state 40)))
+    (reality-engine-lsp::put-machine
+     state
+     (one-bit-machine "agent-fold" "agent-fold-seq" 20 30
+                      :metadata (compose-metadata
+                                 (compose-subscription "producer-fold" "fold-seq-b" 13)
+                                 (compose-subscription "producer-fold" "fold-seq-a" 12))))
+    (reality-engine-lsp::put-machine
+     state
+     (fold-machine "producer-fold" '(("fold-seq-a" (1)) ("fold-seq-b" (1)))))
+    (assert-equal 2 (reality-engine-lsp::event-bus-subscription-count state)
+                  "both subscriptions registered")
+    (let* ((step (fold-step state (list 1)))
+           (producer (find-merge-by-machine (reality-engine-lsp::jget step "mergeBatch")
+                                            "producer-fold"))
+           (event-bus (coerce (reality-engine-lsp::jget step "eventBus") 'list)))
+      (assert-equal '("fold-seq-a" "fold-seq-b") (merge-sequence-ids producer)
+                    "the producer contributes one operation naming both sequences")
+      (assert-equal 2 (length event-bus)
+                    "every contributing sequence's subscription still fires")
+      (assert-equal '(12 13)
+                    (mapcar (lambda (write) (reality-engine-lsp::jnumber write "bitOffset" nil))
+                            event-bus)
+                    "both subscriber bits are written")
+      (assert-equal '("fold-seq-a" "fold-seq-b")
+                    (mapcar (lambda (write)
+                              (reality-engine-lsp::jstring write "producerSequenceId" ""))
+                            event-bus)
+                    "each write is attributed to the sequence that produced it")))
+
+  ;; ── §2 — a fold refusal contributes NO operation ──────────────────────────
+  ;;
+  ;; Not a vector of zeros: zeros are a positive claim about every cell in the
+  ;; region, and would reach the arbiter as a contribution that could suppress a
+  ;; real one. A machine whose declared transformation cannot be evaluated
+  ;; presents nothing, exactly as one that completed no Reality Event does.
+  (let ((state (make-test-state 32)))
+    (reality-engine-lsp::put-machine
+     state
+     (fold-machine "machine-refuses" '(("seq-refuse-a" (1 0)) ("seq-refuse-b" (1 0)))
+                   :transformation "strong-conjunction"))
+    (let* ((step (fold-step state (list 1)))
+           (result (reality-engine-lsp::jget (reality-engine-lsp::jget step "machineResults")
+                                             "machine-refuses")))
+      (assert-equal nil (fold-batch step)
+                    "a refusing machine contributes no merge operation")
+      (assert-true (eq (reality-engine-lsp::jget result "mergedOutputVector")
+                       reality-engine-lsp::+json-null+)
+                   "and presents no merged output to the Perception Engine")
+      ;; The output region specifically — the input cell the push asserted is
+      ;; still set, and it is the output side that a zero-vector contribution
+      ;; would have claimed.
+      (assert-true (every #'zerop
+                          (subseq (reality-engine-lsp::reality-state-perceptual-space state)
+                                  16 18))
+                   "and writes nothing into its output region")))
+
+  ;; ── §2 against §5 — a refusal withdraws the VALUE, not the FIRINGS ────────
+  ;;
+  ;; The two clauses collide if the event bus is driven off the merge batch: §2
+  ;; says a refusing machine contributes no operation, and §5 says every
+  ;; (producer machine, producer sequence) subscription that would have fired
+  ;; still fires. With no operation to iterate there is nothing to fan out from,
+  ;; and the subscriptions go silent — which §5 forbids.
+  ;;
+  ;; Resolved by driving the bus from the contributor record instead. The bus
+  ;; asks which CESs COMPLETED, which is independent of whether the fold produced
+  ;; a presentable value, so a producer whose transformation refuses still feeds
+  ;; every meta machine subscribed to it while contributing nothing to
+  ;; arbitration. Getting this wrong is close to undetectable in a single step:
+  ;; the response looks well formed, and only the meta machine's silence
+  ;; downstream shows it.
+  (let ((state (make-test-state 40)))
+    (reality-engine-lsp::put-machine
+     state
+     (one-bit-machine "agent-refuse" "agent-refuse-seq" 20 30
+                      :metadata (compose-metadata
+                                 (compose-subscription "producer-refuse" "refuse-seq-b" 13)
+                                 (compose-subscription "producer-refuse" "refuse-seq-a" 12))))
+    (reality-engine-lsp::put-machine
+     state
+     (fold-machine "producer-refuse" '(("refuse-seq-a" (1)) ("refuse-seq-b" (1)))
+                   :transformation "strong-disjunction"))
+    (let* ((step (fold-step state (list 1)))
+           (event-bus (coerce (reality-engine-lsp::jget step "eventBus") 'list)))
+      (assert-equal nil (find-merge-by-machine (reality-engine-lsp::jget step "mergeBatch")
+                                               "producer-refuse")
+                    "the refusing producer contributes no merge operation")
+      (assert-equal 2 (length event-bus)
+                    "but every subscription it feeds still fires")
+      (assert-equal '(12 13)
+                    (mapcar (lambda (write) (reality-engine-lsp::jnumber write "bitOffset" nil))
+                            event-bus)
+                    "both subscriber bits are written despite the refusal")
+      (assert-equal '("refuse-seq-a" "refuse-seq-b")
+                    (mapcar (lambda (write)
+                              (reality-engine-lsp::jstring write "producerSequenceId" ""))
+                            event-bus)
+                    "each write is still attributed to the sequence that completed")))
+
+  ;; ── A3 — `cesId` is the comma-joined contributing set ─────────────────────
+  ;;
+  ;; A folded contribution has no single CES, so the arbitration record carries
+  ;; the whole set as one opaque key: sorted, deduplicated, comma-joined, no
+  ;; spaces. Taking one member would render identically for nearly every machine
+  ;; and discard the rest exactly where the evidence matters — a cell contested
+  ;; by a machine that reached its value from several CESs. C++ joins, so a
+  ;; runtime that picked would disagree with it on those contributions only,
+  ;; which is the hardest class of divergence to find.
+  ;;
+  ;; Contested here on purpose: an uncontended cell resolves to its single
+  ;; contributor and emits NO arbitration record (contract 4.5), so a second
+  ;; machine has to write the same cell for one to exist at all.
+  (let ((state (make-test-state 32)))
+    (reality-engine-lsp::put-machine
+     state
+     ;; `ces-b` asserts TWICE in the step, so it enters the contributor list
+     ;; twice and the join has genuine deduplication to do. Declaring the id
+     ;; twice in `sequences` would not exercise it — the loader keys sequences
+     ;; by id, so the second declaration would simply replace the first.
+     (fold-machine "m-joined" '(("ces-b" (1) 2) ("ces-a" (1)))
+                   :input-offset 0 :output-offset 16))
+    (reality-engine-lsp::put-machine
+     state
+     (fold-machine "m-solo" '(("ces-solo" (1)))
+                   :input-offset 0 :output-offset 16))
+    (fold-step state (list 1))
+    (let* ((records (reality-engine-lsp::reality-state-arbitration state))
+           (contributors (and records
+                              (reality-engine-lsp::arbitration-record-contributors
+                               (first records))))
+           (ces-ids (sort (mapcar #'reality-engine-lsp::contribution-ces-id contributors)
+                          #'string<)))
+      (assert-equal 1 (length records) "the shared output cell produced one arbitration record")
+      ;; "ces-b" contributed twice and must appear once: the set is deduplicated
+      ;; before it is joined, and sorted, so "ces-a" precedes "ces-b" regardless
+      ;; of the order the machine enumerated them.
+      (assert-equal '("ces-a,ces-b" "ces-solo") ces-ids
+                    "cesId is the sorted, deduplicated, comma-joined contributing set")
+      ;; The invariant that keeps this surface unchanged for nearly every
+      ;; machine: one contributor renders as the bare id, with no delimiter.
+      (assert-true (notany (lambda (id) (find #\, id))
+                           (remove "ces-a,ces-b" ces-ids :test #'string=))
+                   "a one-element set renders as the bare id, no comma")
+      ;; No spaces anywhere — the join is a wire format shared with C++, and a
+      ;; stray separator would make the two runtimes disagree on a key that
+      ;; nothing compares numerically and everything compares as a string.
+      (assert-true (notany (lambda (id) (find #\Space id)) ces-ids)
+                   "the join carries no spaces")))
+
+  ;; The PE dispatch ledger and its replay path carry the SET, not a scalar.
+  ;;
+  ;; Replay copies its fields off the original record, so it was reading a
+  ;; `sequenceId` key that stopped existing when the ledger moved to
+  ;; `sequenceIds`. `jstring` of a missing key is the supplied default, so the
+  ;; replay recorded "" and looked perfectly well formed — a replay that had
+  ;; forgotten which CESs produced the determination it was replaying. That is
+  ;; the silent-degradation failure this whole line of work exists to remove, so
+  ;; it is pinned rather than left to the next reader to notice.
+  (let* ((pe-state (reality-engine-lsp::make-perception-state-from-config
+                    :dimension 64
+                    :reality-url "http://localhost:3299"
+                    :localai-url "http://localhost:8000"
+                    :localai-machine-dir "../localAIStack/data/machines"))
+         (machine-json (reality-engine-lsp::obj
+                        "name" "m-replay"
+                        "metadata" (reality-engine-lsp::obj
+                                    "dispatchableAgent" "agent-x"
+                                    "aiTrigger" "trigger-x"
+                                    "agentBinding" (reality-engine-lsp::obj
+                                                    "agent" "agent-x"
+                                                    "trigger" "trigger-x"
+                                                    "mode" "advise"))))
+         (operation (reality-engine-lsp::obj
+                     "region" (reality-engine-lsp::obj "offset" 16 "length" 1)
+                     "machineId" "m-replay"
+                     "sequenceIds" (reality-engine-lsp::vectorize '("ces-a" "ces-b"))
+                     "values" (reality-engine-lsp::vectorize '(1))
+                     "governance" (reality-engine-lsp::obj "ragStatusCode" "RED"
+                                                           "processStatus" "error")))
+         (record (reality-engine-lsp::record-dispatch-envelope pe-state operation machine-json)))
+    (assert-true record "dispatch record was not created")
+    (assert-equal '("ces-a" "ces-b")
+                  (reality-engine-lsp::jarray-list
+                   (reality-engine-lsp::jget record "sequenceIds"))
+                  "the ledger record carries the contributing set")
+    (assert-equal '("ces-a" "ces-b")
+                  (reality-engine-lsp::jarray-list
+                   (reality-engine-lsp::jget
+                    (reality-engine-lsp::jget
+                     (reality-engine-lsp::jget record "envelope") "ces")
+                    "sequenceIds"))
+                  "and so does the envelope it wraps")
+    (let ((replayed (reality-engine-lsp::replay-dispatch-record
+                     pe-state (reality-engine-lsp::jstring record "id" ""))))
+      (assert-true replayed "replay produced no record")
+      (assert-equal '("ces-a" "ces-b")
+                    (reality-engine-lsp::jarray-list
+                     (reality-engine-lsp::jget replayed "sequenceIds"))
+                    "a replay must not forget which CESs produced the determination")))
+
+  ;; Refusal is about the missing parameter, not the data: the same machine with
+  ;; k declared on its perceptualMapping folds and contributes.
+  (let ((state (make-test-state 32)))
+    (reality-engine-lsp::put-machine
+     state
+     (fold-machine "machine-declares-k" '(("seq-k-a" (1 0)) ("seq-k-b" (1 0)))
+                   :transformation "strong-conjunction"
+                   :chain-top 1))
+    (let* ((step (fold-step state (list 1)))
+           (op (first (fold-batch step))))
+      (assert-true op "a declared chain top lets the same machine fold")
+      (assert-equal '("seq-k-a" "seq-k-b") (merge-sequence-ids op)
+                    "both sequences contributed to the folded value")
+      ;; (.) over [1,1] at k=1 is max(0, 2 - 1) = 1; over [0,0] it extinguishes.
+      (assert-equal '(1 0) (merge-values op)
+                    "strong-conjunction folds the collection at the declared k")))
+
+  ;; The declared k must survive a machine round trip, or a copy made by any
+  ;; route that rebuilds from machine-json would refuse a fold its original
+  ;; performed.
+  (let* ((machine (fold-machine "machine-k-roundtrip" '(("seq-k" (1)))
+                                :transformation "strong-disjunction"
+                                :chain-top 3))
+         (copy (machine-from-json (reality-engine-lsp::machine-json machine :full t))))
+    (assert-equal 3 (reality-engine-lsp::machine-chain-top copy)
+                  "outputAlphabetTop survives machine-json -> machine-from-json"))
+  t)
+
 (defun run-tests ()
   (let* ((machine-json (reality-engine-lsp::obj
                        "id" "machine-test"
@@ -485,7 +1192,7 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
       (assert-equal (list "machine-a" "machine-z")
                     (mapcar (lambda (op) (reality-engine-lsp::jstring op "machineId" "")) batch)
                     "mergeBatch should be sorted by machineId")
-      (assert-equal (list 1) (reality-engine-lsp::numbers-from-json (reality-engine-lsp::jget (first batch) "values"))
+      (assert-equal (list 1) (merge-values (first batch))
                     "mergeBatch should carry output values")
       (assert-equal (list "seq-a-vector")
                     (coerce (reality-engine-lsp::jget (first batch) "provenance") 'list)
@@ -603,9 +1310,8 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                     :include-machine-results t
                     :include-perceptual-space t))
            (batch (coerce (reality-engine-lsp::jget step-2 "mergeBatch") 'list)))
-      (assert-true (find "agent-seq" batch
-                         :key (lambda (op) (reality-engine-lsp::jstring op "sequenceId" ""))
-                         :test #'string=)
+      (assert-true (find-if (lambda (op) (member "agent-seq" (merge-sequence-ids op) :test #'string=))
+                            batch)
                    "latched compose bit should let subscriber fire on the next step")))
   (let* ((state (make-test-state 32))
          (agent-meta (compose-metadata
@@ -684,10 +1390,20 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                     "id" "packed-machine"
                     "name" "Packed Machine"
                     "arbiterRule" "passthrough"
+                    ;; `join` + a declared chain top, because the merge batch now
+                    ;; carries the FOLD rather than the raw asserted output. The
+                    ;; Boolean gates answer only "asserted or not", so folding an
+                    ;; ordinal ladder with one flattens 0,1,2,3 to 0,1,1,1 — the
+                    ;; packed payload below would become "FQ==" and the 2-bit
+                    ;; cells would carry a flag instead of a rung
+                    ;; (RealityEngine_CI#158). The binarising case is asserted
+                    ;; directly beneath this block so the boundary stays visible.
+                    "outputMergeTransformation" "join"
                     "perceptualMapping" (reality-engine-lsp::obj
                                          "input" (reality-engine-lsp::obj "offset" 0 "length" 1)
                                          "output" (reality-engine-lsp::obj "offset" 1 "length" 4)
-                                         "bitsPerElement" 2)
+                                         "bitsPerElement" 2
+                                         "outputAlphabetTop" 3)
                     "sequences" (reality-engine-lsp::vectorize
                                  (list
                                   (reality-engine-lsp::obj
@@ -724,6 +1440,43 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                     "storage footprint histogram should count 2-bit machines")
       (assert-equal 2 (reality-engine-lsp::jnumber footprint "totalPackedBytes" nil)
                     "storage footprint should total packed bytes")))
+  ;; The same machine without the multi-valued declaration. Its ONE contributing
+  ;; sequence asserts 0,1,2,3 and folds with the default `or`, which reports only
+  ;; whether a cell was asserted — so the operation carries 0,1,1,1 and packs to
+  ;; "FQ==" rather than "Gw==".
+  ;;
+  ;; This is the limit of the byte-identity property: a single contributing
+  ;; sequence reads exactly as it did only where the fold is the IDENTITY on it,
+  ;; which for a Boolean gate requires the asserted values to already be in
+  ;; {0,1}. The corpus satisfies that today — of 1328 machines, 1326 fold with
+  ;; `or` and assert only 0/1, and the two that assert an ordinal ladder,
+  ;; FallDetection and FallSensorMotionPreaggregator, now declare `join`, which
+  ;; preserves the value. So nothing in the corpus currently lands here.
+  ;;
+  ;; Pinned anyway, because the property is one declaration away from being
+  ;; violated: a machine asserting outside {0,1} while leaving
+  ;; outputMergeTransformation to default is well formed, loads without
+  ;; complaint, and would have its ladder flattened to a flag by a fold that
+  ;; never used to reach arbitration (RealityEngine_CI#158). Better asserted
+  ;; here than discovered as a corpus divergence.
+  (let* ((state (make-test-state 8))
+         (machine (fold-machine "packed-machine-boolean" '(("packed-seq-boolean" (0 1 2 3)))
+                                :input-offset 0 :output-offset 1)))
+    (setf (reality-engine-lsp::mapping-bits-per-element
+           (reality-engine-lsp::machine-mapping machine))
+          2)
+    (reality-engine-lsp::put-machine state machine)
+    (let* ((step (reality-engine-lsp::process-perceptual-input
+                  state (list 1)
+                  :include-machine-results t
+                  :include-perceptual-space t
+                  :compact t))
+           (op (first-merge step)))
+      (assert-equal '(0 1 1 1) (merge-values op)
+                    "a Boolean gate reports assertion, not the ordinal value")
+      (assert-equal "FQ==" (reality-engine-lsp::jstring
+                            (reality-engine-lsp::jget op "valuesPacked") "base64" "")
+                    "and the packed payload follows the folded value")))
   (let ((patterns (mapcar #'reality-engine-lsp::route-pattern
                           (reality-engine-lsp::flatten-routes
                            (reality-engine-lsp::reality-routes nil)))))
@@ -1406,8 +2159,8 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
              (assert-equal nil m055 "stage 1 tick: AGX055 must not fire before tier-1 outputs propagate"))))
        (assert-true m051-final "stage 1: AGX051 never fired URGENT_MAINT across 3-tick escalation")
        (when m051-final
-         (assert-equal "agx-051-urgent-maint" (reality-engine-lsp::jstring m051-final "sequenceId" "") "AGX051 sequenceId")
-         (assert-equal '(1 0 0 0) (reality-engine-lsp::numbers-from-json (reality-engine-lsp::jget m051-final "values")) "AGX051 values != URGENT_MAINT one-hot")
+         (assert-equal '("agx-051-urgent-maint") (merge-sequence-ids m051-final) "AGX051 sequenceIds")
+         (assert-equal '(1 0 0 0) (merge-values m051-final) "AGX051 values != URGENT_MAINT one-hot")
          (let ((gov (reality-engine-lsp::jget m051-final "governance")))
            (assert-equal "RED"   (reality-engine-lsp::jstring gov "ragStatusCode" "") "AGX051 gov.rag")
            (assert-equal 900     (reality-engine-lsp::jnumber gov "slaSeconds" nil)   "AGX051 gov.sla != 900")))
@@ -1423,8 +2176,8 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
          (declare (ignore _))
          (assert-true m055 "stage 2: AGX055 did not fire — bridge contract broken")
          (when m055
-           (assert-equal "agx-055-aqua-urgent" (reality-engine-lsp::jstring m055 "sequenceId" "") "AGX055 sequenceId")
-           (assert-equal '(1 0 0 0 0 0 0 0 0 0 0 0) (reality-engine-lsp::numbers-from-json (reality-engine-lsp::jget m055 "values")) "AGX055 values != AQUA_URGENT one-hot")
+           (assert-equal '("agx-055-aqua-urgent") (merge-sequence-ids m055) "AGX055 sequenceIds")
+           (assert-equal '(1 0 0 0 0 0 0 0 0 0 0 0) (merge-values m055) "AGX055 values != AQUA_URGENT one-hot")
            (let ((gov (reality-engine-lsp::jget m055 "governance")))
              (assert-equal "RED" (reality-engine-lsp::jstring gov "ragStatusCode" "") "AGX055 gov.rag")
              (assert-equal 600   (reality-engine-lsp::jnumber gov "slaSeconds" nil)   "AGX055 gov.sla != 600")))
@@ -1437,9 +2190,9 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
               (_ (zero-region stage3 256 16)))
          (declare (ignore _))
          (assert-true (>= (length stage3) 3971) "stage 3: perceptualSpace not grown to 3971")
-         (assert-equal 1 (nth 3959 stage3) "stage 3: AQUA_URGENT bit at [3959] missing")
+         (assert-equal 1 (round (nth 3959 stage3)) "stage 3: AQUA_URGENT bit at [3959] missing")
          (loop for i from 3960 below 3971 do
-               (assert-equal 0 (nth i stage3) (format nil "stage 3: stray bit at [~a] — one-hot projection violated" i)))
+               (assert-equal 0 (round (nth i stage3)) (format nil "stage 3: stray bit at [~a] — one-hot projection violated" i)))
          (reality-engine-lsp::process-perceptual-input state stage3
                                                        :include-machine-results t :include-perceptual-space t)))
 
@@ -1461,8 +2214,8 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
          (declare (ignore _))
          (assert-true m055 "stable path: AGX055 did not fire FACILITY_STABLE")
          (when m055
-           (assert-equal "agx-055-facility-stable" (reality-engine-lsp::jstring m055 "sequenceId" "") "stable path: sequenceId")
-           (assert-equal '(0 0 0 0 0 0 0 0 0 0 0 1) (reality-engine-lsp::numbers-from-json (reality-engine-lsp::jget m055 "values")) "stable path: values != FACILITY_STABLE one-hot")
+           (assert-equal '("agx-055-facility-stable") (merge-sequence-ids m055) "stable path: sequenceIds")
+           (assert-equal '(0 0 0 0 0 0 0 0 0 0 0 1) (merge-values m055) "stable path: values != FACILITY_STABLE one-hot")
            (assert-equal "GREEN" (reality-engine-lsp::jstring (reality-engine-lsp::jget m055 "governance") "ragStatusCode" "") "stable path: rag != GREEN"))))))
 
   ;; ── /api/perceive input forms (regression for the jarray-p / missing-key
@@ -1622,6 +2375,9 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
         (let ((shuffled (sort (copy-list base) #'< :key (lambda (c) (random 1000)))))
           (assert-equal first-result (reality-engine-lsp::resolve-cell 1 0 shuffled e)
                         "resolution is invariant under contribution order")))))
+
+  (output-merge-tests)
+  (fold-placement-tests)
 
   (format t "~&RealityEngine_LSP core tests passed.~%")
   t)

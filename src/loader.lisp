@@ -227,7 +227,15 @@ from a request body with no machine in scope."
                   :output (make-region-from-json (jget item "output"))
                   :bits-per-element (let ((bits (jnumber item "bitsPerElement" nil)))
                                       (when (and bits (member (truncate bits) '(1 2 4 8)))
-                                        (truncate bits))))))
+                                        (truncate bits)))
+                  ;; k, the machine's declared alphabet top. The schema requires
+                  ;; it of exactly the machines that select one of the two
+                  ;; Lukasiewicz strong operations and allows it on any other;
+                  ;; a value below 1 is not a chain, so it is read as undeclared
+                  ;; and the fold refuses rather than folding at a nonsense k.
+                  :output-alphabet-top (let ((k (jnumber item "outputAlphabetTop" nil)))
+                                         (when (and k (>= (truncate k) 1))
+                                           (truncate k))))))
 
 ;; STA strictness defaults to NIL — matches AI's MachineLoader.loadFromJSON
 ;; (`options.strictSta` opt-in) and C++'s `LoadOptions{strictSta=false}` so

@@ -706,7 +706,17 @@ Wire-compatible with _AI Dispatcher.replay() — same mode:\"replay\" + replayOf
                           "replayOf" dispatch-id
                           "target" (or (jstring original "target" nil) +json-null+)
                           "machineId" (or (jstring original "machineId" nil) "")
-                          "sequenceId" (or (jstring original "sequenceId" nil) "")
+                          ;; The contributing SET, carried across verbatim.
+                          ;; This read scalar `sequenceId` until the fold moved
+                          ;; into the machine's atomic step; once the ledger
+                          ;; started recording `sequenceIds`, the old read found
+                          ;; no key and quietly wrote "" — a replay that had
+                          ;; forgotten which CESs produced the determination it
+                          ;; was replaying, with nothing in the record to show
+                          ;; it. `jarray-list` of a missing key is NIL, so a
+                          ;; record predating the change replays as an empty set
+                          ;; rather than erroring.
+                          "sequenceIds" (vectorize (jarray-list (jget original "sequenceIds")))
                           "ragStatusCode" (or (jstring original "ragStatusCode" nil) "")
                           "processStatus" (or (jstring original "processStatus" nil) "")
                           "adapter" +json-null+ "provider" +json-null+
@@ -843,7 +853,22 @@ Wire-compatible with CPP build_trigger_envelope and TS buildTriggerEnvelope."
          (trigger-config (or (jget md "triggerConfig") (obj)))
          (trigger-dispatch (or (jget trigger-config "dispatch") (obj)))
          (binding (ces-dispatch-binding md values))
-         (sequence-id (jstring op "sequenceId" ""))
+         ;; A merge operation covers a whole machine now and names the SET of
+         ;; CESs that contributed, so the envelope reports the set. RE and PE
+         ;; move together here by necessity: a PE still reading a scalar
+         ;; `sequenceId` from an updated RE would attribute every determination
+         ;; to nothing at all, and no fallback is offered because a silent
+         ;; fallback would hide exactly that mismatch.
+         ;;
+         ;; The ARRAY, deliberately, where the arbiter's `cesId` carries the same
+         ;; set comma-joined (FOLD_PLACEMENT.md A3). The two are renderings of
+         ;; one thing and the join is derivable from this, never the reverse:
+         ;; `cesId` is an opaque key for ordering and attribution, while this is
+         ;; the evidence trail a dispatch consumer walks, and a consumer that had
+         ;; to split a string to find which CESs fired would be one delimiter
+         ;; away from silently attributing a determination to a CES named after
+         ;; a fragment of two others.
+         (sequence-ids (vectorize (jarray-list (jget op "sequenceIds"))))
          (machine-id (jstring op "machineId" ""))
          (mode (perception-state-trigger-dispatch-mode state))
          (graphql-p (string= mode "graphql")))
@@ -858,9 +883,13 @@ Wire-compatible with CPP build_trigger_envelope and TS buildTriggerEnvelope."
          "ces" (obj "machineId" machine-id
                     "machineName" (or (jstring machine "name" nil) machine-id)
                     "machineCode" (jstring md "machineCode" "")
-                    "sequenceId" sequence-id
-                    "sequenceName" sequence-id
-                    "outputIndex" (or (jnumber op "outputIndex" nil) 0)
+                    "sequenceIds" sequence-ids
+                    ;; Names have always been the ids here; pluralised rather
+                    ;; than dropped so a consumer reading the name side of the
+                    ;; pair keeps finding it. `outputIndex` is gone: it
+                    ;; identified one asserted output within a machine, and a
+                    ;; machine now presents one output.
+                    "sequenceNames" sequence-ids
                     "stepNumber" 0
                     "perceptualMapping" (obj "output" (or (jget op "region") +json-null+))
                     "provenance" (if (jarray-present-p op "provenance")
@@ -925,7 +954,11 @@ corpus-walk helpers that already hold the loaded machine object)."
                         "mode" (perception-state-trigger-dispatch-mode state)
                         "target" agent
                         "machineId" machine-id
-                        "sequenceId" (jstring operation "sequenceId" "")
+                        ;; The ledger records the contributing set for the same
+                        ;; reason the envelope does — a dispatch record that
+                        ;; named one CES would misattribute a determination the
+                        ;; machine reached from several.
+                        "sequenceIds" (vectorize (jarray-list (jget operation "sequenceIds")))
                         "ragStatusCode" (jstring governance "ragStatusCode" "")
                         "processStatus" (jstring governance "processStatus" "")
                         "adapter" +json-null+
