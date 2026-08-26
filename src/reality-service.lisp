@@ -619,62 +619,63 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                                count))))
                    (reality-state-cov-deprecated state))
 
-          (emit-help "ces_unfired_sequences"
-                     "Number of sequences in this machine that have never emitted output." "gauge")
-          (dolist (row (prom-per-machine-unfired state))
-            (emit "ces_unfired_sequences"
-                  (append base `(("machine" . ,(nth 1 row))
-                                 ("machine_id" . ,(nth 0 row))))
-                  (nth 4 row)))
+          ;; One corpus walk per scrape.  The five families below each select a
+          ;; different column out of the *same* rows, so this used to call
+          ;; prom-per-machine-unfired five times — five maphashes over every
+          ;; machine, sequence and vector, and ~3,500 freshly consed
+          ;; coverage-key strings per walk.  Bind it once and reuse.
+          ;;
+          ;; The per-machine label set is identical across all five families
+          ;; too, so it is built once here rather than re-appended per family.
+          ;; Emission order and label order are unchanged, which matters: this
+          ;; payload is byte-compared against the C++ and Scala runtimes
+          ;; (RealityEngine_Machines/docs/PE_METRICS_CONTRACT.md), so only the
+          ;; traversal count may change, never the text.
+          (let* ((unfired-rows (prom-per-machine-unfired state))
+                 (unfired-labels (mapcar (lambda (row)
+                                           (append base `(("machine" . ,(nth 1 row))
+                                                          ("machine_id" . ,(nth 0 row)))))
+                                         unfired-rows)))
+            (emit-help "ces_unfired_sequences"
+                       "Number of sequences in this machine that have never emitted output." "gauge")
+            (loop for row in unfired-rows for labels in unfired-labels
+                  do (emit "ces_unfired_sequences" labels (nth 4 row)))
 
-          (emit-help "ces_unfired_vectors"
-                     "Number of vectors in this machine that have never matched or activated." "gauge")
-          (dolist (row (prom-per-machine-unfired state))
-            (emit "ces_unfired_vectors"
-                  (append base `(("machine" . ,(nth 1 row))
-                                 ("machine_id" . ,(nth 0 row))))
-                  (nth 5 row)))
+            (emit-help "ces_unfired_vectors"
+                       "Number of vectors in this machine that have never matched or activated." "gauge")
+            (loop for row in unfired-rows for labels in unfired-labels
+                  do (emit "ces_unfired_vectors" labels (nth 5 row)))
 
-          (emit-help "ces_machine_sequence_count"
-                     "Total sequences declared by this machine." "gauge")
-          (dolist (row (prom-per-machine-unfired state))
-            (emit "ces_machine_sequence_count"
-                  (append base `(("machine" . ,(nth 1 row))
-                                 ("machine_id" . ,(nth 0 row))))
-                  (nth 2 row)))
+            (emit-help "ces_machine_sequence_count"
+                       "Total sequences declared by this machine." "gauge")
+            (loop for row in unfired-rows for labels in unfired-labels
+                  do (emit "ces_machine_sequence_count" labels (nth 2 row)))
 
-          (emit-help "ces_machine_vector_count"
-                     "Total vectors declared by this machine." "gauge")
-          (dolist (row (prom-per-machine-unfired state))
-            (emit "ces_machine_vector_count"
-                  (append base `(("machine" . ,(nth 1 row))
-                                 ("machine_id" . ,(nth 0 row))))
-                  (nth 3 row)))
+            (emit-help "ces_machine_vector_count"
+                       "Total vectors declared by this machine." "gauge")
+            (loop for row in unfired-rows for labels in unfired-labels
+                  do (emit "ces_machine_vector_count" labels (nth 3 row)))
 
-          ;; Zero-baseline counter series so dashboards plot rate() /
-          ;; by(machine) before any events fire.  Event-keyed series
-          ;; above carry sequence / vector sub-labels (distinct Prom
-          ;; label sets) so they coexist with these baselines;
-          ;; ces_machine_steps_total shares its baseline label shape,
-          ;; so we skip machines already seen in cov-steps.
-          (let ((seen-steps (make-hash-table :test #'equal)))
-            (maphash (lambda (k v)
-                       (declare (ignore v))
-                       (let ((parts (split-coverage-key k)))
-                         (when (= (length parts) 2)
-                           (setf (gethash (nth 0 parts) seen-steps) t))))
-                     (reality-state-cov-steps state))
-            (dolist (row (prom-per-machine-unfired state))
-              (let* ((mid (nth 0 row))
-                     (mname (nth 1 row))
-                     (labels (append base `(("machine" . ,mname)
-                                            ("machine_id" . ,mid)))))
-                (emit "ces_vector_matched_total"   labels 0)
-                (emit "ces_vector_activated_total" labels 0)
-                (emit "ces_sequence_outputs_total" labels 0)
-                (emit "ces_deprecated_fires_total" labels 0)
-                (unless (gethash mid seen-steps)
-                  (emit "ces_machine_steps_total"  labels 0)))))
+            ;; Zero-baseline counter series so dashboards plot rate() /
+            ;; by(machine) before any events fire.  Event-keyed series
+            ;; above carry sequence / vector sub-labels (distinct Prom
+            ;; label sets) so they coexist with these baselines;
+            ;; ces_machine_steps_total shares its baseline label shape,
+            ;; so we skip machines already seen in cov-steps.
+            (let ((seen-steps (make-hash-table :test #'equal)))
+              (maphash (lambda (k v)
+                         (declare (ignore v))
+                         (let ((parts (split-coverage-key k)))
+                           (when (= (length parts) 2)
+                             (setf (gethash (nth 0 parts) seen-steps) t))))
+                       (reality-state-cov-steps state))
+              (loop for row in unfired-rows for labels in unfired-labels
+                    do (emit "ces_vector_matched_total"   labels 0)
+                       (emit "ces_vector_activated_total" labels 0)
+                       (emit "ces_sequence_outputs_total" labels 0)
+                       (emit "ces_deprecated_fires_total" labels 0)
+                       (unless (gethash (nth 0 row) seen-steps)
+                         (emit "ces_machine_steps_total"  labels 0)))))
 
           (let ((uptime-ms (- (now-ms) (reality-state-started-at state))))
             (emit-help "ces_registry_uptime_seconds"
