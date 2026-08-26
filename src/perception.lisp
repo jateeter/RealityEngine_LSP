@@ -97,9 +97,10 @@ than the reporting one this replaces."
 (defun reset-perception-engine (engine)
   "Reset playback state in place, keeping the registered sources.
 
-Resets what a run accumulates — global step, the persistent vector, and every
-source's playback cursor — then *validates* each source's activity, matching
-C++ `PerceptionEngine::reset` and Scala `PerceptionEngine.reset()`.
+Resets what a run accumulates — global step, the persistent vector, and the
+playback cursor of every *test* source — then *validates* each source's
+activity, matching C++ `PerceptionEngine::reset` and Scala
+`PerceptionEngine.reset()`.
 
 Reset does not assign activity (RealityEngine_CI#163 point 3). It used to:
 every test source was forced active and every other kind was left holding
@@ -143,7 +144,23 @@ and the auto interval to 1000ms as a side effect of rebuilding the struct."
     (when sources
       (maphash (lambda (id source)
                  (declare (ignore id))
-                 (setf (source-cursor source) 0)
+                 ;; Rewind the playback cursor of test sources only. C++ and
+                 ;; Scala rewind test cursors and re-seed RandomWalk; this
+                 ;; runtime zeroed `cursor' for every kind, reaching into
+                 ;; sensor and simulated sources that do not have a playback
+                 ;; position (#64). The cursor is read only by the "test"
+                 ;; branch of SAMPLE-SOURCE and advanced only by the "test"
+                 ;; branch of ADVANCE-PERCEPTION-ENGINE, so writing it on the
+                 ;; other kinds was touching a field that is not theirs.
+                 ;;
+                 ;; There is no RandomWalk seed to re-seed here: this
+                 ;; runtime's simulated branch is stateless, deriving its
+                 ;; payload from `dcOffset' rather than from a walk carried
+                 ;; between steps. Nothing is owed on that half of the
+                 ;; parity, and if a stateful pattern generator ever lands it
+                 ;; re-seeds here.
+                 (when (string= (source-kind source) "test")
+                   (setf (source-cursor source) 0))
                  (setf (source-active-p source)
                        (source-validated-active-p source now)))
                sources)))

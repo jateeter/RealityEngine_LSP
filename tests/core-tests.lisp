@@ -1863,7 +1863,7 @@ ever have seen."
                   :inputs (list (list 1.0d0) (list 0.0d0)) :loop-p t))
          (sim (reality-engine-lsp::make-source
                :id "s-sim" :kind "simulated" :name "sim"
-               :active-p nil
+               :active-p nil :cursor 7
                :region (reality-engine-lsp::make-region :offset 2 :length 1)
                :pattern "constant" :dc-offset 0.5d0)))
     (dolist (s (list empty filled sim))
@@ -1876,7 +1876,12 @@ ever have seen."
     (assert-true (reality-engine-lsp::source-active-p sim)
                  "a simulated source validates active; reset does not preserve a pause")
     (assert-equal 0 (reality-engine-lsp::source-cursor filled)
-                  "reset rewinds the test cursor"))
+                  "reset rewinds the test cursor")
+    ;; ...and only the test cursor (#64). `cursor' is read and advanced by the
+    ;; "test" branches alone, so zeroing it on other kinds wrote a field that
+    ;; is not theirs. C++ and Scala rewind test cursors only.
+    (assert-equal 7 (reality-engine-lsp::source-cursor sim)
+                  "reset leaves a simulated source's cursor alone"))
 
   ;; ── Ingress is the only origin of activity for an integration source ───
   ;; An integration (sensor-kind) source that has never received a value must
