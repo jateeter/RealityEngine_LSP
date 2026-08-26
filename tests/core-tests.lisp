@@ -1822,7 +1822,95 @@ ever have seen."
       (assert-equal 0.0d0 (nth 1 vec) "stale sensor contributes zero"))
     (let ((js (reality-engine-lsp::source-json stale)))
       (assert-true (reality-engine-lsp::jbool js "stale" nil) "stale sensor reports stale=true in JSON")
-      (assert-true (> (reality-engine-lsp::jnumber js "ageMs" 0) 0) "stale sensor reports positive ageMs")))
+      (assert-true (> (reality-engine-lsp::jnumber js "ageMs" 0) 0) "stale sensor reports positive ageMs"))
+
+    ;; ── Reset validates activity, it does not assign it (#65) ─────────────
+    ;; RealityEngine_CI#163 point 3. The expired sensor already contributed
+    ;; zeros above; what was wrong was the reported flag, which reset forced
+    ;; back to a value nothing had checked.
+    (assert-true (not (reality-engine-lsp::jbool (reality-engine-lsp::source-json stale) "active" t))
+                 "an expired sensor must not report active, even before the reset")
+    (reality-engine-lsp::reset-perception-engine engine)
+    (assert-true (reality-engine-lsp::source-active-p fresh)
+                 "a sensor holding a value inside its TTL validates active across reset")
+    (assert-true (not (reality-engine-lsp::source-active-p stale))
+                 "a sensor whose TTL expired validates inactive across reset")
+    (assert-true (not (reality-engine-lsp::jbool (reality-engine-lsp::source-json stale) "active" t))
+                 "GET /api/sources reports active=false for the expired sensor")
+
+    ;; A later value must re-earn activity, or the source is stranded
+    ;; contributing zeros while holding a fresh reading.
+    (reality-engine-lsp::record-sensor-value stale (list 0.9d0))
+    (assert-true (reality-engine-lsp::source-active-p stale)
+                 "a value arriving re-activates a sensor reset had validated inactive")
+    (assert-equal 0.9d0 (nth 1 (reality-engine-lsp::assemble-perception-vector engine))
+                  "the re-activated sensor contributes its value again"))
+
+  ;; Reset validates the other kinds too: a test source with an empty
+  ;; sequence supplies nothing, so calling it active would be assignment
+  ;; rather than validation.  Reset does not preserve an explicit pause —
+  ;; an operator-deactivated source is run state, and reset clears run state.
+  (let* ((engine (reality-engine-lsp::make-perception-engine-state 4))
+         (empty (reality-engine-lsp::make-source
+                 :id "t-empty" :kind "test" :name "empty test"
+                 :active-p t :cursor 3
+                 :region (reality-engine-lsp::make-region :offset 0 :length 1)
+                 :inputs nil :loop-p t))
+         (filled (reality-engine-lsp::make-source
+                  :id "t-filled" :kind "test" :name "filled test"
+                  :active-p nil :cursor 2
+                  :region (reality-engine-lsp::make-region :offset 1 :length 1)
+                  :inputs (list (list 1.0d0) (list 0.0d0)) :loop-p t))
+         (sim (reality-engine-lsp::make-source
+               :id "s-sim" :kind "simulated" :name "sim"
+               :active-p nil
+               :region (reality-engine-lsp::make-region :offset 2 :length 1)
+               :pattern "constant" :dc-offset 0.5d0)))
+    (dolist (s (list empty filled sim))
+      (reality-engine-lsp::ensure-source-id engine s))
+    (reality-engine-lsp::reset-perception-engine engine)
+    (assert-true (not (reality-engine-lsp::source-active-p empty))
+                 "a test source with an empty sequence validates inactive")
+    (assert-true (reality-engine-lsp::source-active-p filled)
+                 "a test source with a non-empty sequence validates active")
+    (assert-true (reality-engine-lsp::source-active-p sim)
+                 "a simulated source validates active; reset does not preserve a pause")
+    (assert-equal 0 (reality-engine-lsp::source-cursor filled)
+                  "reset rewinds the test cursor"))
+
+  ;; ── Ingress is the only origin of activity for an integration source ───
+  ;; An integration (sensor-kind) source that has never received a value must
+  ;; report inactive at every observation point, through any sequence of
+  ;; register and reset. Only a value arriving may originate activity, and it
+  ;; expires with that value's TTL.
+  (let* ((engine (reality-engine-lsp::make-perception-engine-state 4))
+         (unfed (reality-engine-lsp::make-source
+                 :id "s-unfed" :kind "sensor" :name "never fed"
+                 ;; even asked for active at registration
+                 :active-p t
+                 :region (reality-engine-lsp::make-region :offset 0 :length 1)
+                 :sensor-id "unfed-sid"
+                 :last-value nil :last-updated 0 :ttl-ms 5000)))
+    (reality-engine-lsp::ensure-source-id engine unfed)
+    (assert-true (not (reality-engine-lsp::jbool
+                       (reality-engine-lsp::source-json unfed) "active" t))
+                 "an unfed sensor reports inactive at registration")
+    (reality-engine-lsp::reset-perception-engine engine)
+    (assert-true (not (reality-engine-lsp::source-active-p unfed))
+                 "reset cannot activate a sensor that was never fed")
+    (assert-true (not (reality-engine-lsp::jbool
+                       (reality-engine-lsp::source-json unfed) "active" t))
+                 "an unfed sensor still reports inactive after reset")
+    (reality-engine-lsp::record-sensor-value unfed (list 0.4d0))
+    (assert-true (reality-engine-lsp::jbool
+                  (reality-engine-lsp::source-json unfed) "active" nil)
+                 "the first value earns activity")
+    ;; ...and it expires with that value's TTL.
+    (setf (reality-engine-lsp::source-last-updated unfed)
+          (- (reality-engine-lsp::now-ms) 60000))
+    (assert-true (not (reality-engine-lsp::jbool
+                       (reality-engine-lsp::source-json unfed) "active" t))
+                 "ingress-earned activity expires with the value's TTL"))
 
   ;; ── Assembled vector: a source owns its region (#53) ──────────────────
   ;; Zero-valued cells used to be skipped, so a cell a source drove low kept

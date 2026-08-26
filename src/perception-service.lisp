@@ -252,10 +252,15 @@ the whole set sorted by key, per the contract."
             (push sensor-id skipped)
             (let ((source (ensure-source-id
                            engine
+                           ;; Declared complete and INACTIVE (contract 2a).
+                           ;; Activity is earned by the first value: a localai
+                           ;; sensor that has never been fed must report
+                           ;; inactive at every observation point, and only
+                           ;; RECORD-SENSOR-VALUE may originate it.
                            (make-source :id sensor-id
                                         :kind "sensor"
                                         :name name
-                                        :active-p t
+                                        :active-p nil
                                         :region (make-region :offset offset :length length)
                                         :sensor-id sensor-id
                                         :last-value nil
@@ -590,10 +595,13 @@ Per-sequence boundaries live in metadata.segments for UI display."
     (unless source
       (setf source (ensure-source-id
                     engine
+                    ;; Declared inactive; the RECORD-SENSOR-VALUE below is
+                    ;; what earns activity, so an empty signal body cannot
+                    ;; provision a live-looking source (contract 2a/2b).
                     (make-source :id sensor-id
                                  :kind "sensor"
                                  :name name
-                                 :active-p t
+                                 :active-p nil
                                  :region region
                                  :sensor-id sensor-id
                                  :last-value nil
@@ -603,9 +611,8 @@ Per-sequence boundaries live in metadata.segments for UI display."
     (when origin (setf (source-origin source) origin))
     (setf (source-name source) name
           (source-region source) region
-          (source-ttl-ms source) ttl-ms
-          (source-last-value source) values
-          (source-last-updated source) (now-ms))
+          (source-ttl-ms source) ttl-ms)
+    (record-sensor-value source values)
     source))
 
 (defun signal-body-region (body values)
@@ -2125,8 +2132,7 @@ it is accepted as an alternative to the body bridgeToken/token fields."
                                                                            (let ((source (sensor-exists-p (perception-state-engine state)
                                                                                                           (gethash "sensorId" params))))
                                                                              (when source
-                                                                               (setf (source-last-value source) (numbers-from-json (jget body "values"))
-                                                                                     (source-last-updated source) (now-ms))
+                                                                               (record-sensor-value source (numbers-from-json (jget body "values")))
                                                                                (obj "success" t
                                                                                     "sensorId" (gethash "sensorId" params)
                                                                                     "timestamp" (now-ms))))))))
@@ -2242,20 +2248,25 @@ feed_mqtt_signal (CPP)."
          (existing (sensor-exists-p engine sensor-id)))
     (cond
       (existing
-       (setf (source-last-value existing) values
-             (source-last-updated existing) (now-ms)))
+       (record-sensor-value existing values))
       (t
-       (ensure-source-id engine
-                         (make-source :id sensor-id
-                                      :kind "sensor"
-                                      :name (format nil "mqtt:~a" topic)
-                                      :active-p t
-                                      :region (make-region :offset offset :length length)
-                                      :sensor-id sensor-id
-                                      :last-value values
-                                      :last-updated (now-ms)
-                                      :ttl-ms (if (> ttl-ms 0) ttl-ms 30000)
-                                      :origin "mqtt"))))
+       ;; Auto-provision declares the source inactive and lets the value that
+       ;; triggered the provisioning earn its activity, exactly as it would on
+       ;; any later ingest.  Hardcoding active-p t here made the MQTT path the
+       ;; one place where registration originated activity.
+       (record-sensor-value
+        (ensure-source-id engine
+                          (make-source :id sensor-id
+                                       :kind "sensor"
+                                       :name (format nil "mqtt:~a" topic)
+                                       :active-p nil
+                                       :region (make-region :offset offset :length length)
+                                       :sensor-id sensor-id
+                                       :last-value nil
+                                       :last-updated 0
+                                       :ttl-ms (if (> ttl-ms 0) ttl-ms 30000)
+                                       :origin "mqtt"))
+        values)))
     (broadcast (obj "type" "mqtt-ingest"
                     "payload" (obj "sensorId" sensor-id
                                    "offset" offset

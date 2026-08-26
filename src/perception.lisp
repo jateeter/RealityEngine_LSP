@@ -35,12 +35,87 @@ per source, each element written by walking the list from the head."
                           :persistent-vector (make-perceptual-buffer dimension)
                           :global-step 0))
 
+(defun sensor-stale-p (source &optional (now (now-ms)))
+  "Return true when a sensor source's last-updated timestamp is older than
+its TTL window.  Aligns LSP staleness semantics with the C++ runtime — a
+stale sensor sources contributes zeros to assembled perception vectors so
+machines downstream don't keep reading a value that was supposed to expire."
+  (let ((kind (source-kind source))
+        (last-updated (or (source-last-updated source) 0))
+        (ttl (or (source-ttl-ms source) 0)))
+    (and (string= kind "sensor")
+         (> last-updated 0)
+         (> ttl 0)
+         (> (- now last-updated) ttl))))
+
+(defun source-validated-active-p (source &optional (now (now-ms)))
+  "Recompute whether SOURCE can currently supply a value.
+
+Activity is *validated*, never assigned (RealityEngine_CI#163 point 3): the
+answer is derived from the source's own state under the rules below and never
+read back from its previously stored flag, so the same source in the same
+condition validates identically on every runtime.
+
+  sensor     — holds a value inside its TTL window.  Reuses SENSOR-STALE-P,
+               the predicate the assembly path already applies to zero a
+               stale sensor's contribution, so the reported flag and the
+               actual contribution can no longer disagree.
+  test       — its interned sequence is non-empty.  A test source with no
+               inputs supplies nothing, so calling it active would be an
+               assignment rather than a validation.
+  simulated  — generates from the global step, so it always has a value.
+
+NOW is a parameter so a caller validating many sources reads the clock once:
+two identically configured sensors must not validate differently because the
+loop crossed a millisecond boundary."
+  (let ((kind (source-kind source)))
+    (cond
+      ((string= kind "sensor")
+       (and (source-last-value source)
+            (not (sensor-stale-p source now))
+            t))
+      ((string= kind "test")
+       (and (source-inputs source) t))
+      (t t))))
+
+(defun record-sensor-value (source values &optional (now (now-ms)))
+  "Store a sensor reading and let the value earn activity.
+
+Every sensor ingress path funnels through here.  Before, a value arriving set
+lastValue and lastUpdated but never touched the active flag, which was safe
+only because nothing ever cleared it — sensors became active at registration
+and stayed that way.  Now that reset validates activity, an expired sensor is
+correctly deactivated, and without this a later reading would leave it
+inactive forever: SAMPLE-SOURCE gates on the flag, so the source would
+contribute zeros while holding a fresh value.  That would be a worse defect
+than the reporting one this replaces."
+  (setf (source-last-value source) values
+        (source-last-updated source) now)
+  (setf (source-active-p source) (source-validated-active-p source now))
+  source)
+
 (defun reset-perception-engine (engine)
   "Reset playback state in place, keeping the registered sources.
 
 Resets what a run accumulates — global step, the persistent vector, and every
-source's playback cursor — and re-arms test sources, matching C++
-`PerceptionEngine::reset` and Scala `PerceptionEngine.reset()`.
+source's playback cursor — then *validates* each source's activity, matching
+C++ `PerceptionEngine::reset` and Scala `PerceptionEngine.reset()`.
+
+Reset does not assign activity (RealityEngine_CI#163 point 3). It used to:
+every test source was forced active and every other kind was left holding
+whatever flag it happened to carry, so a sensor whose TTL had expired before
+the reset was still advertised `active: true` afterwards by `/api/sources` and
+`/api/state` — a source contributing nothing, reported as live, on a
+byte-compared payload. Now the flag is recomputed from each source's own state
+by SOURCE-VALIDATED-ACTIVE-P once the run state above has been cleared.
+
+The prior flag is deliberately not carried forward. An operator-deactivated
+source is run state, not configuration, so a source paused before the reset is
+re-activated by it if it validates active. The clock is read once for the whole
+pass so two identically configured sensors cannot disagree.
+
+Membership is untouched either way: reset never creates a source and never
+removes one (contract point 4).
 
 Sources deliberately survive. Replacing the engine struct wholesale (the
 previous behaviour) discarded them, so `POST /api/reset` silently emptied the
@@ -63,13 +138,14 @@ and the auto interval to 1000ms as a side effect of rebuilding the struct."
   (setf (perception-engine-last-push engine) nil)
   (let ((pv (perception-engine-persistent-vector engine)))
     (when pv (fill pv 0.0d0)))
-  (let ((sources (perception-engine-sources engine)))
+  (let ((sources (perception-engine-sources engine))
+        (now (now-ms)))
     (when sources
       (maphash (lambda (id source)
                  (declare (ignore id))
                  (setf (source-cursor source) 0)
-                 (when (string= (source-kind source) "test")
-                   (setf (source-active-p source) t)))
+                 (setf (source-active-p source)
+                       (source-validated-active-p source now)))
                sources)))
   engine)
 
@@ -97,27 +173,26 @@ and its machine never receives input."
               current required-end context)))
   (perception-engine-dimension engine))
 
-(defun sensor-stale-p (source &optional (now (now-ms)))
-  "Return true when a sensor source's last-updated timestamp is older than
-its TTL window.  Aligns LSP staleness semantics with the C++ runtime — a
-stale sensor sources contributes zeros to assembled perception vectors so
-machines downstream don't keep reading a value that was supposed to expire."
-  (let ((kind (source-kind source))
-        (last-updated (or (source-last-updated source) 0))
-        (ttl (or (source-ttl-ms source) 0)))
-    (and (string= kind "sensor")
-         (> last-updated 0)
-         (> ttl 0)
-         (> (- now last-updated) ttl))))
-
 (defun source-json (source)
   (let* ((now (now-ms))
+         ;; `active' is what this source will actually contribute on the next
+         ;; assembly, not the raw stored flag.  The flag alone went stale
+         ;; between resets: nothing runs when a sensor's TTL lapses, so an
+         ;; expired sensor kept advertising `active: true` on /api/sources and
+         ;; /api/state while SAMPLE-SOURCE was already zeroing it.  This
+         ;; runtime computed the staleness for serialization (`stale', below)
+         ;; and then declined to use it for the one field that should reflect
+         ;; it.  Both halves matter: the stored flag still gates, so a source
+         ;; an operator paused via PATCH /api/sources/:id or a finished
+         ;; non-looping test source still reports inactive.
+         (active (and (source-active-p source)
+                      (source-validated-active-p source now)))
          ;; `kind' was a duplicate of `type' unique to this runtime; the
          ;; canonical source shape is the C++ one (RealityEngine_CI#91).
          (out (obj "id" (source-id source)
                    "type" (source-kind source)
                    "name" (source-name source)
-                   "active" (json-bool (source-active-p source))
+                   "active" (json-bool active)
                    "region" (region-json (source-region source)))))
     (cond
       ((string= (source-kind source) "test")
