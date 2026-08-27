@@ -1772,6 +1772,63 @@ ever have seen."
       (assert-equal 1
                     (length (reality-engine-lsp::perception-state-dispatch-ledger state))
                     "dispatch ledger should retain PE-owned record")))
+  ;; ── Cold catalog vs no dispatch binding (#63) ─────────────────────────
+  ;; Both used to leave record-dispatch-envelope as a bare NIL and land on the
+  ;; droppedNoDispatch counter, so a PE that lost the startup race with its RE
+  ;; reported a minute of transient infrastructure failure as deliberate
+  ;; no-binding decisions.
+  (let ((state (reality-engine-lsp::make-perception-state-from-config
+                :dimension 16
+                :reality-url "http://localhost:3299"
+                :localai-url "http://localhost:8000"
+                :localai-machine-dir "../localAIStack/data/machines"))
+        (operation (reality-engine-lsp::obj
+                    "machineId" "machine-cold"
+                    "sequenceIds" (reality-engine-lsp::vectorize (list "seq-cold"))
+                    "values" (reality-engine-lsp::vectorize (list 1))
+                    "governance" (reality-engine-lsp::obj "ownerTeam" "t"
+                                                          "ragStatusCode" "RED"
+                                                          "processStatus" "error"))))
+    (assert-true (reality-engine-lsp::machine-catalog-cold-p state)
+                 "a freshly constructed catalog is cold")
+    (multiple-value-bind (record reason)
+        (reality-engine-lsp::record-dispatch-envelope state operation)
+      (assert-true (not record) "a cold catalog cannot resolve a dispatch")
+      (assert-equal :catalog-cold reason
+                    "a drop against a cold catalog reports :catalog-cold"))
+
+    ;; A successful refresh warms the catalog even when the RE holds no
+    ;; machines — "loaded and empty" is not "never loaded".
+    (bt:with-lock-held ((reality-engine-lsp::perception-state-machine-catalog-lock state))
+      (setf (reality-engine-lsp::perception-state-machine-catalog-refreshed-at state)
+            (reality-engine-lsp::now-ms)))
+    (assert-true (not (reality-engine-lsp::machine-catalog-cold-p state))
+                 "a catalog that loaded zero machines is warm, not cold")
+    (multiple-value-bind (record reason)
+        (reality-engine-lsp::record-dispatch-envelope state operation)
+      (assert-true (not record) "an absent machine still drops")
+      (assert-equal :no-dispatch reason
+                    "a drop against a warm catalog reports :no-dispatch"))
+
+    ;; A machine present but declaring no agent/trigger is a genuine
+    ;; no-binding decision, not a cold-catalog drop.
+    (bt:with-lock-held ((reality-engine-lsp::perception-state-machine-catalog-lock state))
+      (setf (gethash "machine-cold"
+                     (reality-engine-lsp::perception-state-machine-catalog state))
+            (reality-engine-lsp::obj "id" "machine-cold"
+                                     "metadata" (reality-engine-lsp::obj))))
+    (multiple-value-bind (record reason)
+        (reality-engine-lsp::record-dispatch-envelope state operation)
+      (assert-true (not record) "a machine with no binding drops")
+      (assert-equal :no-dispatch reason
+                    "no agent/trigger is a no-binding drop, not a cold one"))
+
+    (let ((status (reality-engine-lsp::triggers-status-json state)))
+      (assert-equal 0 (reality-engine-lsp::jnumber status "droppedCatalogCold" nil)
+                    "triggers status exposes the cold-drop counter")
+      (assert-true (not (reality-engine-lsp::jbool status "machineCatalogCold" t))
+                   "triggers status reports the warm catalog as not cold")))
+
   (let* ((state (make-test-state 8))
          (text (reality-engine-lsp::prometheus-text-of state "lsp")))
     (assert-true (search "runtime=\"lsp\"" text)
