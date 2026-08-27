@@ -99,11 +99,15 @@ domain subdirectories load by filename (corpus filenames are unique)."
             flat))))
 
 (defun ensure-space-length (state length)
-  (when (> length (length (reality-state-perceptual-space state)))
-    (setf (reality-state-perceptual-space state)
-          (append (reality-state-perceptual-space state)
-                  (make-list (- length (length (reality-state-perceptual-space state)))
-                             :initial-element 0.0d0))))
+  "Grow the perceptual space so [0, LENGTH) is addressable.
+
+Regression guard for #24: a machine whose perceptualMapping runs past the
+configured dimension must still receive input.  The growth path is
+GROW-PERCEPTUAL-SPACE (doubling, amortised O(1)) rather than the old
+append + make-list, which allocated a fresh full-length list and measured it
+with two more O(n) LENGTH calls."
+  (setf (reality-state-perceptual-space state)
+        (grow-perceptual-space (reality-state-perceptual-space state) length))
   (when (> length (reality-state-dimension state))
     (setf (reality-state-dimension state) length)))
 
@@ -169,7 +173,7 @@ domain subdirectories load by filename (corpus filenames are unique)."
            :dimension dimension
            :machines (make-hash-table :test #'equal)
            :machine-dir machine-dir
-           :perceptual-space (make-list dimension :initial-element 0.0d0)
+           :perceptual-space (make-perceptual-space dimension)
            :history nil
            :engine-history nil
            :isre-history nil
@@ -225,12 +229,14 @@ domain subdirectories load by filename (corpus filenames are unique)."
 ;; Dense vector -> sparse trajectory entry. A cell absent from `nonZero` is
 ;; zero; `length` keeps the dense width so the reconstruction is exact.
 (defun sparse-trajectory (step-number dense)
+  ;; MAP NIL rather than DOLIST: DENSE is the perceptual space, now a vector.
   (let ((cells nil)
         (index 0))
-    (dolist (value dense)
-      (unless (zerop value)
-        (push (obj "index" index "value" value) cells))
-      (incf index))
+    (map nil (lambda (value)
+               (unless (zerop value)
+                 (push (obj "index" index "value" value) cells))
+               (incf index))
+         dense)
     (obj "stepNumber" step-number
          "length" (length dense)
          "nonZero" (vectorize (nreverse cells)))))
@@ -299,7 +305,7 @@ domain subdirectories load by filename (corpus filenames are unique)."
                (reset-sequence sequence)))
            (reality-state-machines state))
   (setf (reality-state-perceptual-space state)
-        (make-list (reality-state-dimension state) :initial-element 0.0d0)
+        (make-perceptual-space (reality-state-dimension state))
         (reality-state-history state) nil
         (reality-state-engine-history state) nil
         (reality-state-isre-history state) nil
@@ -619,62 +625,63 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                                count))))
                    (reality-state-cov-deprecated state))
 
-          (emit-help "ces_unfired_sequences"
-                     "Number of sequences in this machine that have never emitted output." "gauge")
-          (dolist (row (prom-per-machine-unfired state))
-            (emit "ces_unfired_sequences"
-                  (append base `(("machine" . ,(nth 1 row))
-                                 ("machine_id" . ,(nth 0 row))))
-                  (nth 4 row)))
+          ;; One corpus walk per scrape.  The five families below each select a
+          ;; different column out of the *same* rows, so this used to call
+          ;; prom-per-machine-unfired five times — five maphashes over every
+          ;; machine, sequence and vector, and ~3,500 freshly consed
+          ;; coverage-key strings per walk.  Bind it once and reuse.
+          ;;
+          ;; The per-machine label set is identical across all five families
+          ;; too, so it is built once here rather than re-appended per family.
+          ;; Emission order and label order are unchanged, which matters: this
+          ;; payload is byte-compared against the C++ and Scala runtimes
+          ;; (RealityEngine_Machines/docs/PE_METRICS_CONTRACT.md), so only the
+          ;; traversal count may change, never the text.
+          (let* ((unfired-rows (prom-per-machine-unfired state))
+                 (unfired-labels (mapcar (lambda (row)
+                                           (append base `(("machine" . ,(nth 1 row))
+                                                          ("machine_id" . ,(nth 0 row)))))
+                                         unfired-rows)))
+            (emit-help "ces_unfired_sequences"
+                       "Number of sequences in this machine that have never emitted output." "gauge")
+            (loop for row in unfired-rows for labels in unfired-labels
+                  do (emit "ces_unfired_sequences" labels (nth 4 row)))
 
-          (emit-help "ces_unfired_vectors"
-                     "Number of vectors in this machine that have never matched or activated." "gauge")
-          (dolist (row (prom-per-machine-unfired state))
-            (emit "ces_unfired_vectors"
-                  (append base `(("machine" . ,(nth 1 row))
-                                 ("machine_id" . ,(nth 0 row))))
-                  (nth 5 row)))
+            (emit-help "ces_unfired_vectors"
+                       "Number of vectors in this machine that have never matched or activated." "gauge")
+            (loop for row in unfired-rows for labels in unfired-labels
+                  do (emit "ces_unfired_vectors" labels (nth 5 row)))
 
-          (emit-help "ces_machine_sequence_count"
-                     "Total sequences declared by this machine." "gauge")
-          (dolist (row (prom-per-machine-unfired state))
-            (emit "ces_machine_sequence_count"
-                  (append base `(("machine" . ,(nth 1 row))
-                                 ("machine_id" . ,(nth 0 row))))
-                  (nth 2 row)))
+            (emit-help "ces_machine_sequence_count"
+                       "Total sequences declared by this machine." "gauge")
+            (loop for row in unfired-rows for labels in unfired-labels
+                  do (emit "ces_machine_sequence_count" labels (nth 2 row)))
 
-          (emit-help "ces_machine_vector_count"
-                     "Total vectors declared by this machine." "gauge")
-          (dolist (row (prom-per-machine-unfired state))
-            (emit "ces_machine_vector_count"
-                  (append base `(("machine" . ,(nth 1 row))
-                                 ("machine_id" . ,(nth 0 row))))
-                  (nth 3 row)))
+            (emit-help "ces_machine_vector_count"
+                       "Total vectors declared by this machine." "gauge")
+            (loop for row in unfired-rows for labels in unfired-labels
+                  do (emit "ces_machine_vector_count" labels (nth 3 row)))
 
-          ;; Zero-baseline counter series so dashboards plot rate() /
-          ;; by(machine) before any events fire.  Event-keyed series
-          ;; above carry sequence / vector sub-labels (distinct Prom
-          ;; label sets) so they coexist with these baselines;
-          ;; ces_machine_steps_total shares its baseline label shape,
-          ;; so we skip machines already seen in cov-steps.
-          (let ((seen-steps (make-hash-table :test #'equal)))
-            (maphash (lambda (k v)
-                       (declare (ignore v))
-                       (let ((parts (split-coverage-key k)))
-                         (when (= (length parts) 2)
-                           (setf (gethash (nth 0 parts) seen-steps) t))))
-                     (reality-state-cov-steps state))
-            (dolist (row (prom-per-machine-unfired state))
-              (let* ((mid (nth 0 row))
-                     (mname (nth 1 row))
-                     (labels (append base `(("machine" . ,mname)
-                                            ("machine_id" . ,mid)))))
-                (emit "ces_vector_matched_total"   labels 0)
-                (emit "ces_vector_activated_total" labels 0)
-                (emit "ces_sequence_outputs_total" labels 0)
-                (emit "ces_deprecated_fires_total" labels 0)
-                (unless (gethash mid seen-steps)
-                  (emit "ces_machine_steps_total"  labels 0)))))
+            ;; Zero-baseline counter series so dashboards plot rate() /
+            ;; by(machine) before any events fire.  Event-keyed series
+            ;; above carry sequence / vector sub-labels (distinct Prom
+            ;; label sets) so they coexist with these baselines;
+            ;; ces_machine_steps_total shares its baseline label shape,
+            ;; so we skip machines already seen in cov-steps.
+            (let ((seen-steps (make-hash-table :test #'equal)))
+              (maphash (lambda (k v)
+                         (declare (ignore v))
+                         (let ((parts (split-coverage-key k)))
+                           (when (= (length parts) 2)
+                             (setf (gethash (nth 0 parts) seen-steps) t))))
+                       (reality-state-cov-steps state))
+              (loop for row in unfired-rows for labels in unfired-labels
+                    do (emit "ces_vector_matched_total"   labels 0)
+                       (emit "ces_vector_activated_total" labels 0)
+                       (emit "ces_sequence_outputs_total" labels 0)
+                       (emit "ces_deprecated_fires_total" labels 0)
+                       (unless (gethash (nth 0 row) seen-steps)
+                         (emit "ces_machine_steps_total"  labels 0)))))
 
           (let ((uptime-ms (- (now-ms) (reality-state-started-at state))))
             (emit-help "ces_registry_uptime_seconds"
@@ -1128,14 +1135,15 @@ they still do."
       (dolist (write sorted)
         (let ((bit (truncate (or (jnumber write "bitOffset" 0) 0))))
           (ensure-space-length state (1+ bit))
-          (setf (nth bit (reality-state-perceptual-space state)) (or (jnumber write "value" 1.0d0) 1.0d0))))
+          (setf (aref (reality-state-perceptual-space state) bit)
+                (coerce (or (jnumber write "value" 1.0d0) 1.0d0) 'double-float))))
       sorted)))
 
 (defun apply-latched-event-bits (state)
   (maphash (lambda (bit _)
              (declare (ignore _))
              (ensure-space-length state (1+ bit))
-             (setf (nth bit (reality-state-perceptual-space state)) 1.0d0))
+             (setf (aref (reality-state-perceptual-space state) bit) 1.0d0))
            (reality-state-latched-event-bits state)))
 
 (defun process-perceptual-input (state input &key override include-machine-results include-perceptual-space compact)
@@ -1144,9 +1152,25 @@ they still do."
   ;; so existing callers (and RE_INCLUDE_PERCEPTUAL_SPACE) do not become errors.
   (declare (ignore include-perceptual-space))
   (ensure-space-length state (max (reality-state-dimension state) (length input)))
-  (setf (reality-state-perceptual-space state)
-        (append input (make-list (max 0 (- (reality-state-dimension state) (length input)))
-                                 :initial-element 0.0d0)))
+  ;; Seed the space from INPUT in place and zero the tail, rather than
+  ;; rebuilding it with append + make-list, which allocated a fresh
+  ;; ~17k-cons structure (~271 KB) before any machine ran (#60).
+  ;;
+  ;; INPUT is sometimes the space itself — /api/simulation/step and the MCP
+  ;; step tool feed the current space straight back in. Copying then would be
+  ;; a self-overwrite; there is also nothing to copy, since it is already the
+  ;; state being seeded.
+  (let ((space (reality-state-perceptual-space state)))
+    (unless (eq input space)
+      (let ((i 0)
+            (limit (length space)))
+        (map nil (lambda (value)
+                   (when (< i limit)
+                     (setf (aref space i) (coerce (or value 0) 'double-float))
+                     (incf i)))
+             input)
+        (when (< i limit)
+          (fill space 0.0d0 :start i)))))
   (apply-latched-event-bits state)
   ;; ISRE(n) observation point. This is the input space reality event the corpus
   ;; is about to be presented with: every extract-region below reads exactly this
@@ -1373,7 +1397,7 @@ they still do."
       ;; at all — the engine computed the right answer and did not report it,
       ;; which is what the cross-runtime parity stage read as divergence
       ;; (RealityEngine_Scala#43).
-      (setf (jget step "perceptualSpace") (vectorize (reality-state-perceptual-space state))
+      (setf (jget step "perceptualSpace") (perceptual-space-snapshot (reality-state-perceptual-space state))
             (jget step "perceptualSpaceIsDebugProjection") t)
       (record-trajectory state isre orev)
       (record-history state step)
@@ -1971,7 +1995,7 @@ on this surface."
                                                          (declare (ignore _ body query))
                                                          (json-response (actor-ask actor (lambda (state) (obj "running" +json-false+
                                                                                                              "dimension" (reality-state-dimension state)
-                                                                                                             "perceptualSpace" (vectorize (reality-state-perceptual-space state))))))))
+                                                                                                             "perceptualSpace" (perceptual-space-snapshot (reality-state-perceptual-space state))))))))
    (make-route "GET" "/api/perceptual-simulation/history" (lambda (_ body query)
                                                            (declare (ignore _ body query))
                                                            (json-response (actor-ask actor (lambda (state) (obj "history" (vectorize (reality-state-history state))))))))
@@ -2672,7 +2696,7 @@ on this surface."
                                                             (state-json (lambda (state)
                                                                           (obj "running" +json-false+
                                                                                "dimension" (reality-state-dimension state)
-                                                                               "perceptualSpace" (vectorize (reality-state-perceptual-space state)))))))
+                                                                               "perceptualSpace" (perceptual-space-snapshot (reality-state-perceptual-space state)))))))
      (make-route "GET" "/api/perceptual-simulation/history" (lambda (_ body query)
                                                               (declare (ignore _ body query))
                                                               (state-json (lambda (state)

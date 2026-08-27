@@ -67,19 +67,67 @@ if [ -f "$_SIDX" ] && [ ! -s "$_SIDX" ]; then
   rm -f "$_SIDX"
 fi
 
-if ! command -v sbcl >/dev/null 2>&1; then
-  echo "Missing SBCL. Install SBCL and Quicklisp before starting RealityEngine_LSP." >&2
-  exit 1
-fi
+# Launch path selection.  LSP_LAUNCH_MODE=binary|source|auto (default auto):
+#
+#   binary  — require bin/reality-engine-lsp (built by `make build`).  Its
+#             `main` already dispatches the "reality" and "perception" modes
+#             and supplies the idle loop, so no --eval shims are needed.
+#   source  — load the system through Quicklisp at launch, as this script used
+#             to do unconditionally.
+#   auto    — use the binary when it is present, executable and no older than
+#             any tracked source file; otherwise fall back to source.
+#
+# The launch path never passes :force t.  Forcing a recompile is a *build*
+# intent (`make build`, `make test`) — on the service path it is a latent
+# full-system rebuild, three times over, the first time a runner comes up with
+# a cold ~/.cache/common-lisp.
+LSP_LAUNCH_MODE="${LSP_LAUNCH_MODE:-auto}"
+ENGINE_BIN="${ENGINE_BIN:-${ROOT_DIR}/bin/reality-engine-lsp}"
 
-QUICKLISP_SETUP="${QUICKLISP_SETUP:-${ROOT_DIR}/quicklisp/setup.lisp}"
-if [ ! -f "$QUICKLISP_SETUP" ]; then
-  QUICKLISP_SETUP="${HOME}/quicklisp/setup.lisp"
-fi
+engine_binary_is_current() {
+  [ -x "$ENGINE_BIN" ] || return 1
+  # Any source newer than the image means the image is stale.
+  local newer
+  newer="$(find "${ROOT_DIR}/src" "${ROOT_DIR}/reality-engine-lsp.asd" \
+             -newer "$ENGINE_BIN" -print -quit 2>/dev/null || true)"
+  [ -z "$newer" ]
+}
 
-if [ ! -f "$QUICKLISP_SETUP" ]; then
-  echo "Missing Quicklisp. Expected ${ROOT_DIR}/quicklisp/setup.lisp or ${HOME}/quicklisp/setup.lisp." >&2
-  exit 1
+case "$LSP_LAUNCH_MODE" in
+  binary)
+    if [ ! -x "$ENGINE_BIN" ]; then
+      echo "LSP_LAUNCH_MODE=binary but $ENGINE_BIN is missing. Run 'make build' first." >&2
+      exit 1
+    fi
+    USE_BINARY=1
+    ;;
+  source)
+    USE_BINARY=0
+    ;;
+  auto)
+    if engine_binary_is_current; then USE_BINARY=1; else USE_BINARY=0; fi
+    ;;
+  *)
+    echo "Unknown LSP_LAUNCH_MODE '${LSP_LAUNCH_MODE}' (expected binary|source|auto)." >&2
+    exit 1
+    ;;
+esac
+
+if [ "$USE_BINARY" = "0" ]; then
+  if ! command -v sbcl >/dev/null 2>&1; then
+    echo "Missing SBCL. Install SBCL and Quicklisp before starting RealityEngine_LSP." >&2
+    exit 1
+  fi
+
+  QUICKLISP_SETUP="${QUICKLISP_SETUP:-${ROOT_DIR}/quicklisp/setup.lisp}"
+  if [ ! -f "$QUICKLISP_SETUP" ]; then
+    QUICKLISP_SETUP="${HOME}/quicklisp/setup.lisp"
+  fi
+
+  if [ ! -f "$QUICKLISP_SETUP" ]; then
+    echo "Missing Quicklisp. Expected ${ROOT_DIR}/quicklisp/setup.lisp or ${HOME}/quicklisp/setup.lisp." >&2
+    exit 1
+  fi
 fi
 
 # When RE_LOAD_MACHINES=0 the RE starts with no corpus (CI will seed separately).
@@ -97,28 +145,49 @@ export INTEGRATIONS_CONFIG
 export ACP_ENABLED ACP_PLATFORM ACP_SURFACE ACP_GATEWAY_URL OPENCLAW_GATEWAY_URL
 export ACP_SESSION_KEY OPENCLAW_ACP_SESSION ACP_TARGET_AGENT ACP_COMPLETION_SOURCE_MAPPING_ID
 
-sbcl --dynamic-space-size "$SBCL_DYNAMIC_SPACE_SIZE" --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
-  --eval "(pushnew (truename \".\") ql:*local-project-directories*)" \
-  --eval "(handler-case (ql:register-local-projects) (error (c) (format t \"~&Warning: register-local-projects: ~a~%\" c)))" \
-  --eval "(ql:quickload :reality-engine-lsp :force t)" \
-  --quit > "logs/quicklisp-bootstrap${_INST}.log" 2>&1
+if [ "$USE_BINARY" = "1" ]; then
+  # The saved image parses SBCL runtime options (--dynamic-space-size) itself
+  # and strips them from *posix-argv*, so `main` still sees just the mode.
+  "$ENGINE_BIN" --dynamic-space-size "$SBCL_DYNAMIC_SPACE_SIZE" reality \
+    > "logs/reality-engine${_INST}.log" 2>&1 &
+  echo "$!" > "run/reality-engine${_INST}.pid"
 
-sbcl --dynamic-space-size "$SBCL_DYNAMIC_SPACE_SIZE" --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
-  --eval "(pushnew (truename \".\") ql:*local-project-directories*)" \
-  --eval "(ql:quickload :reality-engine-lsp :force t)" \
-  --eval "(reality-engine-lsp:start-reality-from-environment)" \
-  --eval "(loop (sleep 3600))" > "logs/reality-engine${_INST}.log" 2>&1 &
-echo "$!" > "run/reality-engine${_INST}.pid"
+  "$ENGINE_BIN" --dynamic-space-size "$SBCL_DYNAMIC_SPACE_SIZE" perception \
+    > "logs/perception-engine${_INST}.log" 2>&1 &
+  echo "$!" > "run/perception-engine${_INST}.pid"
+else
+  # Bootstrap pass: register the local project and load the system once, to a
+  # throwaway process, so the two service processes below start against a warm
+  # fasl cache instead of racing each other to compile the same files into it.
+  # Only the source path needs this; the binary path has no compile step.
+  sbcl --dynamic-space-size "$SBCL_DYNAMIC_SPACE_SIZE" --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
+    --eval "(pushnew (truename \".\") ql:*local-project-directories*)" \
+    --eval "(handler-case (ql:register-local-projects) (error (c) (format t \"~&Warning: register-local-projects: ~a~%\" c)))" \
+    --eval "(ql:quickload :reality-engine-lsp)" \
+    --quit > "logs/quicklisp-bootstrap${_INST}.log" 2>&1
 
-sbcl --dynamic-space-size "$SBCL_DYNAMIC_SPACE_SIZE" --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
-  --eval "(pushnew (truename \".\") ql:*local-project-directories*)" \
-  --eval "(ql:quickload :reality-engine-lsp :force t)" \
-  --eval "(reality-engine-lsp:start-perception-from-environment)" \
-  --eval "(loop (sleep 3600))" > "logs/perception-engine${_INST}.log" 2>&1 &
-echo "$!" > "run/perception-engine${_INST}.pid"
+  sbcl --dynamic-space-size "$SBCL_DYNAMIC_SPACE_SIZE" --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
+    --eval "(pushnew (truename \".\") ql:*local-project-directories*)" \
+    --eval "(ql:quickload :reality-engine-lsp)" \
+    --eval "(reality-engine-lsp:start-reality-from-environment)" \
+    --eval "(loop (sleep 3600))" > "logs/reality-engine${_INST}.log" 2>&1 &
+  echo "$!" > "run/reality-engine${_INST}.pid"
+
+  sbcl --dynamic-space-size "$SBCL_DYNAMIC_SPACE_SIZE" --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
+    --eval "(pushnew (truename \".\") ql:*local-project-directories*)" \
+    --eval "(ql:quickload :reality-engine-lsp)" \
+    --eval "(reality-engine-lsp:start-perception-from-environment)" \
+    --eval "(loop (sleep 3600))" > "logs/perception-engine${_INST}.log" 2>&1 &
+  echo "$!" > "run/perception-engine${_INST}.pid"
+fi
 
 echo "Reality Engine LSP     : http://localhost:${REALITY_ENGINE_PORT}${INSTANCE_ID:+ [instance: $INSTANCE_ID]}"
 echo "Perception Engine LSP  : http://localhost:${PERCEPTION_ENGINE_PORT}${INSTANCE_ID:+ [instance: $INSTANCE_ID]}"
+if [ "$USE_BINARY" = "1" ]; then
+  echo "Launch path            : binary (${ENGINE_BIN})"
+else
+  echo "Launch path            : source (Quicklisp load; run 'make build' for the binary path)"
+fi
 echo "Machines               : ${MACHINES_DIR}"
 echo "Vector dimension       : ${VECTOR_DIMENSION}"
 echo "SBCL dynamic space     : ${SBCL_DYNAMIC_SPACE_SIZE} MB"

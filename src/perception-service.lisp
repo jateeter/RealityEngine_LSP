@@ -118,8 +118,9 @@ the whole set sorted by key, per the contract."
   engine reality-url localai-url localai-machine-dir push-records started-at
   integrations-config-path integrations-loaded-p integrations-load-error integrations source-mappings
   triggers-enabled-p trigger-dispatch-mode trigger-graphql-url envelopes-created dispatch-errors
-  dropped-no-governance dropped-no-dispatch
+  dropped-no-governance dropped-no-dispatch dropped-catalog-cold
   machine-catalog machine-catalog-lock machine-catalog-refreshed-at
+  catalog-cold-warned-p
   dispatch-ledger dispatch-ledger-limit
   ollama-base-url ollama-model ollama-completion-source-mapping-id
   openai-base-url openai-model openai-completion-source-mapping-id openai-api-key
@@ -151,9 +152,13 @@ the whole set sorted by key, per the contract."
    :dispatch-errors 0
    :dropped-no-governance 0
    :dropped-no-dispatch 0
+   :dropped-catalog-cold 0
    :machine-catalog (make-hash-table :test #'equal)
    :machine-catalog-lock (bt:make-lock "machine-catalog")
+   ;; 0 means "never successfully loaded". Only a successful fetch sets it, so
+   ;; it is the authoritative cold/warm signal — see MACHINE-CATALOG-COLD-P.
    :machine-catalog-refreshed-at 0
+   :catalog-cold-warned-p nil
    :dispatch-ledger nil
    :dispatch-ledger-limit (env-int "TRIGGER_DISPATCH_LEDGER_LIMIT" 100)
    :ollama-base-url (trim-trailing-slashes (env "OLLAMA_BASE_URL" "http://localhost:11434"))
@@ -252,10 +257,15 @@ the whole set sorted by key, per the contract."
             (push sensor-id skipped)
             (let ((source (ensure-source-id
                            engine
+                           ;; Declared complete and INACTIVE (contract 2a).
+                           ;; Activity is earned by the first value: a localai
+                           ;; sensor that has never been fed must report
+                           ;; inactive at every observation point, and only
+                           ;; RECORD-SENSOR-VALUE may originate it.
                            (make-source :id sensor-id
                                         :kind "sensor"
                                         :name name
-                                        :active-p t
+                                        :active-p nil
                                         :region (make-region :offset offset :length length)
                                         :sensor-id sensor-id
                                         :last-value nil
@@ -590,10 +600,13 @@ Per-sequence boundaries live in metadata.segments for UI display."
     (unless source
       (setf source (ensure-source-id
                     engine
+                    ;; Declared inactive; the RECORD-SENSOR-VALUE below is
+                    ;; what earns activity, so an empty signal body cannot
+                    ;; provision a live-looking source (contract 2a/2b).
                     (make-source :id sensor-id
                                  :kind "sensor"
                                  :name name
-                                 :active-p t
+                                 :active-p nil
                                  :region region
                                  :sensor-id sensor-id
                                  :last-value nil
@@ -603,9 +616,8 @@ Per-sequence boundaries live in metadata.segments for UI display."
     (when origin (setf (source-origin source) origin))
     (setf (source-name source) name
           (source-region source) region
-          (source-ttl-ms source) ttl-ms
-          (source-last-value source) values
-          (source-last-updated source) (now-ms))
+          (source-ttl-ms source) ttl-ms)
+    (record-sensor-value source values)
     source))
 
 (defun signal-body-region (body values)
@@ -661,7 +673,12 @@ Per-sequence boundaries live in metadata.segments for UI display."
          "dispatchErrors" (perception-state-dispatch-errors state)
          "droppedNoGovernance" (perception-state-dropped-no-governance state)
          "droppedNoDispatch" (perception-state-dropped-no-dispatch state)
+         ;; Additive: dispatches dropped because the catalog had never loaded.
+         ;; Previously these inflated droppedNoDispatch, which reads as "the
+         ;; machine declares no agent/trigger" — the opposite of the truth (#63).
+         "droppedCatalogCold" (perception-state-dropped-catalog-cold state)
          "machineCatalogSize" catalog-size
+         "machineCatalogCold" (json-bool (machine-catalog-cold-p state))
          "machineCatalogRefreshedAt" (perception-state-machine-catalog-refreshed-at state)
          "ledgerSize" (length (perception-state-dispatch-ledger state)))))
 
@@ -735,10 +752,15 @@ Wire-compatible with _AI Dispatcher.replay() — same mode:\"replay\" + replayOf
 ;; The catalog is populated by a background thread; dispatch lookups are O(1)
 ;; and never block the actor (push cycle) on a RE HTTP round-trip.
 
-(defun refresh-machine-catalog (state)
+(defun refresh-machine-catalog (state &key quiet)
   "Fetch /api/machines from RE and atomically replace the local catalog.
 Intended to be called from the background refresher thread only — never
-from the actor thread.  Soft-fails: existing catalog is preserved on error."
+from the actor thread.  Soft-fails: existing catalog is preserved on error.
+
+Returns the machine count on success (0 is a success — the RE is up and holds
+no machines) or NIL on failure.  QUIET suppresses the per-failure log line,
+used during warm-up where losing the race with the RE's listener is expected
+and the retry loop reports the outcome once instead."
   (handler-case
       (let* ((response (http-get-json (format nil "~a/api/machines?summary=true"
                                               (perception-state-reality-url state))))
@@ -753,8 +775,29 @@ from the actor thread.  Soft-fails: existing catalog is preserved on error."
                 (perception-state-machine-catalog-refreshed-at state) (now-ms)))
         (length machines))
     (error (condition)
-      (format *error-output* "~&[dispatch] machine catalog refresh failed: ~a~%" condition)
+      (unless quiet
+        (format *error-output* "~&[dispatch] machine catalog refresh failed: ~a~%" condition))
       nil)))
+
+(defun note-catalog-cold-drop (state machine-id)
+  "Log the first dispatch dropped to a cold catalog, once per process.
+
+The drop path is per-operation per-push, so logging every one would bury the
+signal it is meant to raise.  One line names the condition and points at the
+durable counter; `droppedCatalogCold` on /api/triggers/status carries the rest."
+  (unless (perception-state-catalog-cold-warned-p state)
+    (setf (perception-state-catalog-cold-warned-p state) t)
+    (format *error-output*
+            "~&[dispatch] dropping dispatch for machine ~a: machine catalog has never loaded (RE at ~a). This is not a no-binding decision. Subsequent cold drops are counted in droppedCatalogCold, not logged.~%"
+            machine-id (perception-state-reality-url state))))
+
+(defun machine-catalog-cold-p (state)
+  "True until the catalog has successfully loaded at least once.
+
+Distinct from \"loaded, and this machine is not in it\".  MACHINE-CATALOG-
+REFRESHED-AT starts at 0 and is only ever written by a successful fetch, so 0
+is an unambiguous never-loaded marker."
+  (zerop (or (perception-state-machine-catalog-refreshed-at state) 0)))
 
 (defun get-cached-machine (state machine-id)
   "O(1) thread-safe lookup of a machine from the local catalog.
@@ -762,16 +805,73 @@ Returns NIL when the machine is absent or the catalog is still warming up."
   (bt:with-lock-held ((perception-state-machine-catalog-lock state))
     (gethash machine-id (perception-state-machine-catalog state))))
 
+(defparameter +machine-catalog-refresh-interval+ 60
+  "Steady-state seconds between machine catalog refreshes.")
+
+(defparameter +machine-catalog-warmup-initial-delay+ 0.1
+  "Seconds before the first warm-up retry; doubles up to the warm-up cap.")
+
+(defparameter +machine-catalog-warmup-max-delay+ 2
+  "Ceiling on the warm-up backoff, in seconds.
+
+Deliberately far below the steady interval.  Backing off toward 60 s while
+still cold would reintroduce exactly the gap this fixes — an RE that takes 30 s
+to load a large corpus would be met by a PE that had already stretched its
+retry to the better part of a minute.  Capping here bounds the cold window to
+roughly this value no matter how slow the RE is, at a cost of one failed
+connect every 2 s, which stops the moment the catalog warms.")
+
+(defparameter +machine-catalog-warmup-warn-after+ 8
+  "Warm-up attempts to make quietly before reporting that the catalog is cold.")
+
 (defun start-machine-catalog-refresher (state)
-  "Spawn a background thread that refreshes the machine catalog every 60 s.
-Fires an immediate best-effort fetch on startup so the catalog is warm before
-the first push cycle completes — mirrors TS: void refreshMachineCatalog();
-setInterval(refreshMachineCatalog, 60_000)."
+  "Spawn the background thread that keeps the machine catalog warm.
+
+Warm-up first, then the steady cadence.  `start.sh` spawns the RE and the PE
+concurrently and this refresher starts before the PE's own HTTP listener, so
+the initial fetch races the RE's listener and normally loses.  Falling straight
+into the 60 s interval on that loss left the catalog empty for a full minute,
+and every dispatch in that window was dropped through the same branch as a
+machine with no dispatch binding — a transient infrastructure failure laundered
+into what reads as a deliberate business decision (#63).
+
+Warm-up retries on an exponential backoff from 100 ms, capped at
++machine-catalog-warmup-max-delay+, until the first fetch succeeds.  A startup
+race now costs milliseconds, and an RE slow to load a large corpus costs at
+most the cap rather than a minute.  There is no attempt limit: giving up would
+put the PE back in the state this fixes, only permanently.
+
+Warm-up failures are expected, so they are not logged per attempt — one line
+after +machine-catalog-warmup-warn-after+ attempts, and one on success.
+
+Every error is treated as retryable, deliberately.  The condition raised when
+the RE is not yet listening is USOCKET:INVALID-ARGUMENT-ERROR, not the
+CONNECTION-REFUSED-ERROR the name would suggest: sb-bsd-sockets reports
+ECONNREFUSED correctly (errno 61 on Darwin), but usocket maps errnos by number
+against Linux values, has no entry for 61, and falls through to its generic
+invalid-argument condition.  Special-casing a refusal here would therefore not
+match on this platform."
   (bt:make-thread
    (lambda ()
+     (let ((delay +machine-catalog-warmup-initial-delay+)
+           (attempts 0))
+       (loop
+         (incf attempts)
+         (let ((count (refresh-machine-catalog state :quiet t)))
+           (when count
+             (format *standard-output*
+                     "~&[dispatch] machine catalog warm after ~a attempt~:p: ~a machine~:p~%"
+                     attempts count)
+             (return)))
+         (when (= attempts +machine-catalog-warmup-warn-after+)
+           (format *error-output*
+                   "~&[dispatch] machine catalog still cold after ~a attempts; retrying (RE at ~a)~%"
+                   attempts (perception-state-reality-url state)))
+         (sleep delay)
+         (setf delay (min (* delay 2) +machine-catalog-warmup-max-delay+))))
      (loop
-       (refresh-machine-catalog state)
-       (sleep 60)))
+       (sleep +machine-catalog-refresh-interval+)
+       (refresh-machine-catalog state)))
    :name "machine-catalog-refresher"))
 
 (defun fetch-machine-for-dispatch (state machine-id)
@@ -925,22 +1025,36 @@ Wire-compatible with CPP build_trigger_envelope and TS buildTriggerEnvelope."
 
 (defun record-dispatch-envelope (state operation &optional machine-json-override)
   "Build and ledger one dispatch record for a merge operation.
-Returns the record on success, or NIL when the machine lacks a dispatch
-agent / trigger — the drop-no-dispatch signal to the caller.
 Wire-compatible with CPP DispatchRecord and TS Dispatcher.recordFromEnvelope.
 Optional MACHINE-JSON-OVERRIDE bypasses the catalog lookup (used in tests and
-corpus-walk helpers that already hold the loaded machine object)."
+corpus-walk helpers that already hold the loaded machine object).
+
+Returns (values RECORD NIL) on success, or (values NIL REASON) on a drop:
+
+  :catalog-cold — the machine catalog has never loaded, so nothing can be
+                  resolved and this says nothing about the machine.
+  :no-dispatch  — resolved against a loaded catalog: the machine is absent, or
+                  it declares no dispatch agent / trigger.
+
+Both used to arrive at the caller as a bare NIL, which made a transient
+infrastructure failure indistinguishable from a deliberate business decision
+(#63).  The second value is additive — callers that want only the record are
+unaffected."
   (let* ((machine-id (jstring operation "machineId" ""))
          (machine (or machine-json-override (fetch-machine-for-dispatch state machine-id)))
          (md (and machine (jget machine "metadata")))
          (binding (and md (ces-dispatch-binding md (jget operation "values"))))
          (agent (and binding (jstring binding "agent" nil)))
          (trigger (and binding (jstring binding "trigger" nil))))
-    ;; Drop — no dispatch agent or no trigger.
+    ;; Drop.  A cold catalog is reported separately from a genuine no-binding
+    ;; decision: with no catalog loaded, MACHINE is NIL for every machine and
+    ;; the drop carries no information about this one.
+    (when (and (null machine) (machine-catalog-cold-p state))
+      (return-from record-dispatch-envelope (values nil :catalog-cold)))
     (when (or (null machine)
               (null agent) (string= agent "")
               (null trigger) (string= trigger ""))
-      (return-from record-dispatch-envelope nil))
+      (return-from record-dispatch-envelope (values nil :no-dispatch)))
     (let* ((envelope-id (make-id "trigger-envelope"))
            (correlation-id (make-id "trigger-correlation"))
            (dispatch-id (make-id "dispatch"))
@@ -991,10 +1105,14 @@ dispatch_triggers and TS Dispatcher.onStep: drop ops without governance
            (incf (perception-state-dropped-no-governance state)))
           (t
            (handler-case
-               (let ((record (record-dispatch-envelope state operation)))
-                 (if record
-                     (push record records)
-                     (incf (perception-state-dropped-no-dispatch state))))
+               (multiple-value-bind (record reason)
+                   (record-dispatch-envelope state operation)
+                 (cond
+                   (record (push record records))
+                   ((eq reason :catalog-cold)
+                    (incf (perception-state-dropped-catalog-cold state))
+                    (note-catalog-cold-drop state (jstring operation "machineId" "")))
+                   (t (incf (perception-state-dropped-no-dispatch state)))))
              (error ()
                (incf (perception-state-dispatch-errors state)))))))
       (vectorize (nreverse records)))))
@@ -2125,8 +2243,7 @@ it is accepted as an alternative to the body bridgeToken/token fields."
                                                                            (let ((source (sensor-exists-p (perception-state-engine state)
                                                                                                           (gethash "sensorId" params))))
                                                                              (when source
-                                                                               (setf (source-last-value source) (numbers-from-json (jget body "values"))
-                                                                                     (source-last-updated source) (now-ms))
+                                                                               (record-sensor-value source (numbers-from-json (jget body "values")))
                                                                                (obj "success" t
                                                                                     "sensorId" (gethash "sensorId" params)
                                                                                     "timestamp" (now-ms))))))))
@@ -2242,20 +2359,25 @@ feed_mqtt_signal (CPP)."
          (existing (sensor-exists-p engine sensor-id)))
     (cond
       (existing
-       (setf (source-last-value existing) values
-             (source-last-updated existing) (now-ms)))
+       (record-sensor-value existing values))
       (t
-       (ensure-source-id engine
-                         (make-source :id sensor-id
-                                      :kind "sensor"
-                                      :name (format nil "mqtt:~a" topic)
-                                      :active-p t
-                                      :region (make-region :offset offset :length length)
-                                      :sensor-id sensor-id
-                                      :last-value values
-                                      :last-updated (now-ms)
-                                      :ttl-ms (if (> ttl-ms 0) ttl-ms 30000)
-                                      :origin "mqtt"))))
+       ;; Auto-provision declares the source inactive and lets the value that
+       ;; triggered the provisioning earn its activity, exactly as it would on
+       ;; any later ingest.  Hardcoding active-p t here made the MQTT path the
+       ;; one place where registration originated activity.
+       (record-sensor-value
+        (ensure-source-id engine
+                          (make-source :id sensor-id
+                                       :kind "sensor"
+                                       :name (format nil "mqtt:~a" topic)
+                                       :active-p nil
+                                       :region (make-region :offset offset :length length)
+                                       :sensor-id sensor-id
+                                       :last-value nil
+                                       :last-updated 0
+                                       :ttl-ms (if (> ttl-ms 0) ttl-ms 30000)
+                                       :origin "mqtt"))
+        values)))
     (broadcast (obj "type" "mqtt-ingest"
                     "payload" (obj "sensorId" sensor-id
                                    "offset" offset

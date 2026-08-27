@@ -336,8 +336,7 @@
                     (result (actor-ask actor (lambda (s)
                                                (let ((src (sensor-exists-p (perception-state-engine s) sensor-id)))
                                                  (when src
-                                                   (setf (source-last-value src) values
-                                                         (source-last-updated src) (now-ms))
+                                                   (record-sensor-value src values)
                                                    t))))))
                (if result
                    (mcp-text (json-stringify (obj "success" t "sensorId" sensor-id "timestamp" (now-ms))))
@@ -355,8 +354,7 @@
                     (result (actor-ask actor (lambda (s)
                                                (let ((src (sensor-exists-p (perception-state-engine s) sensor-id)))
                                                  (when src
-                                                   (setf (source-last-value src) values
-                                                         (source-last-updated src) (now-ms))
+                                                   (record-sensor-value src values)
                                                    t))))))
                (if result
                    (mcp-text (json-stringify (obj "success" t "sensorId" sensor-id "timestamp" (now-ms))))

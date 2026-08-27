@@ -24,7 +24,7 @@
    :dimension dimension
    :machines (make-hash-table :test #'equal)
    :machine-dir "/tmp"
-   :perceptual-space (make-list dimension :initial-element 0.0d0)
+   :perceptual-space (reality-engine-lsp::make-perceptual-space dimension)
    :history nil
    :history-limit 25
    :include-machine-results-p t
@@ -149,10 +149,14 @@
     (reality-engine-lsp::reset-sequence sequence))
   machine)
 
-(defun zero-region (list offset length)
-  (loop for i from offset below (+ offset length)
-        do (setf (nth i list) 0.0d0))
-  list)
+(defun zero-region (space offset length)
+  "Zero [OFFSET, OFFSET+LENGTH) of SPACE, which may be a vector or a list.
+The perceptual space is a vector since #60; some callers still pass lists."
+  (if (vectorp space)
+      (fill space 0.0d0 :start offset :end (min (+ offset length) (length space)))
+      (loop for i from offset below (+ offset length)
+            do (setf (nth i space) 0.0d0)))
+  space)
 
 (defun find-merge-by-machine (batch machine-id)
   (find machine-id (coerce batch 'list)
@@ -406,7 +410,7 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                 :dimension 0
                 :machines (make-hash-table :test #'equal)
                 :machine-dir (namestring +ai-machines-dir+)
-                :perceptual-space (make-list 0 :initial-element 0.0d0)
+                :perceptual-space (reality-engine-lsp::make-perceptual-space 0)
                 :history nil :history-limit 25
                 :include-machine-results-p t :include-perceptual-space-p t
                 :vector-store (make-hash-table :test #'equal)
@@ -1772,6 +1776,63 @@ ever have seen."
       (assert-equal 1
                     (length (reality-engine-lsp::perception-state-dispatch-ledger state))
                     "dispatch ledger should retain PE-owned record")))
+  ;; ── Cold catalog vs no dispatch binding (#63) ─────────────────────────
+  ;; Both used to leave record-dispatch-envelope as a bare NIL and land on the
+  ;; droppedNoDispatch counter, so a PE that lost the startup race with its RE
+  ;; reported a minute of transient infrastructure failure as deliberate
+  ;; no-binding decisions.
+  (let ((state (reality-engine-lsp::make-perception-state-from-config
+                :dimension 16
+                :reality-url "http://localhost:3299"
+                :localai-url "http://localhost:8000"
+                :localai-machine-dir "../localAIStack/data/machines"))
+        (operation (reality-engine-lsp::obj
+                    "machineId" "machine-cold"
+                    "sequenceIds" (reality-engine-lsp::vectorize (list "seq-cold"))
+                    "values" (reality-engine-lsp::vectorize (list 1))
+                    "governance" (reality-engine-lsp::obj "ownerTeam" "t"
+                                                          "ragStatusCode" "RED"
+                                                          "processStatus" "error"))))
+    (assert-true (reality-engine-lsp::machine-catalog-cold-p state)
+                 "a freshly constructed catalog is cold")
+    (multiple-value-bind (record reason)
+        (reality-engine-lsp::record-dispatch-envelope state operation)
+      (assert-true (not record) "a cold catalog cannot resolve a dispatch")
+      (assert-equal :catalog-cold reason
+                    "a drop against a cold catalog reports :catalog-cold"))
+
+    ;; A successful refresh warms the catalog even when the RE holds no
+    ;; machines — "loaded and empty" is not "never loaded".
+    (bt:with-lock-held ((reality-engine-lsp::perception-state-machine-catalog-lock state))
+      (setf (reality-engine-lsp::perception-state-machine-catalog-refreshed-at state)
+            (reality-engine-lsp::now-ms)))
+    (assert-true (not (reality-engine-lsp::machine-catalog-cold-p state))
+                 "a catalog that loaded zero machines is warm, not cold")
+    (multiple-value-bind (record reason)
+        (reality-engine-lsp::record-dispatch-envelope state operation)
+      (assert-true (not record) "an absent machine still drops")
+      (assert-equal :no-dispatch reason
+                    "a drop against a warm catalog reports :no-dispatch"))
+
+    ;; A machine present but declaring no agent/trigger is a genuine
+    ;; no-binding decision, not a cold-catalog drop.
+    (bt:with-lock-held ((reality-engine-lsp::perception-state-machine-catalog-lock state))
+      (setf (gethash "machine-cold"
+                     (reality-engine-lsp::perception-state-machine-catalog state))
+            (reality-engine-lsp::obj "id" "machine-cold"
+                                     "metadata" (reality-engine-lsp::obj))))
+    (multiple-value-bind (record reason)
+        (reality-engine-lsp::record-dispatch-envelope state operation)
+      (assert-true (not record) "a machine with no binding drops")
+      (assert-equal :no-dispatch reason
+                    "no agent/trigger is a no-binding drop, not a cold one"))
+
+    (let ((status (reality-engine-lsp::triggers-status-json state)))
+      (assert-equal 0 (reality-engine-lsp::jnumber status "droppedCatalogCold" nil)
+                    "triggers status exposes the cold-drop counter")
+      (assert-true (not (reality-engine-lsp::jbool status "machineCatalogCold" t))
+                   "triggers status reports the warm catalog as not cold")))
+
   (let* ((state (make-test-state 8))
          (text (reality-engine-lsp::prometheus-text-of state "lsp")))
     (assert-true (search "runtime=\"lsp\"" text)
@@ -1822,7 +1883,100 @@ ever have seen."
       (assert-equal 0.0d0 (nth 1 vec) "stale sensor contributes zero"))
     (let ((js (reality-engine-lsp::source-json stale)))
       (assert-true (reality-engine-lsp::jbool js "stale" nil) "stale sensor reports stale=true in JSON")
-      (assert-true (> (reality-engine-lsp::jnumber js "ageMs" 0) 0) "stale sensor reports positive ageMs")))
+      (assert-true (> (reality-engine-lsp::jnumber js "ageMs" 0) 0) "stale sensor reports positive ageMs"))
+
+    ;; ── Reset validates activity, it does not assign it (#65) ─────────────
+    ;; RealityEngine_CI#163 point 3. The expired sensor already contributed
+    ;; zeros above; what was wrong was the reported flag, which reset forced
+    ;; back to a value nothing had checked.
+    (assert-true (not (reality-engine-lsp::jbool (reality-engine-lsp::source-json stale) "active" t))
+                 "an expired sensor must not report active, even before the reset")
+    (reality-engine-lsp::reset-perception-engine engine)
+    (assert-true (reality-engine-lsp::source-active-p fresh)
+                 "a sensor holding a value inside its TTL validates active across reset")
+    (assert-true (not (reality-engine-lsp::source-active-p stale))
+                 "a sensor whose TTL expired validates inactive across reset")
+    (assert-true (not (reality-engine-lsp::jbool (reality-engine-lsp::source-json stale) "active" t))
+                 "GET /api/sources reports active=false for the expired sensor")
+
+    ;; A later value must re-earn activity, or the source is stranded
+    ;; contributing zeros while holding a fresh reading.
+    (reality-engine-lsp::record-sensor-value stale (list 0.9d0))
+    (assert-true (reality-engine-lsp::source-active-p stale)
+                 "a value arriving re-activates a sensor reset had validated inactive")
+    (assert-equal 0.9d0 (nth 1 (reality-engine-lsp::assemble-perception-vector engine))
+                  "the re-activated sensor contributes its value again"))
+
+  ;; Reset validates the other kinds too: a test source with an empty
+  ;; sequence supplies nothing, so calling it active would be assignment
+  ;; rather than validation.  Reset does not preserve an explicit pause —
+  ;; an operator-deactivated source is run state, and reset clears run state.
+  (let* ((engine (reality-engine-lsp::make-perception-engine-state 4))
+         (empty (reality-engine-lsp::make-source
+                 :id "t-empty" :kind "test" :name "empty test"
+                 :active-p t :cursor 3
+                 :region (reality-engine-lsp::make-region :offset 0 :length 1)
+                 :inputs nil :loop-p t))
+         (filled (reality-engine-lsp::make-source
+                  :id "t-filled" :kind "test" :name "filled test"
+                  :active-p nil :cursor 2
+                  :region (reality-engine-lsp::make-region :offset 1 :length 1)
+                  :inputs (list (list 1.0d0) (list 0.0d0)) :loop-p t))
+         (sim (reality-engine-lsp::make-source
+               :id "s-sim" :kind "simulated" :name "sim"
+               :active-p nil :cursor 7
+               :region (reality-engine-lsp::make-region :offset 2 :length 1)
+               :pattern "constant" :dc-offset 0.5d0)))
+    (dolist (s (list empty filled sim))
+      (reality-engine-lsp::ensure-source-id engine s))
+    (reality-engine-lsp::reset-perception-engine engine)
+    (assert-true (not (reality-engine-lsp::source-active-p empty))
+                 "a test source with an empty sequence validates inactive")
+    (assert-true (reality-engine-lsp::source-active-p filled)
+                 "a test source with a non-empty sequence validates active")
+    (assert-true (reality-engine-lsp::source-active-p sim)
+                 "a simulated source validates active; reset does not preserve a pause")
+    (assert-equal 0 (reality-engine-lsp::source-cursor filled)
+                  "reset rewinds the test cursor")
+    ;; ...and only the test cursor (#64). `cursor' is read and advanced by the
+    ;; "test" branches alone, so zeroing it on other kinds wrote a field that
+    ;; is not theirs. C++ and Scala rewind test cursors only.
+    (assert-equal 7 (reality-engine-lsp::source-cursor sim)
+                  "reset leaves a simulated source's cursor alone"))
+
+  ;; ── Ingress is the only origin of activity for an integration source ───
+  ;; An integration (sensor-kind) source that has never received a value must
+  ;; report inactive at every observation point, through any sequence of
+  ;; register and reset. Only a value arriving may originate activity, and it
+  ;; expires with that value's TTL.
+  (let* ((engine (reality-engine-lsp::make-perception-engine-state 4))
+         (unfed (reality-engine-lsp::make-source
+                 :id "s-unfed" :kind "sensor" :name "never fed"
+                 ;; even asked for active at registration
+                 :active-p t
+                 :region (reality-engine-lsp::make-region :offset 0 :length 1)
+                 :sensor-id "unfed-sid"
+                 :last-value nil :last-updated 0 :ttl-ms 5000)))
+    (reality-engine-lsp::ensure-source-id engine unfed)
+    (assert-true (not (reality-engine-lsp::jbool
+                       (reality-engine-lsp::source-json unfed) "active" t))
+                 "an unfed sensor reports inactive at registration")
+    (reality-engine-lsp::reset-perception-engine engine)
+    (assert-true (not (reality-engine-lsp::source-active-p unfed))
+                 "reset cannot activate a sensor that was never fed")
+    (assert-true (not (reality-engine-lsp::jbool
+                       (reality-engine-lsp::source-json unfed) "active" t))
+                 "an unfed sensor still reports inactive after reset")
+    (reality-engine-lsp::record-sensor-value unfed (list 0.4d0))
+    (assert-true (reality-engine-lsp::jbool
+                  (reality-engine-lsp::source-json unfed) "active" nil)
+                 "the first value earns activity")
+    ;; ...and it expires with that value's TTL.
+    (setf (reality-engine-lsp::source-last-updated unfed)
+          (- (reality-engine-lsp::now-ms) 60000))
+    (assert-true (not (reality-engine-lsp::jbool
+                       (reality-engine-lsp::source-json unfed) "active" t))
+                 "ingress-earned activity expires with the value's TTL"))
 
   ;; ── Assembled vector: a source owns its region (#53) ──────────────────
   ;; Zero-valued cells used to be skipped, so a cell a source drove low kept
@@ -2166,7 +2320,7 @@ ever have seen."
            (assert-equal 900     (reality-engine-lsp::jnumber gov "slaSeconds" nil)   "AGX051 gov.sla != 900")))
 
        ;; Stage 2 — carry-forward perceptual space, zero tier-1 sensors, AGX055 fires
-       (let* ((stage2 (copy-list (reality-engine-lsp::reality-state-perceptual-space state)))
+       (let* ((stage2 (reality-engine-lsp::perceptual-space-snapshot (reality-engine-lsp::reality-state-perceptual-space state)))
               (_ (zero-region stage2 40 4))  (_ (zero-region stage2 84 4))
               (_ (zero-region stage2 184 4)) (_ (zero-region stage2 228 4))
               (s2 (reality-engine-lsp::process-perceptual-input
@@ -2184,15 +2338,15 @@ ever have seen."
          (assert-equal nil (find-merge-by-machine batch2 yield-id) "stage 2: AgYieldOptimizationAI fired before AGX055 projection landed"))
 
        ;; Stage 3 — projection landing: perceptualSpace[3959]=1, [3960:3971]=0
-       (let* ((stage3 (copy-list (reality-engine-lsp::reality-state-perceptual-space state)))
+       (let* ((stage3 (reality-engine-lsp::perceptual-space-snapshot (reality-engine-lsp::reality-state-perceptual-space state)))
               (_ (zero-region stage3 40 4))  (_ (zero-region stage3 84 4))
               (_ (zero-region stage3 184 4)) (_ (zero-region stage3 228 4))
               (_ (zero-region stage3 256 16)))
          (declare (ignore _))
          (assert-true (>= (length stage3) 3971) "stage 3: perceptualSpace not grown to 3971")
-         (assert-equal 1 (round (nth 3959 stage3)) "stage 3: AQUA_URGENT bit at [3959] missing")
+         (assert-equal 1 (round (elt stage3 3959)) "stage 3: AQUA_URGENT bit at [3959] missing")
          (loop for i from 3960 below 3971 do
-               (assert-equal 0 (round (nth i stage3)) (format nil "stage 3: stray bit at [~a] — one-hot projection violated" i)))
+               (assert-equal 0 (round (elt stage3 i)) (format nil "stage 3: stray bit at [~a] — one-hot projection violated" i)))
          (reality-engine-lsp::process-perceptual-input state stage3
                                                        :include-machine-results t :include-perceptual-space t)))
 
@@ -2206,7 +2360,7 @@ ever have seen."
                      (loop for x in +tier1-normal-input+ for i from 228 do (setf (nth i v) x))
                      v)))
        (reality-engine-lsp::process-perceptual-input state input :include-machine-results t :include-perceptual-space t)
-       (let* ((stage2 (copy-list (reality-engine-lsp::reality-state-perceptual-space state)))
+       (let* ((stage2 (reality-engine-lsp::perceptual-space-snapshot (reality-engine-lsp::reality-state-perceptual-space state)))
               (_ (zero-region stage2 40 4))  (_ (zero-region stage2 84 4))
               (_ (zero-region stage2 184 4)) (_ (zero-region stage2 228 4))
               (s2 (reality-engine-lsp::process-perceptual-input state stage2 :include-machine-results t :include-perceptual-space t))
@@ -2375,6 +2529,62 @@ ever have seen."
         (let ((shuffled (sort (copy-list base) #'< :key (lambda (c) (random 1000)))))
           (assert-equal first-result (reality-engine-lsp::resolve-cell 1 0 shuffled e)
                         "resolution is invariant under contribution order")))))
+
+  ;; ── Perceptual space representation (#60) ─────────────────────────────
+  ;; The space is a growable double-float vector, not a list. These guard the
+  ;; properties the conversion has to preserve rather than the speed it buys.
+  (let ((space (reality-engine-lsp::make-perceptual-space 8)))
+    (assert-true (vectorp space) "the perceptual space is a vector")
+    (assert-equal 8 (length space) "length is the logical dimension")
+    (assert-true (every #'zerop space) "a fresh space is zeroed")
+
+    ;; Growth (regression guard for #24: a machine mapping past the dimension
+    ;; must still be addressable). Contents survive; new cells read zero.
+    (setf (aref space 3) 0.5d0)
+    (let ((grown (reality-engine-lsp::grow-perceptual-space space 40)))
+      (assert-equal 40 (length grown) "growth extends the logical length")
+      (assert-equal 0.5d0 (aref grown 3) "growth preserves existing cells")
+      (assert-true (every #'zerop (subseq grown 8 40)) "grown cells read zero")
+      ;; Growth doubles capacity, so it is amortised rather than one
+      ;; reallocation per appended cell.
+      (assert-true (>= (array-dimension grown 0) 40) "capacity covers the length")
+
+      ;; A snapshot must detach: VECTORIZE returns a vector argument unchanged,
+      ;; so serializing the live space would alias it and the next step's
+      ;; in-place writes would rewrite an already-emitted response.
+      (let ((snap (reality-engine-lsp::perceptual-space-snapshot grown)))
+        (setf (aref grown 3) 0.9d0)
+        (assert-equal 0.5d0 (elt snap 3)
+                      "a snapshot does not track later writes to the space")
+        (assert-true (not (eq snap grown)) "a snapshot is a distinct object"))))
+
+  ;; extract-region and merge-region are O(region), and merge-region still
+  ;; grows the space when the region runs past the end.
+  (let ((space (reality-engine-lsp::make-perceptual-space 8)))
+    (reality-engine-lsp::merge-region
+     space (reality-engine-lsp::make-region :offset 2 :length 3) (list 1 0 1))
+    (assert-equal '(1.0d0 0.0d0 1.0d0)
+                  (reality-engine-lsp::extract-region
+                   space (reality-engine-lsp::make-region :offset 2 :length 3))
+                  "merge-region writes, extract-region reads back")
+    (assert-equal '(0.0d0 0.0d0)
+                  (reality-engine-lsp::extract-region
+                   space (reality-engine-lsp::make-region :offset 20 :length 2))
+                  "extract-region zero-fills past the end")
+    (let ((grown (reality-engine-lsp::merge-region
+                  space (reality-engine-lsp::make-region :offset 30 :length 2)
+                  (list 1 1))))
+      (assert-true (>= (length grown) 32) "merge-region grows to fit the region")
+      (assert-equal '(1.0d0 1.0d0)
+                    (reality-engine-lsp::extract-region
+                     grown (reality-engine-lsp::make-region :offset 30 :length 2))
+                    "values written past the old end are readable"))
+    ;; Lists are still accepted — universalInputSpace callers extract from a
+    ;; plain numbers-from-json result, which is not the shared space.
+    (assert-equal '(2 3)
+                  (reality-engine-lsp::extract-region
+                   (list 1 2 3 4) (reality-engine-lsp::make-region :offset 1 :length 2))
+                  "extract-region still reads a list"))
 
   (output-merge-tests)
   (fold-placement-tests)

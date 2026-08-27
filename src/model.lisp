@@ -862,17 +862,52 @@ are constant within every comparison the sort can now make."
        "arbiterMetadata" (transition-result-arbiter-metadata result)))
 
 (defun extract-region (space region)
-  (let ((offset (region-offset region))
-        (length (region-length region)))
-    (loop for i from offset below (+ offset length)
-          collect (if (< i (length space)) (nth i space) 0.0d0))))
+  "Read REGION out of SPACE as a list, zero-filling past the end.
+
+O(region length).  The perceptual space is a vector (see
+MAKE-PERCEPTUAL-SPACE), so cells are read with AREF rather than NTH.  This
+used to be two O(n) operations *per element*: (nth i space) walked i conses,
+and (length space) was loop-invariant but re-evaluated on every iteration,
+walking all ~17k conses each time.  With one call per machine per step across
+a 1,300-machine corpus that dominated this runtime's CPU (#60).
+
+Lists are still accepted: several callers extract from a plain
+NUMBERS-FROM-JSON result (universalInputSpace), which is not the shared space.
+That path walks the list once with a cursor instead of re-walking from the
+head per element."
+  (let* ((offset (region-offset region))
+         (len (region-length region)))
+    (if (vectorp space)
+        (let ((n (length space)))
+          (loop for i from offset below (+ offset len)
+                collect (if (< i n) (aref space i) 0.0d0)))
+        (let ((tail (nthcdr offset space)))
+          (loop repeat len
+                collect (if tail (or (pop tail) 0.0d0) 0.0d0))))))
 
 (defun merge-region (space region values)
+  "Write VALUES into SPACE at REGION and return the space.
+
+Destructive on a vector space, and the caller assigns the result back because
+growth may return a different array.  The list version was quadratic three
+times over: it copied the whole space, appended one cons at a time to reach
+the needed length (re-measuring with an O(n) LENGTH per pass), then wrote each
+value with (setf (nth i out) ...) at O(i) apiece.  Committing arbitration
+called it once per resolved cell, so a step that resolved k cells copied the
+entire ~17k-element space k times (#60)."
   (let* ((offset (region-offset region))
-         (needed (+ offset (length values)))
-         (out (copy-list space)))
-    (loop while (< (length out) needed) do (setf out (append out (list 0.0d0))))
-    (loop for value in values
-          for i from offset
-          do (setf (nth i out) value))
-    out))
+         (needed (+ offset (length values))))
+    (if (vectorp space)
+        (let ((out (grow-perceptual-space space needed))
+              (i offset))
+          (map nil (lambda (value)
+                     (setf (aref out i) (coerce (or value 0) 'double-float))
+                     (incf i))
+               values)
+          out)
+        (let ((out (copy-list space)))
+          (loop while (< (length out) needed) do (setf out (append out (list 0.0d0))))
+          (loop for value in values
+                for i from offset
+                do (setf (nth i out) value))
+          out))))

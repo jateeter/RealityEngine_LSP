@@ -26,11 +26,13 @@ build: deps-check
 	  --eval '(sb-ext:save-lisp-and-die "bin/reality-engine-lsp" :toplevel #'\''reality-engine-lsp:main :executable t)' \
 	  --quit
 
+# reality/perception are service-launch targets, so they load without :force t.
+# Forcing a recompile is a build intent and stays in `build` and `test`.
 reality: deps-check
 	$(LISP) --noinform --disable-debugger --load "$(QUICKLISP)" \
 	  --eval '(pushnew (truename ".") ql:*local-project-directories*)' \
 	  --eval '(ql:register-local-projects)' \
-	  --eval '(ql:quickload :reality-engine-lsp :force t)' \
+	  --eval '(ql:quickload :reality-engine-lsp)' \
 	  --eval '(reality-engine-lsp:start-reality-from-environment)' \
 	  --eval '(loop (sleep 3600))'
 
@@ -38,7 +40,7 @@ perception: deps-check
 	$(LISP) --noinform --disable-debugger --load "$(QUICKLISP)" \
 	  --eval '(pushnew (truename ".") ql:*local-project-directories*)' \
 	  --eval '(ql:register-local-projects)' \
-	  --eval '(ql:quickload :reality-engine-lsp :force t)' \
+	  --eval '(ql:quickload :reality-engine-lsp)' \
 	  --eval '(reality-engine-lsp:start-perception-from-environment)' \
 	  --eval '(loop (sleep 3600))'
 
