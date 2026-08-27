@@ -24,7 +24,7 @@
    :dimension dimension
    :machines (make-hash-table :test #'equal)
    :machine-dir "/tmp"
-   :perceptual-space (make-list dimension :initial-element 0.0d0)
+   :perceptual-space (reality-engine-lsp::make-perceptual-space dimension)
    :history nil
    :history-limit 25
    :include-machine-results-p t
@@ -149,10 +149,14 @@
     (reality-engine-lsp::reset-sequence sequence))
   machine)
 
-(defun zero-region (list offset length)
-  (loop for i from offset below (+ offset length)
-        do (setf (nth i list) 0.0d0))
-  list)
+(defun zero-region (space offset length)
+  "Zero [OFFSET, OFFSET+LENGTH) of SPACE, which may be a vector or a list.
+The perceptual space is a vector since #60; some callers still pass lists."
+  (if (vectorp space)
+      (fill space 0.0d0 :start offset :end (min (+ offset length) (length space)))
+      (loop for i from offset below (+ offset length)
+            do (setf (nth i space) 0.0d0)))
+  space)
 
 (defun find-merge-by-machine (batch machine-id)
   (find machine-id (coerce batch 'list)
@@ -406,7 +410,7 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                 :dimension 0
                 :machines (make-hash-table :test #'equal)
                 :machine-dir (namestring +ai-machines-dir+)
-                :perceptual-space (make-list 0 :initial-element 0.0d0)
+                :perceptual-space (reality-engine-lsp::make-perceptual-space 0)
                 :history nil :history-limit 25
                 :include-machine-results-p t :include-perceptual-space-p t
                 :vector-store (make-hash-table :test #'equal)
@@ -2316,7 +2320,7 @@ ever have seen."
            (assert-equal 900     (reality-engine-lsp::jnumber gov "slaSeconds" nil)   "AGX051 gov.sla != 900")))
 
        ;; Stage 2 — carry-forward perceptual space, zero tier-1 sensors, AGX055 fires
-       (let* ((stage2 (copy-list (reality-engine-lsp::reality-state-perceptual-space state)))
+       (let* ((stage2 (reality-engine-lsp::perceptual-space-snapshot (reality-engine-lsp::reality-state-perceptual-space state)))
               (_ (zero-region stage2 40 4))  (_ (zero-region stage2 84 4))
               (_ (zero-region stage2 184 4)) (_ (zero-region stage2 228 4))
               (s2 (reality-engine-lsp::process-perceptual-input
@@ -2334,15 +2338,15 @@ ever have seen."
          (assert-equal nil (find-merge-by-machine batch2 yield-id) "stage 2: AgYieldOptimizationAI fired before AGX055 projection landed"))
 
        ;; Stage 3 — projection landing: perceptualSpace[3959]=1, [3960:3971]=0
-       (let* ((stage3 (copy-list (reality-engine-lsp::reality-state-perceptual-space state)))
+       (let* ((stage3 (reality-engine-lsp::perceptual-space-snapshot (reality-engine-lsp::reality-state-perceptual-space state)))
               (_ (zero-region stage3 40 4))  (_ (zero-region stage3 84 4))
               (_ (zero-region stage3 184 4)) (_ (zero-region stage3 228 4))
               (_ (zero-region stage3 256 16)))
          (declare (ignore _))
          (assert-true (>= (length stage3) 3971) "stage 3: perceptualSpace not grown to 3971")
-         (assert-equal 1 (round (nth 3959 stage3)) "stage 3: AQUA_URGENT bit at [3959] missing")
+         (assert-equal 1 (round (elt stage3 3959)) "stage 3: AQUA_URGENT bit at [3959] missing")
          (loop for i from 3960 below 3971 do
-               (assert-equal 0 (round (nth i stage3)) (format nil "stage 3: stray bit at [~a] — one-hot projection violated" i)))
+               (assert-equal 0 (round (elt stage3 i)) (format nil "stage 3: stray bit at [~a] — one-hot projection violated" i)))
          (reality-engine-lsp::process-perceptual-input state stage3
                                                        :include-machine-results t :include-perceptual-space t)))
 
@@ -2356,7 +2360,7 @@ ever have seen."
                      (loop for x in +tier1-normal-input+ for i from 228 do (setf (nth i v) x))
                      v)))
        (reality-engine-lsp::process-perceptual-input state input :include-machine-results t :include-perceptual-space t)
-       (let* ((stage2 (copy-list (reality-engine-lsp::reality-state-perceptual-space state)))
+       (let* ((stage2 (reality-engine-lsp::perceptual-space-snapshot (reality-engine-lsp::reality-state-perceptual-space state)))
               (_ (zero-region stage2 40 4))  (_ (zero-region stage2 84 4))
               (_ (zero-region stage2 184 4)) (_ (zero-region stage2 228 4))
               (s2 (reality-engine-lsp::process-perceptual-input state stage2 :include-machine-results t :include-perceptual-space t))
@@ -2525,6 +2529,62 @@ ever have seen."
         (let ((shuffled (sort (copy-list base) #'< :key (lambda (c) (random 1000)))))
           (assert-equal first-result (reality-engine-lsp::resolve-cell 1 0 shuffled e)
                         "resolution is invariant under contribution order")))))
+
+  ;; ── Perceptual space representation (#60) ─────────────────────────────
+  ;; The space is a growable double-float vector, not a list. These guard the
+  ;; properties the conversion has to preserve rather than the speed it buys.
+  (let ((space (reality-engine-lsp::make-perceptual-space 8)))
+    (assert-true (vectorp space) "the perceptual space is a vector")
+    (assert-equal 8 (length space) "length is the logical dimension")
+    (assert-true (every #'zerop space) "a fresh space is zeroed")
+
+    ;; Growth (regression guard for #24: a machine mapping past the dimension
+    ;; must still be addressable). Contents survive; new cells read zero.
+    (setf (aref space 3) 0.5d0)
+    (let ((grown (reality-engine-lsp::grow-perceptual-space space 40)))
+      (assert-equal 40 (length grown) "growth extends the logical length")
+      (assert-equal 0.5d0 (aref grown 3) "growth preserves existing cells")
+      (assert-true (every #'zerop (subseq grown 8 40)) "grown cells read zero")
+      ;; Growth doubles capacity, so it is amortised rather than one
+      ;; reallocation per appended cell.
+      (assert-true (>= (array-dimension grown 0) 40) "capacity covers the length")
+
+      ;; A snapshot must detach: VECTORIZE returns a vector argument unchanged,
+      ;; so serializing the live space would alias it and the next step's
+      ;; in-place writes would rewrite an already-emitted response.
+      (let ((snap (reality-engine-lsp::perceptual-space-snapshot grown)))
+        (setf (aref grown 3) 0.9d0)
+        (assert-equal 0.5d0 (elt snap 3)
+                      "a snapshot does not track later writes to the space")
+        (assert-true (not (eq snap grown)) "a snapshot is a distinct object"))))
+
+  ;; extract-region and merge-region are O(region), and merge-region still
+  ;; grows the space when the region runs past the end.
+  (let ((space (reality-engine-lsp::make-perceptual-space 8)))
+    (reality-engine-lsp::merge-region
+     space (reality-engine-lsp::make-region :offset 2 :length 3) (list 1 0 1))
+    (assert-equal '(1.0d0 0.0d0 1.0d0)
+                  (reality-engine-lsp::extract-region
+                   space (reality-engine-lsp::make-region :offset 2 :length 3))
+                  "merge-region writes, extract-region reads back")
+    (assert-equal '(0.0d0 0.0d0)
+                  (reality-engine-lsp::extract-region
+                   space (reality-engine-lsp::make-region :offset 20 :length 2))
+                  "extract-region zero-fills past the end")
+    (let ((grown (reality-engine-lsp::merge-region
+                  space (reality-engine-lsp::make-region :offset 30 :length 2)
+                  (list 1 1))))
+      (assert-true (>= (length grown) 32) "merge-region grows to fit the region")
+      (assert-equal '(1.0d0 1.0d0)
+                    (reality-engine-lsp::extract-region
+                     grown (reality-engine-lsp::make-region :offset 30 :length 2))
+                    "values written past the old end are readable"))
+    ;; Lists are still accepted — universalInputSpace callers extract from a
+    ;; plain numbers-from-json result, which is not the shared space.
+    (assert-equal '(2 3)
+                  (reality-engine-lsp::extract-region
+                   (list 1 2 3 4) (reality-engine-lsp::make-region :offset 1 :length 2))
+                  "extract-region still reads a list"))
 
   (output-merge-tests)
   (fold-placement-tests)

@@ -79,3 +79,56 @@ needs that distinction."
         0.0d0
         (/ dot (* (sqrt l2) (sqrt r2))))))
 
+
+;; ── Perceptual space representation ─────────────────────────────────────────
+;; The shared perceptual space is a growable vector of DOUBLE-FLOAT, matching
+;; the C++ std::vector<double> and the Scala indexed array.  It was a Lisp
+;; list, which made every random access O(n) against a dimension that is 16,944
+;; on the deployment corpus and grows with it — see #60 for the measurements.
+;;
+;; Adjustable with a fill pointer, so LENGTH is the logical dimension while
+;; capacity can run ahead of it and growth amortises to O(1).  Serialization is
+;; unaffected: WRITE-JSON-DOUBLE already renders whole doubles in integer form
+;; (ECMA-262 Number::toString, RealityEngine_CI#91), so a cell holding 1.0d0
+;; emits "1" exactly as the integer 1 did.
+
+(defun make-perceptual-space (dimension)
+  "A perceptual space of DIMENSION zeroed double-float cells."
+  (let ((n (max 0 dimension)))
+    (make-array n :element-type 'double-float
+                  :initial-element 0.0d0
+                  :adjustable t
+                  :fill-pointer n)))
+
+(defun perceptual-space-p (space)
+  "True when SPACE is a vector rather than the historical list."
+  (and (vectorp space) (not (stringp space))))
+
+(defun grow-perceptual-space (space length)
+  "Return SPACE addressable to LENGTH, growing by doubling when needed.
+
+Returns a possibly different array, so callers must assign the result back.
+Cells added by growth read as 0.0d0 — including cells inside capacity that a
+previous, longer fill pointer had used, which is why the fill region below is
+explicit rather than left to ADJUST-ARRAY's :initial-element."
+  (let ((capacity (array-dimension space 0)))
+    (when (> length capacity)
+      (setf space (adjust-array space (max length (* 2 capacity))
+                                :initial-element 0.0d0)))
+    (let ((filled (fill-pointer space)))
+      (when (> length filled)
+        (setf (fill-pointer space) length)
+        (fill space 0.0d0 :start filled :end length))))
+  space)
+
+(defun perceptual-space-snapshot (space)
+  "A detached copy of SPACE for serialization or history.
+
+VECTORIZE is (coerce x 'vector), which returns a vector argument *unchanged* —
+so handing the live space to a JSON payload would alias it, and the next step's
+in-place writes would rewrite a response and every history entry that shared
+it.  The list representation could not alias this way because it was rebuilt
+each step."
+  (if (perceptual-space-p space)
+      (coerce space 'simple-vector)
+      (coerce space 'vector)))

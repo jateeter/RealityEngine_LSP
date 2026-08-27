@@ -99,11 +99,15 @@ domain subdirectories load by filename (corpus filenames are unique)."
             flat))))
 
 (defun ensure-space-length (state length)
-  (when (> length (length (reality-state-perceptual-space state)))
-    (setf (reality-state-perceptual-space state)
-          (append (reality-state-perceptual-space state)
-                  (make-list (- length (length (reality-state-perceptual-space state)))
-                             :initial-element 0.0d0))))
+  "Grow the perceptual space so [0, LENGTH) is addressable.
+
+Regression guard for #24: a machine whose perceptualMapping runs past the
+configured dimension must still receive input.  The growth path is
+GROW-PERCEPTUAL-SPACE (doubling, amortised O(1)) rather than the old
+append + make-list, which allocated a fresh full-length list and measured it
+with two more O(n) LENGTH calls."
+  (setf (reality-state-perceptual-space state)
+        (grow-perceptual-space (reality-state-perceptual-space state) length))
   (when (> length (reality-state-dimension state))
     (setf (reality-state-dimension state) length)))
 
@@ -169,7 +173,7 @@ domain subdirectories load by filename (corpus filenames are unique)."
            :dimension dimension
            :machines (make-hash-table :test #'equal)
            :machine-dir machine-dir
-           :perceptual-space (make-list dimension :initial-element 0.0d0)
+           :perceptual-space (make-perceptual-space dimension)
            :history nil
            :engine-history nil
            :isre-history nil
@@ -225,12 +229,14 @@ domain subdirectories load by filename (corpus filenames are unique)."
 ;; Dense vector -> sparse trajectory entry. A cell absent from `nonZero` is
 ;; zero; `length` keeps the dense width so the reconstruction is exact.
 (defun sparse-trajectory (step-number dense)
+  ;; MAP NIL rather than DOLIST: DENSE is the perceptual space, now a vector.
   (let ((cells nil)
         (index 0))
-    (dolist (value dense)
-      (unless (zerop value)
-        (push (obj "index" index "value" value) cells))
-      (incf index))
+    (map nil (lambda (value)
+               (unless (zerop value)
+                 (push (obj "index" index "value" value) cells))
+               (incf index))
+         dense)
     (obj "stepNumber" step-number
          "length" (length dense)
          "nonZero" (vectorize (nreverse cells)))))
@@ -299,7 +305,7 @@ domain subdirectories load by filename (corpus filenames are unique)."
                (reset-sequence sequence)))
            (reality-state-machines state))
   (setf (reality-state-perceptual-space state)
-        (make-list (reality-state-dimension state) :initial-element 0.0d0)
+        (make-perceptual-space (reality-state-dimension state))
         (reality-state-history state) nil
         (reality-state-engine-history state) nil
         (reality-state-isre-history state) nil
@@ -1129,14 +1135,15 @@ they still do."
       (dolist (write sorted)
         (let ((bit (truncate (or (jnumber write "bitOffset" 0) 0))))
           (ensure-space-length state (1+ bit))
-          (setf (nth bit (reality-state-perceptual-space state)) (or (jnumber write "value" 1.0d0) 1.0d0))))
+          (setf (aref (reality-state-perceptual-space state) bit)
+                (coerce (or (jnumber write "value" 1.0d0) 1.0d0) 'double-float))))
       sorted)))
 
 (defun apply-latched-event-bits (state)
   (maphash (lambda (bit _)
              (declare (ignore _))
              (ensure-space-length state (1+ bit))
-             (setf (nth bit (reality-state-perceptual-space state)) 1.0d0))
+             (setf (aref (reality-state-perceptual-space state) bit) 1.0d0))
            (reality-state-latched-event-bits state)))
 
 (defun process-perceptual-input (state input &key override include-machine-results include-perceptual-space compact)
@@ -1145,9 +1152,25 @@ they still do."
   ;; so existing callers (and RE_INCLUDE_PERCEPTUAL_SPACE) do not become errors.
   (declare (ignore include-perceptual-space))
   (ensure-space-length state (max (reality-state-dimension state) (length input)))
-  (setf (reality-state-perceptual-space state)
-        (append input (make-list (max 0 (- (reality-state-dimension state) (length input)))
-                                 :initial-element 0.0d0)))
+  ;; Seed the space from INPUT in place and zero the tail, rather than
+  ;; rebuilding it with append + make-list, which allocated a fresh
+  ;; ~17k-cons structure (~271 KB) before any machine ran (#60).
+  ;;
+  ;; INPUT is sometimes the space itself — /api/simulation/step and the MCP
+  ;; step tool feed the current space straight back in. Copying then would be
+  ;; a self-overwrite; there is also nothing to copy, since it is already the
+  ;; state being seeded.
+  (let ((space (reality-state-perceptual-space state)))
+    (unless (eq input space)
+      (let ((i 0)
+            (limit (length space)))
+        (map nil (lambda (value)
+                   (when (< i limit)
+                     (setf (aref space i) (coerce (or value 0) 'double-float))
+                     (incf i)))
+             input)
+        (when (< i limit)
+          (fill space 0.0d0 :start i)))))
   (apply-latched-event-bits state)
   ;; ISRE(n) observation point. This is the input space reality event the corpus
   ;; is about to be presented with: every extract-region below reads exactly this
@@ -1374,7 +1397,7 @@ they still do."
       ;; at all — the engine computed the right answer and did not report it,
       ;; which is what the cross-runtime parity stage read as divergence
       ;; (RealityEngine_Scala#43).
-      (setf (jget step "perceptualSpace") (vectorize (reality-state-perceptual-space state))
+      (setf (jget step "perceptualSpace") (perceptual-space-snapshot (reality-state-perceptual-space state))
             (jget step "perceptualSpaceIsDebugProjection") t)
       (record-trajectory state isre orev)
       (record-history state step)
@@ -1972,7 +1995,7 @@ on this surface."
                                                          (declare (ignore _ body query))
                                                          (json-response (actor-ask actor (lambda (state) (obj "running" +json-false+
                                                                                                              "dimension" (reality-state-dimension state)
-                                                                                                             "perceptualSpace" (vectorize (reality-state-perceptual-space state))))))))
+                                                                                                             "perceptualSpace" (perceptual-space-snapshot (reality-state-perceptual-space state))))))))
    (make-route "GET" "/api/perceptual-simulation/history" (lambda (_ body query)
                                                            (declare (ignore _ body query))
                                                            (json-response (actor-ask actor (lambda (state) (obj "history" (vectorize (reality-state-history state))))))))
@@ -2673,7 +2696,7 @@ on this surface."
                                                             (state-json (lambda (state)
                                                                           (obj "running" +json-false+
                                                                                "dimension" (reality-state-dimension state)
-                                                                               "perceptualSpace" (vectorize (reality-state-perceptual-space state)))))))
+                                                                               "perceptualSpace" (perceptual-space-snapshot (reality-state-perceptual-space state)))))))
      (make-route "GET" "/api/perceptual-simulation/history" (lambda (_ body query)
                                                               (declare (ignore _ body query))
                                                               (state-json (lambda (state)
