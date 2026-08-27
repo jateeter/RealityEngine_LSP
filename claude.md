@@ -31,6 +31,29 @@ make test
 make e2e-healthkit-spezi
 ```
 
+## Startup
+
+`start.sh` selects a launch path via `LSP_LAUNCH_MODE=binary|source|auto`
+(default `auto`):
+
+- **binary** — run `bin/reality-engine-lsp <mode>`, built by `make build`. Its
+  `main` dispatches `reality` / `perception` and supplies the idle loop.
+- **source** — load the system through Quicklisp at launch (the historical path).
+- **auto** — binary when it is present, executable and no older than any file
+  under `src/` or the `.asd`; otherwise source.
+
+`bin/` is gitignored, so a fresh clone takes the source fallback until someone
+runs `make build`. The banner reports which path was taken.
+
+`:force t` belongs to `build` and `test`, where a clean compile is the intent.
+It must not appear on a service launch path — there it is a latent full-system
+rebuild, three times per launch, the first time a runner comes up with a cold
+`~/.cache/common-lisp` (#62).
+
+Note for CI: LSP now has a launched artifact when the binary path is taken, so
+`RealityEngine_CI/scripts/verify-build-provenance.py` — which records LSP as
+"runs from source" — may need its expectation widened to accept either path.
+
 ## Runtime Contract
 
 - Keep RE/PE routes and payloads aligned with C++ and Scala.
