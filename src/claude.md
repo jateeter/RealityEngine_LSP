@@ -31,15 +31,46 @@ Reset means "start this run again", not "forget what is connected":
   read back, so an operator pause does not survive a reset (#65).
 - Reset is **membership-neutral** (contract point 4): it never creates a source
   and never removes one, and must never re-derive from boot config or the
-  corpus — that would drop every integration registered since boot. LSP
-  declaring 0 sources under `--pe-source-bootstrap=off` is correct and is the
-  behaviour the other runtimes are being corrected toward (#64, gap 1
-  withdrawn).
+  corpus — that would drop every integration registered since boot.
+
+  Note this is about *reset*, not about *boot*. An earlier revision of this file
+  claimed LSP declaring 0 sources under `--pe-source-bootstrap=off` was the
+  behaviour the other runtimes should be corrected toward. That was wrong in two
+  ways: LSP was declaring 0 sources under **every** setting, because it had no
+  boot intern path at all; and the correct default is to intern, not to skip.
+  See the section below.
 - Reset **leaves** dimension, match algorithm and auto-push settings alone.
   Those are configuration, not run state.
 - Removing a source stays a separate operation: `DELETE /api/sources/:id` and the
   corpus path that drops a machine's source when the machine leaves the dynamic
   corpus. Those are the intended way to forget a source.
+
+## Machine ingestion
+
+**Interning a machine's test source is part of ingesting the machine**, and it
+happens by default. `start-perception-service` interns the corpus test sources
+at boot — a machine's `inputSequences` become a test source over that machine's
+own input region — unless `PE_SOURCE_BOOTSTRAP` is `off`/`0`/`false`/`no`.
+
+Those sources are the material the **ISRE seed queue** is composed from: the
+seed at step n is the merge of every active test source's n-th vector, each
+written into its own machine's region. A runtime holding a corpus but no test
+sources has nothing to be presented with, and a parity comparison against it
+measures a synthetic stimulus rather than the corpus's own.
+
+This runtime previously had *no* boot intern path and depended on the launcher
+calling `POST /api/sources/bootstrap-from-machines` (#68). That POST remains the
+dynamic registration path and is unaffected by the flag.
+
+The intern is fire-and-forget through the actor: the RE may still be coming up
+when the PE binds, and the machine catalog refresher already retries. A failure
+is logged and deferred rather than taking the service down.
+
+Machine-derived test sources are the one source kind that does not wait for an
+external integration to register — they arrive with the machines. MQTT, ACP,
+MCP, HealthKit and localAI are external and register on their own terms.
+
+Master contract: `RealityEngine_CI/SURFACE_SPEC.md`, "Machine ingestion".
 
 ## PE source activity
 
