@@ -2546,6 +2546,30 @@ startup — the PE still serves HTTP signals as a pure REST engine."
     ;; Background machine catalog refresher — best-effort initial fetch + 60 s loop.
     ;; Starts before HTTP so the catalog is warm before the first push cycle.
     (start-machine-catalog-refresher state)
+    ;; Intern the corpus test sources — part of ingesting the machines, not an
+    ;; optional extra. A machine's `inputSequences` become a test source over
+    ;; its own region, and those sources are the material the ISRE seed queue is
+    ;; composed from; a runtime holding a corpus but no test sources has nothing
+    ;; to be presented with.
+    ;;
+    ;; This runtime previously had no boot path at all and only interned on
+    ;; POST /api/sources/bootstrap-from-machines, so it depended on the launcher
+    ;; remembering to call it. C++ read PE_SOURCE_BOOTSTRAP but defaulted off,
+    ;; and Scala seeded unconditionally while ignoring the flag — three
+    ;; runtimes, three post-boot source sets, before any comparison began
+    ;; (RealityEngine_Scala#63).
+    ;;
+    ;; PE_SOURCE_BOOTSTRAP=off suppresses it, which is what a harness driving
+    ;; its own per-iteration bootstrap wants (test-corpus-parity-loop.sh). The
+    ;; POST route is unaffected either way. Fire-and-forget through the actor:
+    ;; the RE may still be coming up, and the catalog refresher above retries.
+    (unless (member (string-downcase (env "PE_SOURCE_BOOTSTRAP" "auto"))
+                    '("off" "0" "false" "no") :test #'string=)
+      (actor-tell actor (lambda (st)
+                          (handler-case (bootstrap-test-sources-from-machines st)
+                            (error (e)
+                              (format *error-output*
+                                      "~&[perception] boot source intern deferred: ~a~%" e))))))
     ;; Boot the bridge after the actor is alive so the ingest closure can
     ;; tell-into it safely.  The bridge boot is fire-and-forget — if MQTT
     ;; isn't configured the PE still serves HTTP signals normally.
