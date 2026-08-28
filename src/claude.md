@@ -47,30 +47,18 @@ Reset means "start this run again", not "forget what is connected":
 
 ## Machine ingestion
 
-**Interning a machine's test source is part of ingesting the machine**, and it
-happens by default. `start-perception-service` interns the corpus test sources
-at boot — a machine's `inputSequences` become a test source over that machine's
-own input region — unless `PE_SOURCE_BOOTSTRAP` is `off`/`0`/`false`/`no`.
+Governed by the canonical contract, which lives in `RealityEngine_CI` and
+nowhere else:
 
-Those sources are the material the **ISRE seed queue** is composed from: the
-seed at step n is the merge of every active test source's n-th vector, each
-written into its own machine's region. A runtime holding a corpus but no test
-sources has nothing to be presented with, and a parity comparison against it
-measures a synthetic stimulus rather than the corpus's own.
+    RealityEngine_CI/SURFACE_SPEC.md  §  Machine ingestion
 
-This runtime previously had *no* boot intern path and depended on the launcher
-calling `POST /api/sources/bootstrap-from-machines` (#68). That POST remains the
-dynamic registration path and is unaffected by the flag.
+Do not restate it here. It defines what ingesting a machine interns, how
+`PE_SOURCE_BOOTSTRAP` gates it, and how those sources compose `ISRESeed(n)` —
+and it governs this repository's implementation of all three.
 
-The intern is fire-and-forget through the actor: the RE may still be coming up
-when the PE binds, and the machine catalog refresher already retries. A failure
-is logged and deferred rather than taking the service down.
-
-Machine-derived test sources are the one source kind that does not wait for an
-external integration to register — they arrive with the machines. MQTT, ACP,
-MCP, HealthKit and localAI are external and register on their own terms.
-
-Master contract: `RealityEngine_CI/SURFACE_SPEC.md`, "Machine ingestion".
+Implemented in `start-perception-service` (`perception-service.lisp`), which
+interns at boot through the actor. Fire-and-forget: the RE may still be coming
+up when the PE binds, and the catalog refresher retries (#68).
 
 ## PE source activity
 
