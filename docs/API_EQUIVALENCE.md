@@ -1,7 +1,7 @@
 # API Equivalence
 
 `RealityEngine_LSP` implements the same black-box HTTP contract used by
-`RealityEngine_AI` and `RealityEngine_CPP`.
+`RealityEngine_CPP` and `RealityEngine_Scala`.
 
 ## Reality Engine
 
