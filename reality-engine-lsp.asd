@@ -40,7 +40,8 @@
   :serial t
   :depends-on (#:reality-engine-lsp)
   :components ((:module "tests"
-                :components ((:file "core-tests"))))
+                :components ((:file "core-tests")
+                             (:file "oracle-parity-tests"))))
   :perform (asdf:test-op (op c)
              (declare (ignore op c))
              (uiop:symbol-call '#:reality-engine-lsp.tests '#:run-tests)))
