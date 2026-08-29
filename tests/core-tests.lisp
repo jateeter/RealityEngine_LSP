@@ -2589,5 +2589,9 @@ ever have seen."
   (output-merge-tests)
   (fold-placement-tests)
 
+  ;; The cesgen oracle set — see tests/oracle-parity-tests.lisp. Runs last:
+  ;; it walks the whole corpus and is by far the slowest check here.
+  (oracle-parity-tests)
+
   (format t "~&RealityEngine_LSP core tests passed.~%")
   t)
