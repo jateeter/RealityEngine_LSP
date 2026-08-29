@@ -17,7 +17,7 @@
   isre-history orev-history
   include-perceptual-space-p vector-store sequences qdrant-url collection-name started-at
   event-bus-subscriptions latched-event-bits step-count mapping-version
-  ;; CES coverage counters — mirror RealityEngine_AI/CesCoverageRegistry and
+  ;; CES coverage counters — mirror the canonical CesCoverageRegistry and
   ;; RealityEngine_CPP/CesCoverageRegistry so the same Prometheus scrape
   ;; config covers all three runtimes.  Keyed by tab-joined identifiers.
   cov-matched cov-activated cov-outputs cov-steps cov-paging cov-deprecated

@@ -1,5 +1,5 @@
 (asdf:defsystem #:reality-engine-lsp
-  :description "Common Lisp black-box equivalent runtime for RealityEngine_AI and RealityEngine_CPP."
+  :description "Common Lisp black-box equivalent runtime for RealityEngine_CPP and RealityEngine_Scala."
   :author "Reality Engine contributors"
   :license "MIT"
   :version "0.1.0"

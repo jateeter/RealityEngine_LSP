@@ -131,18 +131,20 @@
 ;; ── Cross-runtime parity helpers (AI + C++ + LSP must agree) ──────────────
 ;;
 ;; The same corpus walked by:
-;;   RealityEngine_AI/src/__tests__/AiTriggerDispatch.test.ts
 ;;   RealityEngine_CPP/tests/e2e_ai_trigger_dispatch.cpp
 ;; reports 1058/5126/4251/4251 (recursive walk incl. machines/domains/) — pinning the same counters here catches any
 ;; LSP-side drift in process-machine-input or resolve-governance.  And the
 ;; Yuma 3-tick cascade (AGX051→AGX055→AgYieldOptimizationAI) asserts the
 ;; same mergeBatch shapes both other runtimes already enforce.
 
-(defparameter +ai-machines-dir+
+;; The canonical corpus, and the only one. Two fallbacks into a deprecated
+;; TypeScript prototype's examples/machines/ are gone: that repository was
+;; frozen in June 2026, so a probe that found it would have run these tests
+;; against a corpus nobody maintains — silently, since a fallback that hits
+;; looks exactly like one that does not.
+(defparameter +corpus-machines-dir+
   (or (probe-file "../RealityEngine_Machines/machines/")
-      (probe-file "../../RealityEngine_Machines/machines/")
-      (probe-file "../RealityEngine_AI/examples/machines/")
-      (probe-file "../../RealityEngine_AI/examples/machines/")))
+      (probe-file "../../RealityEngine_Machines/machines/")))
 
 (defun reset-machine (machine)
   (dolist (sequence (reality-engine-lsp::machine-sequence-list machine))
@@ -409,7 +411,7 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
   (let ((state (reality-engine-lsp::make-reality-state
                 :dimension 0
                 :machines (make-hash-table :test #'equal)
-                :machine-dir (namestring +ai-machines-dir+)
+                :machine-dir (namestring +corpus-machines-dir+)
                 :perceptual-space (reality-engine-lsp::make-perceptual-space 0)
                 :history nil :history-limit 25
                 :include-machine-results-p t :include-perceptual-space-p t
@@ -433,7 +435,7 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                     "AGX055_yuma-facility-ai-synthesis-bridge.json"
                     "AgYieldOptimizationAI.json"))
       (reality-engine-lsp::put-machine state
-        (reality-engine-lsp::load-machine-from-file (reality-engine-lsp::resolve-machine-json-path +ai-machines-dir+ file))))
+        (reality-engine-lsp::load-machine-from-file (reality-engine-lsp::resolve-machine-json-path +corpus-machines-dir+ file))))
     state))
 
 (defun stage1-input (state tick-values)
@@ -2169,14 +2171,14 @@ ever have seen."
                        (find "humid" ingested-mappings :test #'string=))
                  "both fan-out mappings dispatched"))
 
-  ;; ── Cross-runtime parity (AI + C++ + LSP) ─────────────────────────────
-  ;; Skipped automatically when the AI corpus directory isn't sibling-located
-  ;; (e.g. CI runs that haven't checked out RealityEngine_AI).
+  ;; ── Cross-runtime parity (C++ + LSP + Scala) ──────────────────────────
+  ;; Skipped automatically when the corpus isn't sibling-located (e.g. CI runs
+  ;; that haven't checked out RealityEngine_Machines).
   (cond
-    ((null +ai-machines-dir+)
-     (format t "~&[parity] skipping — RealityEngine_AI/examples/machines not found alongside RealityEngine_LSP~%"))
+    ((null +corpus-machines-dir+)
+     (format t "~&[parity] skipping — RealityEngine_Machines/machines not found alongside RealityEngine_LSP~%"))
     (t
-     (let* ((result (walk-corpus-for-envelopes +ai-machines-dir+))
+     (let* ((result (walk-corpus-for-envelopes +corpus-machines-dir+))
             (machines  (getf result :machines))
             (sequences (getf result :sequences))
             (outputs   (getf result :outputs))
@@ -2188,19 +2190,18 @@ ever have seen."
            (format *error-output* "  - ~a~%" f)))
        (assert-equal nil failures "AiTriggerDispatch parity — corpus walk must produce no failures")
        ;; Counter parity — same numbers reported by:
-       ;;   RealityEngine_AI  AiTriggerDispatch.test.ts          (jest)
        ;;   RealityEngine_CPP e2e_ai_trigger_dispatch            (C++ exec)
-       (format t "~&[parity] LSP walked corpus: machines=~a sequences=~a outputs=~a envelopes=~a (AI/CPP target: 1058/5126/4251/4251)~%"
+       (format t "~&[parity] LSP walked corpus: machines=~a sequences=~a outputs=~a envelopes=~a (CPP target: 1058/5126/4251/4251)~%"
                machines sequences outputs envelopes)
-       (assert-equal 1058  machines  "AiTriggerDispatch parity — machinesWithTriggers != 1058 (AI/CPP value)")
-       (assert-equal 5126 sequences "AiTriggerDispatch parity — inputSequencesRun  != 5126 (AI/CPP value)")
-       (assert-equal 4251 outputs   "AiTriggerDispatch parity — outputsProduced    != 4251 (AI/CPP value)")
-       (assert-equal 4251 envelopes "AiTriggerDispatch parity — envelopesResolved  != 4251 (AI/CPP value)"))
+       (assert-equal 1058  machines  "AiTriggerDispatch parity — machinesWithTriggers != 1058 (CPP value)")
+       (assert-equal 5126 sequences "AiTriggerDispatch parity — inputSequencesRun  != 5126 (CPP value)")
+       (assert-equal 4251 outputs   "AiTriggerDispatch parity — outputsProduced    != 4251 (CPP value)")
+       (assert-equal 4251 envelopes "AiTriggerDispatch parity — envelopesResolved  != 4251 (CPP value)"))
 
      ;; PE dispatch parity — same corpus and counts, but exercised through the
      ;; PE-owned dispatch ledger path that records async bridge envelopes after
      ;; RE returns a mergeBatch.
-     (let* ((pe-result (walk-corpus-through-pe-dispatch +ai-machines-dir+))
+     (let* ((pe-result (walk-corpus-through-pe-dispatch +corpus-machines-dir+))
             (pe-state (getf pe-result :state))
             (machines  (getf pe-result :machines))
             (sequences (getf pe-result :sequences))
@@ -2224,7 +2225,7 @@ ever have seen."
 
      ;; AGX051 pin — urgent_maint resolves to aquaculture_predictive_maintenance_agent / RED / sla=900.
      (let* ((m (reality-engine-lsp::load-machine-from-file
-                (reality-engine-lsp::resolve-machine-json-path +ai-machines-dir+ "AGX051_yuma-aqua-maintenance-forecaster.json")))
+                (reality-engine-lsp::resolve-machine-json-path +corpus-machines-dir+ "AGX051_yuma-aqua-maintenance-forecaster.json")))
             (env (envelope-for m "agx-051-urgent-maint" '(1 0 0 0))))
        (assert-true env                                                                "AGX051 urgent_maint: envelope unresolved")
        (assert-equal "aquaculture_predictive_maintenance_agent"                        (reality-engine-lsp::jstring env "agent" "")       "AGX051 urgent_maint: dispatch agent")
@@ -2257,7 +2258,7 @@ ever have seen."
 
      ;; AGX055 pin — five sequences route to agriculture_yield_optimization_ai with matching RAG.
      (let ((m (reality-engine-lsp::load-machine-from-file
-               (reality-engine-lsp::resolve-machine-json-path +ai-machines-dir+ "AGX055_yuma-facility-ai-synthesis-bridge.json"))))
+               (reality-engine-lsp::resolve-machine-json-path +corpus-machines-dir+ "AGX055_yuma-facility-ai-synthesis-bridge.json"))))
        (dolist (case '(("agx-055-aqua-urgent"     (1 0 0 0 0 0 0 0 0 0 0 0) "RED")
                        ("agx-055-do-urgent"       (0 0 0 1 0 0 0 0 0 0 0 0) "RED")
                        ("agx-055-climate-urgent"  (0 0 0 0 0 0 1 0 0 0 0 0) "RED")
@@ -2287,8 +2288,8 @@ ever have seen."
 	           (assert-equal (third case) (reality-engine-lsp::jstring gov "ragStatusCode" "") (format nil "AGX055 PE ~a: ragStatusCode" (first case)))))))
 
      ;; Bridge perceptual contract — AGX055.output == AgYieldOptimizationAI.input == length 12.
-     (let* ((bridge-root (reality-engine-lsp::parse-json (reality-engine-lsp::safe-read-file (namestring (reality-engine-lsp::resolve-machine-json-path +ai-machines-dir+ "AGX055_yuma-facility-ai-synthesis-bridge.json")))))
-            (yield-root  (reality-engine-lsp::parse-json (reality-engine-lsp::safe-read-file (namestring (reality-engine-lsp::resolve-machine-json-path +ai-machines-dir+ "AgYieldOptimizationAI.json")))))
+     (let* ((bridge-root (reality-engine-lsp::parse-json (reality-engine-lsp::safe-read-file (namestring (reality-engine-lsp::resolve-machine-json-path +corpus-machines-dir+ "AGX055_yuma-facility-ai-synthesis-bridge.json")))))
+            (yield-root  (reality-engine-lsp::parse-json (reality-engine-lsp::safe-read-file (namestring (reality-engine-lsp::resolve-machine-json-path +corpus-machines-dir+ "AgYieldOptimizationAI.json")))))
             (bridge-out (reality-engine-lsp::jget (reality-engine-lsp::jget (reality-engine-lsp::jget bridge-root "machine") "perceptualMapping") "output"))
             (yield-in   (reality-engine-lsp::jget (reality-engine-lsp::jget (reality-engine-lsp::jget yield-root "machine") "perceptualMapping") "input")))
        (assert-equal (reality-engine-lsp::jnumber bridge-out "offset" nil) (reality-engine-lsp::jnumber yield-in "offset" nil) "bridge contract — output.offset != yield input.offset")

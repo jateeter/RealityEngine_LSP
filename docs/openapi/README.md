@@ -7,7 +7,7 @@ Two OpenAPI 3.0.3 documents describe the LSP runtime's HTTP surface.
 | [`reality-engine.yaml`](reality-engine.yaml)     | Reality Engine     | `http://localhost:5601` |
 | [`perception-engine.yaml`](perception-engine.yaml) | Perception Engine | `http://localhost:5600` |
 
-Wire-compatible with [`RealityEngine_AI`](../../../RealityEngine_AI/docs/openapi/)
+Wire-compatible with the historical TypeScript prototype
 (the default runtime) and [`RealityEngine_CPP`](../../../RealityEngine_CPP/docs/openapi/)
 — the same JSON corpus drives byte-identical merge ordering and identical
 Prometheus metrics shape; only the `runtime` label differs (this runtime
