@@ -1146,6 +1146,41 @@ they still do."
              (setf (aref (reality-state-perceptual-space state) bit) 1.0d0))
            (reality-state-latched-event-bits state)))
 
+(defun active-region-sort-key (r)
+  "Canonical sort key for one active region: offset, length, machineId, type."
+  (list (jnumber r "offset" 0)
+        (jnumber r "length" 0)
+        (jstring r "machineId" "")
+        (jstring r "type" "")))
+
+(defun active-region-key< (a b)
+  "Lexicographic compare of two ACTIVE-REGION-SORT-KEY lists."
+  (loop for x in a
+        for y in b
+        do (cond
+             ((and (numberp x) (/= x y)) (return (< x y)))
+             ((and (stringp x) (string/= x y)) (return (string< x y))))
+        finally (return nil)))
+
+(defun sort-active-regions (regions)
+  "Canonical ordering — offset, length, machineId, type (SURFACE_SPEC.md,
+\"Active regions\").
+
+The regions are accumulated by walking the machine table, and each runtime walks
+its own in its own order: all three reported the same fifteen regions in three
+different orders (#197). Because no two agreed byte-for-byte, the clustering in
+the universal-vectors stage never found a majority, and every divergence there
+reported as \"runtimes split evenly\" whatever the engines had actually done.
+
+`machineId' is in the key so the order is total. offset+length+type alone is
+not: two machines may share a region, which is precisely the contended case the
+arbiter exists for.
+
+Replaces an NREVERSE, which only undid the push order and carried no meaning."
+  (sort (copy-list regions)
+        #'active-region-key<
+        :key #'active-region-sort-key))
+
 (defun process-perceptual-input (state input &key override include-machine-results include-perceptual-space compact)
   ;; include-perceptual-space is accepted and ignored: SURFACE_SPEC.md makes
   ;; perceptualSpace unconditional in the push response. Kept in the lambda list
@@ -1388,7 +1423,7 @@ they still do."
                      "timestamp" (now-ms)
                      "mergeBatch" (vectorize merge-batch)
                      "eventBus" (vectorize event-bus)
-                     "activeRegions" (vectorize (nreverse active-regions)))))
+                     "activeRegions" (vectorize (sort-active-regions active-regions)))))
       (setf (reality-state-step-count state) (1+ step-number))
       (when include-machine-results
         (setf (jget step "machineResults") machine-results))

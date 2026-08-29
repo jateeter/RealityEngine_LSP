@@ -223,16 +223,23 @@ and its machine never receives input."
              ;; source shape — no other runtime exposes it.
              (jget out "loop") (json-bool (source-loop-p source))))
       ((string= (source-kind source) "sensor")
+       ;; `ageMs' and `stale' are deliberately absent (#176). They were emitted
+       ;; here and by the Manager TypeScript PE, but not by C++ or Scala, so
+       ;; GET /api/sources could not be byte-compared across runtimes and
+       ;; regression-reset-contract.py had to skip the comparison and say so.
+       ;;
+       ;; Nothing consumed them: the visualizer declared them optional in
+       ;; types.ts and never read either field. And since #175 made `active'
+       ;; report `stored AND validated', `active' already answers the question
+       ;; `stale' was added for — a sensor past its TTL reports inactive. A
+       ;; caller still wanting the arithmetic has `lastUpdated' and `ttlMs',
+       ;; both of which stay on the payload.
        (let* ((last-updated (or (source-last-updated source) 0))
-              (ttl (or (source-ttl-ms source) 5000))
-              (age (if (> last-updated 0) (- now last-updated) 0))
-              (stale-p (sensor-stale-p source now)))
+              (ttl (or (source-ttl-ms source) 5000)))
          (setf (jget out "sensorId") (or (source-sensor-id source) "")
                (jget out "lastValue") (vectorize (or (source-last-value source) nil))
                (jget out "lastUpdated") last-updated
-               (jget out "ttlMs") ttl
-               (jget out "ageMs") age
-               (jget out "stale") (json-bool stale-p))
+               (jget out "ttlMs") ttl)
          (when (source-origin source)
            (setf (jget out "origin") (source-origin source)))))
       (t
