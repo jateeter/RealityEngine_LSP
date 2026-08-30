@@ -2047,8 +2047,14 @@ on this surface."
                                                        (if input
                                                            (process-perceptual-input
                                                             state input
-                                                            :override (or (jstring body "matchAlgorithmOverride" nil)
-                                                                          (jstring body "matchAlgorithm" nil))
+                                                            ;; Only an explicit override overrides.
+                                                            ;; `matchAlgorithm' reports the algorithm in
+                                                            ;; effect; it is not an instruction to replace
+                                                            ;; every element's declared comparatorType, and
+                                                            ;; reading it as one made the corpus's per-element
+                                                            ;; matching semantics unreachable in normal
+                                                            ;; operation (RealityEngine_CI#201).
+                                                            :override (jstring body "matchAlgorithmOverride" nil)
                                                             :include-machine-results (jbool body "includeMachineResults"
                                                                                             (if (jbool body "compact" nil)
                                                                                                 nil
@@ -2838,8 +2844,10 @@ on this surface."
                                                           (if input
                                                               (let ((step (process-perceptual-input
                                                                            state input
-                                                                           :override (or (jstring body "matchAlgorithmOverride" nil)
-                                                                                         (jstring body "matchAlgorithm" nil))
+                                                                           ;; Only an explicit override overrides
+                                                                           ;; -- see the note on the other push
+                                                                           ;; path (RealityEngine_CI#201).
+                                                                           :override (jstring body "matchAlgorithmOverride" nil)
                                                                            :include-machine-results (jbool body "includeMachineResults"
                                                                                                            (if (jbool body "compact" nil)
                                                                                                                nil
