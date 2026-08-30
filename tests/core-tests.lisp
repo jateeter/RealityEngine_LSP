@@ -1883,9 +1883,24 @@ ever have seen."
     (let ((vec (reality-engine-lsp::assemble-perception-vector engine)))
       (assert-equal 0.7d0 (nth 0 vec) "fresh sensor contributes its value")
       (assert-equal 0.0d0 (nth 1 vec) "stale sensor contributes zero"))
+    ;; Derived freshness is NOT part of the sensor payload (#176). `ageMs` and
+    ;; `stale` were emitted here and by the Manager TypeScript PE, and by
+    ;; neither C++ nor Scala, so GET /api/sources could not be byte-compared
+    ;; across runtimes at all. They were removed rather than canonicalised:
+    ;; nothing consumed them, and `active` already answers what `stale` was for.
+    ;;
+    ;; This assertion still required them after that change, which is how it
+    ;; went red on main.
     (let ((js (reality-engine-lsp::source-json stale)))
-      (assert-true (reality-engine-lsp::jbool js "stale" nil) "stale sensor reports stale=true in JSON")
-      (assert-true (> (reality-engine-lsp::jnumber js "ageMs" 0) 0) "stale sensor reports positive ageMs"))
+      (assert-true (eq (reality-engine-lsp::jget js "stale" :missing) :missing)
+                   "sensor payload carries no `stale` key (SURFACE_SPEC.md, Sensor source payload)")
+      (assert-true (eq (reality-engine-lsp::jget js "ageMs" :missing) :missing)
+                   "sensor payload carries no `ageMs` key")
+      ;; What replaced them: a caller wanting the arithmetic has both operands.
+      (assert-true (> (reality-engine-lsp::jnumber js "lastUpdated" 0) 0)
+                   "lastUpdated stays on the payload")
+      (assert-true (> (reality-engine-lsp::jnumber js "ttlMs" 0) 0)
+                   "ttlMs stays on the payload"))
 
     ;; ── Reset validates activity, it does not assign it (#65) ─────────────
     ;; RealityEngine_CI#163 point 3. The expired sensor already contributed
