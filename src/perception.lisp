@@ -280,6 +280,40 @@ and its machine never receives input."
      :ttl-ms (or (jnumber json "ttlMs" nil) 5000)
      :origin (jstring json "origin" nil))))
 
+(defun derive-sensor-activity (source)
+  "Refuse to let a caller assert a sensor into activity it has not earned.
+
+An integration source's activity is always traceable to an ingress event:
+registration declares the source — completely, and inactive
+(RealityEngine_CI#163 point 2a) — and activity is earned by the first value
+(point 2b).  This runtime accepted whatever flag it was handed, so a caller
+could do what no integration could (RealityEngine_CI#199):
+
+    POST /api/sources {\"type\":\"sensor\",\"active\":true,...}  ->  active, never fed
+
+The rule is a conjunction, and the second term is \"has a value ever arrived\",
+not \"is that value still fresh\":
+
+    stored_active = requested_active AND (last-updated is set)
+
+Asking for T on a sensor that has never reported yields NIL.  Asking for NIL
+yields NIL whatever the value says, so a pause is honoured — activation is
+earned, deactivation is not.
+
+Freshness is deliberately not part of it.  Expiry is a read-time question:
+SOURCE-VALIDATED-ACTIVE-P demotes on the way out, and that separation is
+load-bearing — a sensor fed and then lapsed keeps its stored flag, so a later
+value revives it without anything having to re-establish it.  The Scala and
+TypeScript PEs use this same rule.  C++ derives from liveness instead and does
+write the demotion back; all three refuse to originate activity, which is the
+invariant, and differ only on whether storage or serialization owns expiry."
+  (when (string= (source-kind source) "sensor")
+    (setf (source-active-p source)
+          (and (source-active-p source)
+               (source-last-updated source)
+               t)))
+  source)
+
 (defun ensure-source-id (engine source)
   (unless (source-id source)
     (setf (source-id source) (make-id "source")))
@@ -295,6 +329,9 @@ and its machine never receives input."
                (or (source-name source) (source-id source))
                (region-offset region)
                (+ (region-offset region) (region-length region))))))
+  ;; Registration is where the invariant is enforced: every construction path
+  ;; funnels through here.
+  (derive-sensor-activity source)
   (setf (gethash (source-id source) (perception-engine-sources engine)) source)
   source)
 

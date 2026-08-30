@@ -2215,8 +2215,16 @@ it is accepted as an alternative to the body bridgeToken/token fields."
                                                                         (when source
                                                                           (when (jstring body "name" nil)
                                                                             (setf (source-name source) (jstring body "name")))
+                                                                          ;; A PATCH is a registration path like any
+                                                                          ;; other and may not assert a sensor into
+                                                                          ;; activity it has not earned (#199). The
+                                                                          ;; conjunction in DERIVE-SENSOR-ACTIVITY also
+                                                                          ;; makes a requested NIL final, so a pause is
+                                                                          ;; honoured — activation is earned,
+                                                                          ;; deactivation is not (RealityEngine_CPP#43).
                                                                           (when (not (eq (jget body "active" :missing) :missing))
-                                                                            (setf (source-active-p source) (jbool body "active" t)))
+                                                                            (setf (source-active-p source) (jbool body "active" t))
+                                                                            (derive-sensor-activity source))
                                                                           (source-json source)))))))
                                              (if result (json-response (obj "source" result)) (error-response "Source not found" 404)))))
    (make-route "POST" "/api/sources/bootstrap-from-machines" (lambda (_ body query)
