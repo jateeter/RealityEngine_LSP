@@ -12,7 +12,7 @@
 (defstruct mapping input output bits-per-element output-alphabet-top)
 (defstruct vector-element value comparator threshold)
 (defstruct output-vector id vector metadata timestamp provenance)
-(defstruct reality-vector
+(defstruct reality-event
   id elements initial-p active-p match-algorithm metadata next-ids output-vectors just-matched-p predecessor-chain)
 (defstruct (ces (:constructor make-ces) (:conc-name sequence-))
   id name metadata schema-version deprecated-at replaced-by vectors)
@@ -425,29 +425,29 @@ than guessing (MV-FOLD-REFUSES-P)."
        "timestamp" (or (output-vector-timestamp output) 0)
        "provenance" (vectorize (or (output-vector-provenance output) nil))))
 
-(defun reality-vector-json (vector)
-  (obj "id" (reality-vector-id vector)
-       "matchAlgorithm" (reality-vector-match-algorithm vector)
-       "elements" (vectorize (mapcar #'vector-element-json (reality-vector-elements vector)))
-       "state" (if (reality-vector-active-p vector) "active" "inactive")
-       "isActive" (json-bool (reality-vector-active-p vector))
-       "nextVectorIds" (vectorize (reality-vector-next-ids vector))
-       "outputVectors" (vectorize (mapcar #'output-vector-json (reality-vector-output-vectors vector)))
-       "isInitial" (json-bool (reality-vector-initial-p vector))
-       "wasJustMatched" (json-bool (reality-vector-just-matched-p vector))
-       "metadata" (or (reality-vector-metadata vector) (obj))))
+(defun reality-event-json (vector)
+  (obj "id" (reality-event-id vector)
+       "matchAlgorithm" (reality-event-match-algorithm vector)
+       "elements" (vectorize (mapcar #'vector-element-json (reality-event-elements vector)))
+       "state" (if (reality-event-active-p vector) "active" "inactive")
+       "isActive" (json-bool (reality-event-active-p vector))
+       "nextVectorIds" (vectorize (reality-event-next-ids vector))
+       "outputVectors" (vectorize (mapcar #'output-vector-json (reality-event-output-vectors vector)))
+       "isInitial" (json-bool (reality-event-initial-p vector))
+       "wasJustMatched" (json-bool (reality-event-just-matched-p vector))
+       "metadata" (or (reality-event-metadata vector) (obj))))
 
 (defun sequence-json (sequence &key full)
   (let* ((vectors (object-values-sorted (sequence-vectors sequence)))
-         (initials (remove-if-not #'reality-vector-initial-p vectors))
-         (outputs (remove-if-not (lambda (v) (reality-vector-output-vectors v)) vectors))
+         (initials (remove-if-not #'reality-event-initial-p vectors))
+         (outputs (remove-if-not (lambda (v) (reality-event-output-vectors v)) vectors))
          (out (obj "id" (sequence-id sequence)
                    "name" (sequence-name sequence)
                    "vectors" (if full
-                                 (vectorize (mapcar #'reality-vector-json vectors))
-                                 (vectorize (mapcar #'reality-vector-json vectors)))
-                   "initialVectorIds" (vectorize (mapcar #'reality-vector-id initials))
-                   "outputVectorIds" (vectorize (mapcar #'reality-vector-id outputs))
+                                 (vectorize (mapcar #'reality-event-json vectors))
+                                 (vectorize (mapcar #'reality-event-json vectors)))
+                   "initialVectorIds" (vectorize (mapcar #'reality-event-id initials))
+                   "outputVectorIds" (vectorize (mapcar #'reality-event-id outputs))
                    "metadata" (or (sequence-metadata sequence) (obj)))))
     (when (sequence-schema-version sequence)
       (setf (jget out "schemaVersion") (sequence-schema-version sequence)))
@@ -531,13 +531,13 @@ Omits sequences, vectors, and perceptualMapping to keep the response small."
          "perceptualMapping" (mapping-json (machine-mapping machine)))))
 
 (defun vector-provenance-chain (vector)
-  (append (or (reality-vector-predecessor-chain vector) nil)
-          (list (reality-vector-id vector))))
+  (append (or (reality-event-predecessor-chain vector) nil)
+          (list (reality-event-id vector))))
 
-(defun reset-reality-vector (vector)
-  (setf (reality-vector-active-p vector) (reality-vector-initial-p vector)
-        (reality-vector-just-matched-p vector) nil
-        (reality-vector-predecessor-chain vector) nil)
+(defun reset-reality-event (vector)
+  (setf (reality-event-active-p vector) (reality-event-initial-p vector)
+        (reality-event-just-matched-p vector) nil
+        (reality-event-predecessor-chain vector) nil)
   vector)
 
 (defun match-element (element input-value override &optional vector-match-algorithm)
@@ -587,8 +587,8 @@ was evaluated with the weaker predicate no matter what the loader recorded
                          0.0d0)))
          (values ok (clamp01 score)))))))
 
-(defun match-reality-vector (vector input &key override)
-  (let ((elements (reality-vector-elements vector)))
+(defun match-reality-event (vector input &key override)
+  (let ((elements (reality-event-elements vector)))
     (if (/= (length elements) (length input))
         (values nil 0.0d0 (obj "error" "Vector dimension mismatch"))
         (loop with total = 0.0d0
@@ -597,7 +597,7 @@ was evaluated with the weaker predicate no matter what the loader recorded
               for index from 0
               do (multiple-value-bind (ok score)
                      (match-element element actual override
-                                    (reality-vector-match-algorithm vector))
+                                    (reality-event-match-algorithm vector))
                    (unless ok
                      (return (values nil (/ total (max 1 (length elements)))
                                      (obj "failedAtIndex" index))))
@@ -605,11 +605,11 @@ was evaluated with the weaker predicate no matter what the loader recorded
               finally (return (values t (/ total (max 1 (length elements))) (obj)))))))
 
 (defun transition-vector (vector input &key override)
-  (multiple-value-bind (matched score metadata) (match-reality-vector vector input :override override)
+  (multiple-value-bind (matched score metadata) (match-reality-event vector input :override override)
     (unless matched
-      (unless (reality-vector-initial-p vector)
-        (setf (reality-vector-active-p vector) nil
-              (reality-vector-predecessor-chain vector) nil))
+      (unless (reality-event-initial-p vector)
+        (setf (reality-event-active-p vector) nil
+              (reality-event-predecessor-chain vector) nil))
       (return-from transition-vector
         (values nil nil nil score metadata nil)))
     (let* ((chain (vector-provenance-chain vector))
@@ -620,13 +620,13 @@ was evaluated with the weaker predicate no matter what the loader recorded
                                :metadata (or (output-vector-metadata out) (obj))
                                :timestamp (now-ms)
                                :provenance chain))
-                            (reality-vector-output-vectors vector)))
+                            (reality-event-output-vectors vector)))
            (final-p outputs)
-           (transitional-p (and (not (reality-vector-initial-p vector)) (not final-p))))
-      (when (and transitional-p (reality-vector-next-ids vector))
-        (setf (reality-vector-active-p vector) nil
-              (reality-vector-predecessor-chain vector) nil))
-      (values t (reality-vector-next-ids vector) outputs score metadata chain))))
+           (transitional-p (and (not (reality-event-initial-p vector)) (not final-p))))
+      (when (and transitional-p (reality-event-next-ids vector))
+        (setf (reality-event-active-p vector) nil
+              (reality-event-predecessor-chain vector) nil))
+      (values t (reality-event-next-ids vector) outputs score metadata chain))))
 
 (defun transition-sequence (sequence input &key override)
   (let ((matched nil)
@@ -635,25 +635,25 @@ was evaluated with the weaker predicate no matter what the loader recorded
         (pending (make-hash-table :test #'equal)))
     (maphash (lambda (_ vector)
                (declare (ignore _))
-               (setf (reality-vector-just-matched-p vector) nil))
+               (setf (reality-event-just-matched-p vector) nil))
              (sequence-vectors sequence))
-    (dolist (vector (remove-if-not #'reality-vector-active-p (object-values-sorted (sequence-vectors sequence))))
+    (dolist (vector (remove-if-not #'reality-event-active-p (object-values-sorted (sequence-vectors sequence))))
       (multiple-value-bind (ok next-ids emitted _score _metadata chain)
           (transition-vector vector input :override override)
         (declare (ignore _score _metadata))
         (when ok
-          (push (reality-vector-id vector) matched)
-          (when (reality-vector-output-vectors vector)
-            (setf (reality-vector-just-matched-p vector) t))
+          (push (reality-event-id vector) matched)
+          (when (reality-event-output-vectors vector)
+            (setf (reality-event-just-matched-p vector) t))
           (dolist (next-id next-ids)
             (unless (gethash next-id pending)
               (setf (gethash next-id pending) chain)))
           (setf outputs (append outputs emitted)))))
     (maphash (lambda (id chain)
                (let ((next (gethash id (sequence-vectors sequence))))
-                 (when (and next (not (reality-vector-active-p next)))
-                   (setf (reality-vector-active-p next) t
-                         (reality-vector-predecessor-chain next) chain)
+                 (when (and next (not (reality-event-active-p next)))
+                   (setf (reality-event-active-p next) t
+                         (reality-event-predecessor-chain next) chain)
                    (push id activated))))
              pending)
     (obj "matchedVectors" (vectorize (nreverse matched))
@@ -664,7 +664,7 @@ was evaluated with the weaker predicate no matter what the loader recorded
 (defun reset-sequence (sequence)
   (maphash (lambda (_ vector)
              (declare (ignore _))
-             (reset-reality-vector vector))
+             (reset-reality-event vector))
            (sequence-vectors sequence))
   sequence)
 

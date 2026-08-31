@@ -521,7 +521,7 @@ unfiredSequences, unfiredVectors).  Mirrors AI snapshot.perMachine."
             (lambda (_ v)
               (declare (ignore _))
               (incf vec-total)
-              (let ((vk (coverage-key mid mname (sequence-id seq) (reality-vector-id v))))
+              (let ((vk (coverage-key mid mname (sequence-id seq) (reality-event-id v))))
                 (when (or (gethash vk (reality-state-cov-matched state))
                           (gethash vk (reality-state-cov-activated state)))
                   (incf vec-fired))))
@@ -1441,7 +1441,7 @@ Replaces an NREVERSE, which only undid the push order and carried no meaning."
       (when include-machine-results
         (setf (jget step "machineResults") machine-results))
       ;; Always present, compact or not. This was gated on
-      ;; include-perceptual-space, so a compact push returned no reality vector
+      ;; include-perceptual-space, so a compact push returned no Reality Event
       ;; at all — the engine computed the right answer and did not report it,
       ;; which is what the cross-runtime parity stage read as divergence
       ;; (RealityEngine_Scala#43).
@@ -1456,7 +1456,7 @@ Replaces an NREVERSE, which only undid the push order and carried no meaning."
     (dolist (machine (object-values-sorted (reality-state-machines state)))
       (dolist (sequence (machine-sequence-list machine))
         (dolist (vector (object-values-sorted (sequence-vectors sequence)))
-          (when (reality-vector-active-p vector)
+          (when (reality-event-active-p vector)
             (push (obj "machineId" (machine-id machine)
                        "sequenceId" (sequence-id sequence)
                        "vector" (active-vector-json vector))
@@ -1464,21 +1464,21 @@ Replaces an NREVERSE, which only undid the push order and carried no meaning."
     (vectorize (nreverse rows))))
 
 (defun active-vector-json (vector)
-  (obj "elements" (vectorize (mapcar #'vector-element-json (reality-vector-elements vector)))
-       "id" (reality-vector-id vector)
-       "isActive" (json-bool (reality-vector-active-p vector))
-       "isInitial" (json-bool (reality-vector-initial-p vector))
-       "matchAlgorithm" (reality-vector-match-algorithm vector)
-       "metadata" (or (reality-vector-metadata vector) (obj))
-       "nextVectorIds" (vectorize (reality-vector-next-ids vector))
+  (obj "elements" (vectorize (mapcar #'vector-element-json (reality-event-elements vector)))
+       "id" (reality-event-id vector)
+       "isActive" (json-bool (reality-event-active-p vector))
+       "isInitial" (json-bool (reality-event-initial-p vector))
+       "matchAlgorithm" (reality-event-match-algorithm vector)
+       "metadata" (or (reality-event-metadata vector) (obj))
+       "nextVectorIds" (vectorize (reality-event-next-ids vector))
        "outputVectors" (vectorize
                         (mapcar (lambda (output)
                                   (obj "id" (output-vector-id output)
                                        "metadata" (or (output-vector-metadata output) (obj))
                                        "vector" (vectorize (output-vector-vector output))))
-                                (reality-vector-output-vectors vector)))
-       "state" (if (reality-vector-active-p vector) "active" "inactive")
-       "wasJustMatched" (json-bool (reality-vector-just-matched-p vector))))
+                                (reality-event-output-vectors vector)))
+       "state" (if (reality-event-active-p vector) "active" "inactive")
+       "wasJustMatched" (json-bool (reality-event-just-matched-p vector))))
 
 (defun semantic-bus-registry-path (machine-dir)
   (let ((explicit (env "SEMANTIC_BUS_REGISTRY" nil)))
@@ -2694,11 +2694,11 @@ on this surface."
                                                                                   (let ((seq (gethash (gethash "id" params)
                                                                                                       (reality-state-sequences state))))
                                                                                     (when seq
-                                                                                      (let ((vector (parse-reality-vector body)))
-                                                                                        (setf (gethash (reality-vector-id vector)
+                                                                                      (let ((vector (parse-reality-event body)))
+                                                                                        (setf (gethash (reality-event-id vector)
                                                                                                        (sequence-vectors seq))
                                                                                               vector)
-                                                                                        (obj "success" t "vector" (reality-vector-json vector)))))))))
+                                                                                        (obj "success" t "vector" (reality-event-json vector)))))))))
                                                          (if result (json-response result) (error-response "Sequence not found" 404)))))
      (make-route "POST" "/api/machines/:id/process" (lambda (params body query)
                                                       (declare (ignore query))
