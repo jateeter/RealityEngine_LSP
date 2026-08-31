@@ -440,7 +440,7 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
 
 (defun stage1-input (state tick-values)
   "Build the stage-1 input vector: zero-fill to dim, then write the tier-1
-   sensor regions.  The simulator overwrites the entire perceptual space
+   sensor regions.  The engine overwrites the entire perceptual space
    with this input every call, so AGX052-054 sensors must be re-driven on
    every tick of the AGX051 escalation."
   (let* ((dim (reality-engine-lsp::reality-state-dimension state))
