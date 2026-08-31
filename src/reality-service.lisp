@@ -14,7 +14,7 @@
   engine-history
   ;; Trajectory histories — see SURFACE_SPEC.md, "Trajectory histories".
   ;; Oldest-first, capped at +trajectory-capacity+.
-  isre-history orev-history
+  isre-history osre-history
   include-perceptual-space-p vector-store sequences qdrant-url collection-name started-at
   event-bus-subscriptions latched-event-bits step-count mapping-version
   ;; CES coverage counters — mirror the canonical CesCoverageRegistry and
@@ -177,7 +177,7 @@ with two more O(n) LENGTH calls."
            :history nil
            :engine-history nil
            :isre-history nil
-           :orev-history nil
+           :osre-history nil
            :history-limit (env-int "RE_HISTORY_LIMIT" 250)
            :include-machine-results-p (env-bool "RE_INCLUDE_MACHINE_RESULTS" t)
            :include-perceptual-space-p (env-bool "RE_INCLUDE_PERCEPTUAL_SPACE" t)
@@ -241,18 +241,18 @@ with two more O(n) LENGTH calls."
          "length" (length dense)
          "nonZero" (vectorize (nreverse cells)))))
 
-;; Appends ISRE(n) and OREV(n) together. They are captured at their own
+;; Appends ISRE(n) and OSRE(n) together. They are captured at their own
 ;; observation points inside the step and recorded in one action, so no observer
 ;; can see a step whose trajectories are half-written.
 ;;
 ;; Oldest-first. The step history is newest-first because it is read as "what
 ;; just happened"; these are read as sequences to be compared element by element,
 ;; and the index of the first disagreement is the answer they exist to give.
-(defun record-trajectory (state isre orev)
+(defun record-trajectory (state isre osre)
   (setf (reality-state-isre-history state)
         (last (append (reality-state-isre-history state) (list isre)) +trajectory-capacity+)
-        (reality-state-orev-history state)
-        (last (append (reality-state-orev-history state) (list orev)) +trajectory-capacity+)))
+        (reality-state-osre-history state)
+        (last (append (reality-state-osre-history state) (list osre)) +trajectory-capacity+)))
 
 ;; Ascending stepNumber. `from` is the first stepNumber to include; `limit` caps
 ;; the entries returned from there (0 or nil = all).
@@ -309,7 +309,7 @@ with two more O(n) LENGTH calls."
         (reality-state-history state) nil
         (reality-state-engine-history state) nil
         (reality-state-isre-history state) nil
-        (reality-state-orev-history state) nil
+        (reality-state-osre-history state) nil
         (reality-state-latched-event-bits state) (make-hash-table :test #'equal)
         (reality-state-step-count state) 0)
   ;; CES coverage deliberately survives the reset.
@@ -1228,7 +1228,7 @@ Replaces an NREVERSE, which only undid the push order and carried no meaning."
   ;; merged in; the gap between this and the seed is what arbitration did.
   (let ((isre (sparse-trajectory (reality-state-step-count state)
                                  (reality-state-perceptual-space state)))
-        (orev nil)
+        (osre nil)
         (machine-results (make-hash-table :test #'equal))
         (merge-batch nil)
         ;; One record per machine that completed at least one Reality Event,
@@ -1396,7 +1396,7 @@ Replaces an NREVERSE, which only undid the push order and carried no meaning."
                 active-regions)))
       (multiple-value-bind (resolved records)
           (resolve-all by-cell (reality-state-step-count state))
-        ;; OREV(n) observation point. The corpus's output for this step exists as
+        ;; OSRE(n) observation point. The corpus's output for this step exists as
         ;; a single-valued vector at exactly one instant: after resolution, as it
         ;; is committed. Recording it in the same loop as the writes is what makes
         ;; the entry and the space agree by construction rather than by a later
@@ -1409,7 +1409,7 @@ Replaces an NREVERSE, which only undid the push order and carried no meaning."
                                 (list (cdr pair))))
             (unless (zerop (cdr pair))
               (push (obj "index" (car pair) "value" (cdr pair)) cells)))
-          (setf orev (obj "stepNumber" (reality-state-step-count state)
+          (setf osre (obj "stepNumber" (reality-state-step-count state)
                           "length" (length (reality-state-perceptual-space state))
                           "nonZero" (vectorize (sort (nreverse cells) #'<
                                                      :key (lambda (c) (jnumber c "index" 0)))))))
@@ -1447,7 +1447,7 @@ Replaces an NREVERSE, which only undid the push order and carried no meaning."
       ;; (RealityEngine_Scala#43).
       (setf (jget step "perceptualSpace") (perceptual-space-snapshot (reality-state-perceptual-space state))
             (jget step "perceptualSpaceIsDebugProjection") t)
-      (record-trajectory state isre orev)
+      (record-trajectory state isre osre)
       (record-history state step)
       step)))
 
@@ -1861,13 +1861,13 @@ on this surface."
                                                                                                   0 (min limit (length (reality-state-engine-history state))))
                                                                                           (reality-state-engine-history state))))))))))
    ;; Trajectory histories — SURFACE_SPEC.md, "Trajectory histories".
-   (make-route "GET" "/api/engine/orev-history" (lambda (_ body query)
+   (make-route "GET" "/api/engine/osre-history" (lambda (_ body query)
                                                   (declare (ignore _ body))
                                                   (json-response
                                                    (actor-ask actor
                                                               (lambda (state)
                                                                 (obj "history" (trajectory-window
-                                                                                (reality-state-orev-history state)
+                                                                                (reality-state-osre-history state)
                                                                                 (or (parse-integer (or (gethash "from" query) "0") :junk-allowed t) 0)
                                                                                 (parse-integer (or (gethash "limit" query) "0") :junk-allowed t))))))))
    (make-route "GET" "/api/engine/isre-history" (lambda (_ body query)
@@ -2287,11 +2287,11 @@ on this surface."
                                                (declare (ignore _ body query))
                                                (state-json (lambda (state) (obj "history" (vectorize (reality-state-engine-history state)))))))
      ;; Trajectory histories — SURFACE_SPEC.md, "Trajectory histories".
-     (make-route "GET" "/api/engine/orev-history" (lambda (_ body query)
+     (make-route "GET" "/api/engine/osre-history" (lambda (_ body query)
                                                     (declare (ignore _ body))
                                                     (state-json (lambda (state)
                                                                   (obj "history" (trajectory-window
-                                                                                  (reality-state-orev-history state)
+                                                                                  (reality-state-osre-history state)
                                                                                   (or (parse-integer (or (gethash "from" query) "0") :junk-allowed t) 0)
                                                                                   (parse-integer (or (gethash "limit" query) "0") :junk-allowed t)))))))
      (make-route "GET" "/api/engine/isre-history" (lambda (_ body query)
