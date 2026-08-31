@@ -311,13 +311,26 @@ with two more O(n) LENGTH calls."
         (reality-state-isre-history state) nil
         (reality-state-orev-history state) nil
         (reality-state-latched-event-bits state) (make-hash-table :test #'equal)
-        (reality-state-step-count state) 0
-        (reality-state-cov-matched    state) (make-hash-table :test #'equal)
-        (reality-state-cov-activated  state) (make-hash-table :test #'equal)
-        (reality-state-cov-outputs    state) (make-hash-table :test #'equal)
-        (reality-state-cov-steps      state) (make-hash-table :test #'equal)
-        (reality-state-cov-paging     state) (make-hash-table :test #'equal)
-        (reality-state-cov-deprecated state) (make-hash-table :test #'equal))
+        (reality-state-step-count state) 0)
+  ;; CES coverage deliberately survives the reset.
+  ;;
+  ;; It answers "has this sequence EVER emitted output" — the help text says
+  ;; "never emitted output", and C++ agrees by construction: CesCoverageRegistry
+  ;; has a reset() and nothing calls it, so its counters are cumulative for the
+  ;; life of the process.
+  ;;
+  ;; Clearing them here made the metric useless under any harness that resets
+  ;; between iterations, which is what the corpus parity loop does. Coverage
+  ;; started empty every iteration, only the sequences firing within that
+  ;; iteration's steps were recorded, and `ces_unfired_sequences` climbed toward
+  ;; the sequence total as the corpus grew — 1661 of 1661 at 372 machines, while
+  ;; C++ held at 33. On "Unfired Critical Event Sequences by runtime" that is a
+  ;; line rising monotonically with corpus size against a flat one
+  ;; (RealityEngine_CI#215).
+  ;;
+  ;; Reset clears what a run accumulates — step count, histories, the perceptual
+  ;; space, per-vector activation. Coverage is not that: it is a record of what
+  ;; the corpus has been shown to do, and a reset does not un-show it.
   state)
 
 ;; ── CES coverage helpers ────────────────────────────────────────────────────
