@@ -19,7 +19,7 @@
 ;;;              engine, and the merged vector — the next InputSpaceVector —
 ;;;              diverged. Seen on AgHarvestReadinessAssessor, whose output
 ;;;              [3967:3971] overlaps AGX055's [3959:3971]: ISRE cell 3968 read
-;;;              1.0 on C++/LSP and 0.0 on Scala while every OREV agreed
+;;;              1.0 on C++/LSP and 0.0 on Scala while every OSRE agreed
 ;;;              (RealityEngine_CI corpus parity sweep, 2026-08-19).
 ;;;
 ;;; This is a thin, stateless function so the aggregation restriction (all machine
