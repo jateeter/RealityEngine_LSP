@@ -302,7 +302,7 @@ RealityEngine_LSP implements only the PE bridge contract:
   each sample through the same PE source path as `/api/signals`.
 
 RE does not talk to CareKit directly. CareKit state affects RE only when PE
-aggregates the mapped CareKit source into an input-space reality vector.
+aggregates the mapped CareKit source into an input-space Reality Event.
 
 ### localAIStack GraphQL
 

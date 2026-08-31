@@ -159,8 +159,8 @@
    :timestamp (or (jnumber item "timestamp" nil) 0)
    :provenance (jarray-list (or (jget item "provenance") (arr)))))
 
-(defun parse-reality-vector (item &optional machine-match-algorithm)
-  "Parse one reality vector.
+(defun parse-reality-event (item &optional machine-match-algorithm)
+  "Parse one Reality Event.
 
 MACHINE-MATCH-ALGORITHM, when supplied, wins over anything on the vector
 itself.  That is what C++ does -- `rv.matchAlgorithm = machine.matchAlgorithm`
@@ -178,7 +178,7 @@ from a request body with no machine in scope."
          (elements (mapcar #'parse-vector-element (jarray-list (or (jget item "elements") (arr)))))
          (next-ids (mapcar #'princ-to-string (jarray-list (or (jget item "nextVectorIds") (arr)))))
          (outputs (mapcar #'parse-output-vector (jarray-list (or (jget item "outputVectors") (arr))))))
-    (make-reality-vector :id id
+    (make-reality-event :id id
                          :elements elements
                          :initial-p initial-p
                          ;; Honour a serialised isActive when the document
@@ -216,8 +216,8 @@ from a request body with no machine in scope."
                             :replaced-by (jstring item "replacedBy" nil)
                             :vectors nil)))
     (dolist (vector-json (jarray-list (or (jget item "vectors") (arr))))
-      (let ((vector (parse-reality-vector vector-json machine-match-algorithm)))
-        (setf (gethash (reality-vector-id vector) vectors) vector)))
+      (let ((vector (parse-reality-event vector-json machine-match-algorithm)))
+        (setf (gethash (reality-event-id vector) vectors) vector)))
     (setf (sequence-vectors sequence) vectors)
     sequence))
 
