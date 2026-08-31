@@ -542,7 +542,7 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                  (format out "# HELP ~a ~a~%# TYPE ~a ~a~%" name help name type))
                (emit (name labels value)
                  (format out "~a~a ~a~%" name (prom-labels labels) value)))
-          (emit-help "ces_machines_total"  "Number of machines registered with the simulator." "gauge")
+          (emit-help "ces_machines_total"  "Number of machines loaded into the reality engine." "gauge")
           (emit "ces_machines_total" base machines)
           (emit-help "ces_sequences_total" "Number of sequences across all registered machines." "gauge")
           (emit "ces_sequences_total" base sequences)
@@ -1672,7 +1672,7 @@ on this surface."
                   "metadata" (or (machine-metadata machine) (obj)))
              nodes)))
     ;; Edges: source output region overlaps target input region.
-    ;; Mirrors Scala PerceptualSpaceSimulator.rebuildEdgeCache — interval
+    ;; Mirrors Scala PerceptualSpaceRuntime.rebuildEdgeCache — interval
     ;; intersection test, one directed edge per overlapping (source, target) pair.
     ;; Canonical order here too — edges are pushed, so iterate reversed to end
     ;; up ordered, and the (source, target) pair order becomes deterministic
