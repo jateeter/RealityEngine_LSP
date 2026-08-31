@@ -326,7 +326,7 @@ with two more O(n) LENGTH calls."
   ;; the sequence total as the corpus grew — 1661 of 1661 at 372 machines, while
   ;; C++ held at 33. On "Unfired Critical Event Sequences by runtime" that is a
   ;; line rising monotonically with corpus size against a flat one
-  ;; (RealityEngine_CI#215).
+  ;; (RealityEngine_CI#218).
   ;;
   ;; Reset clears what a run accumulates — step count, histories, the perceptual
   ;; space, per-vector activation. Coverage is not that: it is a record of what
