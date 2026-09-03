@@ -31,6 +31,25 @@
   (declare (ignore default))
   (setf (gethash (string key) object) value))
 
+(defun jget-either (object canonical legacy &optional default)
+  "One observation, two spellings, during the Reality Event rename.
+
+Request bodies name the same value INPUTEVENT or INPUTVECTOR depending on how
+old the caller is, and an engine accepting only one breaks every caller still
+sending the other (RealityEngine_CI#220 layer 2).
+
+CANONICAL is tried first, so a client emitting both during its own transition
+is read as the new one. Absent covers both NIL and +JSON-NULL+: a decoded JSON
+null arrives as :NULL here, so checking NIL alone would treat an explicit
+\"inputEvent\": null as a value and never consult the legacy spelling.
+
+Deleted when the rename completes, along with the old spelling at every call
+site. Until then a request carrying the old name is not an error."
+  (let ((value (jget object canonical)))
+    (if (or (null value) (eq value +json-null+))
+        (jget object legacy default)
+        value)))
+
 (defun jobject-p (value)
   (hash-table-p* value))
 
