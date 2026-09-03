@@ -23,6 +23,27 @@ This repo contains the Common Lisp Reality Engine and Perception Engine implemen
 - `docs/`: docs and API references.
 - `quicklisp/`: local dependency environment.
 
+## Building
+
+**Builds are controlled through `RealityEngine_CI`, not from here.** This repo is
+an independent git repository, not a subproject of CI or of any other engine.
+Read the contract before building or deploying:
+
+    RealityEngine_CI/docs/BUILD_CONTROL_CONTRACT.md
+
+```bash
+cd ../RealityEngine_CI && ./scripts/regression-test.sh --build-only
+```
+
+Quicklisp is bootstrapped by the harness, not by the caller's environment:
+`quicklisp/` is untracked, so a cold-start worktree never has it, and
+`make build` dies with "Missing Quicklisp" without
+`scripts/bootstrap-quicklisp.sh --home` having run first. The harness does this
+itself so every lane is self-sufficient.
+
+This engine has no compiled artifact — SBCL loads the `.lisp` files at start —
+so the provenance gate checks its git state rather than an artifact mtime.
+
 ## Key Commands
 
 ```bash
