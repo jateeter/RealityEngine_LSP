@@ -2101,7 +2101,7 @@ on this surface."
               (first-seq (first input-seqs-list))
               (input-vector-count
                (if first-seq
-                   (length (jarray-list (or (jget-either first-seq "events" "vectors") #())))
+                   (length (jarray-list (or (jget first-seq "events") #())))
                    0))
               (meta-response
                (let ((result (make-hash-table :test #'equal)))
@@ -2760,7 +2760,7 @@ on this surface."
                                                                        (state-json (lambda (state)
                                                                                      (when (jbool body "reset" nil)
                                                                                        (setf (reality-state-sim-buffer state) nil))
-                                                                                     (dolist (v (jarray-list (or (jget-either body "events" "vectors") (arr))))
+                                                                                     (dolist (v (jarray-list (or (jget body "events") (arr))))
                                                                                        (push (numbers-from-json v) (reality-state-sim-buffer state)))
                                                                                      (let ((cfg (or (and (jobject-p (jget body "config")) (jget body "config")) body)))
                                                                                        (when (jobject-p (jget cfg "inputRegion"))

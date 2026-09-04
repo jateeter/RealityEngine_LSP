@@ -237,7 +237,7 @@ these assertions compare the numbers rather than their representation."
                              (seq-meta (reality-engine-lsp::jget seq-json "metadata"))
                              (scenario (reality-engine-lsp::jstring seq-meta "scenario" ""))
                              (expected-count (reality-engine-lsp::jnumber seq-meta "expectedOutputCount" nil))
-                             (vectors-json (reality-engine-lsp::jget-either seq-json "events" "events")))
+                             (vectors-json (reality-engine-lsp::jget seq-json "events")))
                         ;; Baseline sequences (expectedOutputCount: 0) intentionally do not fire.
                         ;; Same skip applied by the AI + C++ tests.  Use cond, NOT
                         ;; (return) — `return` from a dolist exits the entire loop and
@@ -359,7 +359,7 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                       (incf sequences)
                       (let* ((seq-meta (reality-engine-lsp::jget seq-json "metadata"))
                              (expected-count (reality-engine-lsp::jnumber seq-meta "expectedOutputCount" nil))
-                             (vectors-json (reality-engine-lsp::jget-either seq-json "events" "events")))
+                             (vectors-json (reality-engine-lsp::jget seq-json "events")))
                         (cond
                           ((eql expected-count 0) nil)
                           ((not (reality-engine-lsp::jarray-p vectors-json))

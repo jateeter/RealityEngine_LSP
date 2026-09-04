@@ -358,7 +358,7 @@ Per-sequence boundaries live in metadata.segments for UI display."
                 (t
                  (let ((concat-inputs nil) (segments nil))
                    (dolist (seq input-sequences)
-                     (let ((vectors (jarray-list (or (jget-either seq "events" "vectors") (arr))))
+                     (let ((vectors (jarray-list (or (jget seq "events") (arr))))
                            (seq-name (or (jstring seq "name" nil) "Test sequence")))
                        (when vectors
                          (push (obj "name" seq-name "length" (length vectors)) segments)
