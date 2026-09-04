@@ -60,14 +60,14 @@
                   (reality-engine-lsp::obj
                    "id" sequence-id
                    "name" sequence-id
-                   "vectors" (reality-engine-lsp::vectorize
+                   "events" (reality-engine-lsp::vectorize
                               (list
                                (reality-engine-lsp::obj
                                 "id" (format nil "~a-vector" sequence-id)
                                 "isInitial" t
                                 "elements" (reality-engine-lsp::vectorize
                                             (list (reality-engine-lsp::obj "value" 1 "threshold" 0.5)))
-                                "outputVectors" (reality-engine-lsp::vectorize
+                                "outputEvents" (reality-engine-lsp::vectorize
                                                  (list
                                                   (reality-engine-lsp::obj
                                                    "id" (format nil "~a-out" sequence-id)
@@ -105,7 +105,7 @@
                             (reality-engine-lsp::obj
                              "id" "sta-seq"
                              "name" "STA Sequence"
-                             "vectors" (reality-engine-lsp::vectorize
+                             "events" (reality-engine-lsp::vectorize
                                         (list
                                          (reality-engine-lsp::obj
                                           "id" "sta-a"
@@ -114,7 +114,7 @@
                                                       (list
                                                        (reality-engine-lsp::obj "value" 0 "threshold" 0.5)
                                                        (reality-engine-lsp::obj "value" 0 "threshold" 0.5)))
-                                          "nextVectorIds" (reality-engine-lsp::vectorize (list "sta-b")))
+                                          "nextEventIds" (reality-engine-lsp::vectorize (list "sta-b")))
                                          (reality-engine-lsp::obj
                                           "id" "sta-b"
                                           "isInitial" nil
@@ -122,7 +122,7 @@
                                                       (list
                                                        (reality-engine-lsp::obj "value" 1 "threshold" 0.5)
                                                        (reality-engine-lsp::obj "value" (if clean 0 1) "threshold" 0.5)))
-                                          "outputVectors" (reality-engine-lsp::vectorize
+                                          "outputEvents" (reality-engine-lsp::vectorize
                                                            (list
                                                             (reality-engine-lsp::obj
                                                              "id" "sta-out"
@@ -237,7 +237,7 @@ these assertions compare the numbers rather than their representation."
                              (seq-meta (reality-engine-lsp::jget seq-json "metadata"))
                              (scenario (reality-engine-lsp::jstring seq-meta "scenario" ""))
                              (expected-count (reality-engine-lsp::jnumber seq-meta "expectedOutputCount" nil))
-                             (vectors-json (reality-engine-lsp::jget-either seq-json "events" "vectors")))
+                             (vectors-json (reality-engine-lsp::jget-either seq-json "events" "events")))
                         ;; Baseline sequences (expectedOutputCount: 0) intentionally do not fire.
                         ;; Same skip applied by the AI + C++ tests.  Use cond, NOT
                         ;; (return) — `return` from a dolist exits the entire loop and
@@ -359,7 +359,7 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
                       (incf sequences)
                       (let* ((seq-meta (reality-engine-lsp::jget seq-json "metadata"))
                              (expected-count (reality-engine-lsp::jnumber seq-meta "expectedOutputCount" nil))
-                             (vectors-json (reality-engine-lsp::jget-either seq-json "events" "vectors")))
+                             (vectors-json (reality-engine-lsp::jget-either seq-json "events" "events")))
                         (cond
                           ((eql expected-count 0) nil)
                           ((not (reality-engine-lsp::jarray-p vectors-json))
@@ -683,14 +683,14 @@ replaces the first."
   (reality-engine-lsp::obj
    "id" sequence-id
    "name" sequence-id
-   "vectors" (reality-engine-lsp::vectorize
+   "events" (reality-engine-lsp::vectorize
               (list
                (reality-engine-lsp::obj
                 "id" (format nil "~a-vector" sequence-id)
                 "isInitial" t
                 "elements" (reality-engine-lsp::vectorize
                             (list (reality-engine-lsp::obj "value" 1 "threshold" 0.5)))
-                "outputVectors" (reality-engine-lsp::vectorize
+                "outputEvents" (reality-engine-lsp::vectorize
                                  (loop for i from 0 below output-count
                                        collect (reality-engine-lsp::obj
                                                 "id" (format nil "~a-out-~a" sequence-id i)
@@ -1155,14 +1155,14 @@ ever have seen."
                                      (reality-engine-lsp::obj
                                       "id" "seq"
                                       "name" "Seq"
-                                      "vectors" (reality-engine-lsp::vectorize
+                                      "events" (reality-engine-lsp::vectorize
                                                  (list
                                                   (reality-engine-lsp::obj
                                                    "id" "v1"
                                                    "isInitial" t
                                                    "elements" (reality-engine-lsp::vectorize
                                                                (list (reality-engine-lsp::obj "value" 1)))
-                                                   "outputVectors" (reality-engine-lsp::vectorize
+                                                   "outputEvents" (reality-engine-lsp::vectorize
                                                                     (list
                                                                      (reality-engine-lsp::obj
                                                                       "id" "out"
@@ -1415,14 +1415,14 @@ ever have seen."
                                   (reality-engine-lsp::obj
                                    "id" "packed-seq"
                                    "name" "Packed Sequence"
-                                   "vectors" (reality-engine-lsp::vectorize
+                                   "events" (reality-engine-lsp::vectorize
                                               (list
                                                (reality-engine-lsp::obj
                                                 "id" "packed-start"
                                                 "isInitial" t
                                                 "elements" (reality-engine-lsp::vectorize
                                                             (list (reality-engine-lsp::obj "value" 1 "threshold" 0.5)))
-                                                "outputVectors" (reality-engine-lsp::vectorize
+                                                "outputEvents" (reality-engine-lsp::vectorize
                                                                  (list
                                                                   (reality-engine-lsp::obj
                                                                    "id" "packed-out"
