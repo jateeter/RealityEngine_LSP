@@ -184,7 +184,7 @@ with two more O(n) LENGTH calls."
            :vector-store (make-hash-table :test #'equal)
            :sequences (make-hash-table :test #'equal)
            :qdrant-url (env "QDRANT_URL" "http://localhost:4333")
-           :collection-name (env "QDRANT_REALITY_COLLECTION" "reality-vectors")
+           :collection-name (env "QDRANT_REALITY_COLLECTION" "reality-events")
            :started-at (now-ms)
            :event-bus-subscriptions (make-hash-table :test #'equal)
            :latched-event-bits (make-hash-table :test #'equal)

@@ -15,7 +15,7 @@ RealityEngine_LSP uses the same environment variables as the sibling runtimes.
 | `QDRANT_GRPC_URL` | `http://localhost:4334` | Shared Qdrant gRPC URL |
 | `QDRANT_STORAGE_DIR` | `../localAIStack/volumes/qdrant` | Shared Qdrant storage path |
 | `QDRANT_LOCALAI_COLLECTION` | `localai_docs` | localAI Qdrant collection |
-| `QDRANT_REALITY_COLLECTION` | `reality-vectors` | Reality Event collection |
+| `QDRANT_REALITY_COLLECTION` | `reality-events` | Reality Event collection |
 | `RE_HISTORY_LIMIT` | `250` | Runtime history entries retained |
 | `RE_INCLUDE_MACHINE_RESULTS` | `true` | Default `/api/perceive` machine-result verbosity |
 | `RE_INCLUDE_PERCEPTUAL_SPACE` | `true` | Default `/api/perceive` perceptual-space inclusion |
