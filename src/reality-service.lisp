@@ -1470,8 +1470,8 @@ Replaces an NREVERSE, which only undid the push order and carried no meaning."
        "isInitial" (json-bool (reality-event-initial-p vector))
        "matchAlgorithm" (reality-event-match-algorithm vector)
        "metadata" (or (reality-event-metadata vector) (obj))
-       "nextVectorIds" (vectorize (reality-event-next-ids vector))
-       "outputVectors" (vectorize
+       "nextEventIds" (vectorize (reality-event-next-ids vector))
+       "outputEvents" (vectorize
                         (mapcar (lambda (output)
                                   (obj "id" (output-vector-id output)
                                        "metadata" (or (output-vector-metadata output) (obj))
