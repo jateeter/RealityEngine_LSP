@@ -31,6 +31,23 @@
   (declare (ignore default))
   (setf (gethash (string key) object) value))
 
+(defun jget-either (object canonical legacy &optional default)
+  "One observation, two spellings, during the corpus schema rename.
+
+A machine file names the same collection EVENTS or VECTORS depending on whether
+it has been rewritten yet (RealityEngine_CI#220 layer 1). A loader accepting only
+one reads an empty list from the other — with no error, no condition signalled,
+and a machine that loads with no sequences while the engine reports success.
+
+CANONICAL is tried first. Absent covers NIL and +JSON-NULL+ both, since a decoded
+JSON null arrives as :NULL here.
+
+Deleted in layer 1c, once the corpus carries only the new spelling."
+  (let ((value (jget object canonical)))
+    (if (or (null value) (eq value +json-null+))
+        (jget object legacy default)
+        value)))
+
 (defun jobject-p (value)
   (hash-table-p* value))
 

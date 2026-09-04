@@ -29,7 +29,7 @@
 (defun sta-vector-index (machine-root)
   (let ((index (make-hash-table :test #'equal)))
     (dolist (sequence (jarray-list (or (jget machine-root "sequences") (arr))))
-      (dolist (vector (jarray-list (or (jget sequence "vectors") (arr))))
+      (dolist (vector (jarray-list (or (jget-either sequence "events" "vectors") (arr))))
         (when (jstring vector "id" nil)
           (setf (gethash (jstring vector "id" nil) index)
                 (obj "sequenceId" (jstring sequence "id" "")
@@ -47,14 +47,14 @@
             (transitions nil)
             (max-intra 0)
             (any-violation nil))
-        (dolist (vector (jarray-list (or (jget sequence "vectors") (arr))))
+        (dolist (vector (jarray-list (or (jget-either sequence "events" "vectors") (arr))))
           (when (jstring vector "id" nil)
             (setf (gethash (jstring vector "id" nil) local) vector)))
-        (dolist (vector (jarray-list (or (jget sequence "vectors") (arr))))
+        (dolist (vector (jarray-list (or (jget-either sequence "events" "vectors") (arr))))
           (let ((from-id (jstring vector "id" ""))
                 (from-state (sta-vector-state vector)))
             (dolist (next-id (mapcar #'princ-to-string
-                                     (jarray-list (or (jget vector "nextVectorIds") (arr)))))
+                                     (jarray-list (or (jget-either vector "nextEventIds" "nextVectorIds") (arr)))))
               (let ((local-next (gethash next-id local)))
                 (cond
                   (local-next
@@ -176,8 +176,8 @@ from a request body with no machine in scope."
   (let* ((id (or (jstring item "id" nil) (make-id "vector")))
          (initial-p (jbool item "isInitial" nil))
          (elements (mapcar #'parse-vector-element (jarray-list (or (jget item "elements") (arr)))))
-         (next-ids (mapcar #'princ-to-string (jarray-list (or (jget item "nextVectorIds") (arr)))))
-         (outputs (mapcar #'parse-output-vector (jarray-list (or (jget item "outputVectors") (arr))))))
+         (next-ids (mapcar #'princ-to-string (jarray-list (or (jget-either item "nextEventIds" "nextVectorIds") (arr)))))
+         (outputs (mapcar #'parse-output-vector (jarray-list (or (jget-either item "outputEvents" "outputVectors") (arr))))))
     (make-reality-event :id id
                          :elements elements
                          :initial-p initial-p
@@ -215,7 +215,7 @@ from a request body with no machine in scope."
                             :deprecated-at (jstring item "deprecatedAt" nil)
                             :replaced-by (jstring item "replacedBy" nil)
                             :vectors nil)))
-    (dolist (vector-json (jarray-list (or (jget item "vectors") (arr))))
+    (dolist (vector-json (jarray-list (or (jget-either item "events" "vectors") (arr))))
       (let ((vector (parse-reality-event vector-json machine-match-algorithm)))
         (setf (gethash (reality-event-id vector) vectors) vector)))
     (setf (sequence-vectors sequence) vectors)
