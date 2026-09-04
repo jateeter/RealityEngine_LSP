@@ -1955,7 +1955,7 @@ on this surface."
                                                                               (let ((machine (gethash (gethash "id" params) (reality-state-machines state))))
                                                                                 (when machine
                                                                                   (transition-result-json
-                                                                                   (process-machine-input machine (numbers-from-json (jget body "inputVector"))))))))))
+                                                                                   (process-machine-input machine (numbers-from-json (jget-either body "inputEvent" "inputVector"))))))))))
                                                      (if result (json-response result) (error-response "Machine not found" 404)))))
    (make-route "POST" "/api/machines/:id/whatif" (lambda (params body query)
                                                   (declare (ignore query))
@@ -1966,7 +1966,7 @@ on this surface."
                                                                                  (transition-result-json
                                                                                   (process-machine-input
                                                                                    (machine-from-json (machine-json machine :full t))
-                                                                                   (numbers-from-json (jget body "inputVector"))))))))))
+                                                                                   (numbers-from-json (jget-either body "inputEvent" "inputVector"))))))))))
                                                     (if result (json-response result) (error-response "Machine not found" 404)))))
    (make-route "POST" "/api/machines/:id/process-universal" (lambda (params body query)
                                                              (declare (ignore query))
@@ -2449,7 +2449,7 @@ on this surface."
                                                                                    (transition-result-json
                                                                                     (process-machine-input
                                                                                      (machine-from-json (machine-json machine :full t))
-                                                                                     (numbers-from-json (jget body "inputVector"))))))))))
+                                                                                     (numbers-from-json (jget-either body "inputEvent" "inputVector"))))))))))
                                                       (if result (json-response result) (error-response "Machine not found" 404)))))
      (make-route "POST" "/api/machines/:id/whatif-universal" (lambda (params body query)
                                                               (declare (ignore query))
@@ -2708,7 +2708,7 @@ on this surface."
                                                                                                          (reality-state-machines state))))
                                                                                    (when machine
                                                                                      (transition-result-json
-                                                                                      (process-machine-input machine (numbers-from-json (jget body "inputVector"))))))))))
+                                                                                      (process-machine-input machine (numbers-from-json (jget-either body "inputEvent" "inputVector"))))))))))
                                                         (if result (json-response result) (error-response "Machine not found" 404)))))
      (make-route "GET" "/api/machine-graph" (lambda (_ body query)
                                               (declare (ignore _ body query))
