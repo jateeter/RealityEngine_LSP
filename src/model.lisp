@@ -446,7 +446,7 @@ than guessing (MV-FOLD-REFUSES-P)."
                    "vectors" (if full
                                  (vectorize (mapcar #'reality-event-json vectors))
                                  (vectorize (mapcar #'reality-event-json vectors)))
-                   "initialVectorIds" (vectorize (mapcar #'reality-event-id initials))
+                   "initialEventIds" (vectorize (mapcar #'reality-event-id initials))
                    "outputVectorIds" (vectorize (mapcar #'reality-event-id outputs))
                    "metadata" (or (sequence-metadata sequence) (obj)))))
     (when (sequence-schema-version sequence)
@@ -524,7 +524,7 @@ Omits sequences, vectors, and perceptualMapping to keep the response small."
          "outputMergeLocked" (json-bool (machine-output-merge-locked machine))
          "arbiterRule" (machine-arbiter-rule machine)
          "sequenceCount" (length sequences)
-         "totalVectors" total-vectors
+         "totalEvents" total-vectors
          "sequenceIds" (vectorize sequence-ids)
          "sequences" (vectorize sequence-jsons)
          "metadata" (or (machine-metadata machine) (obj))
@@ -656,8 +656,8 @@ was evaluated with the weaker predicate no matter what the loader recorded
                          (reality-event-predecessor-chain next) chain)
                    (push id activated))))
              pending)
-    (obj "matchedVectors" (vectorize (nreverse matched))
-         "activatedVectors" (vectorize (nreverse activated))
+    (obj "matchedEvents" (vectorize (nreverse matched))
+         "activatedEvents" (vectorize (nreverse activated))
          "assertedOutputs" (vectorize (mapcar #'output-vector-json outputs))
          "%outputs" outputs)))
 
@@ -853,7 +853,7 @@ are constant within every comparison the sort can now make."
                    (jstring right "machineId" "")))))
 
 (defun transition-result-json (result)
-  (obj "inputVector" (vectorize (transition-result-input-vector result))
+  (obj "inputEvent" (vectorize (transition-result-input-vector result))
        "timestamp" (transition-result-timestamp result)
        "sequenceResults" (transition-result-sequence-results result)
        "machineOutput" (if (transition-result-machine-output result)
