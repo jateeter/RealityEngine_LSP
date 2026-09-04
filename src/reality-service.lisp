@@ -362,13 +362,13 @@ counters.  Called once per machine per step from process-perceptual-input."
       (when (jobject-p seq-results)
         (dolist (sid (object-keys-sorted seq-results))
           (let ((sr (jget seq-results sid)))
-            (let ((matched (jget sr "matchedVectors")))
+            (let ((matched (jget sr "matchedEvents")))
               (when (jarray-p matched)
                 (dolist (vid (jarray-list matched))
                   (when (stringp vid)
                     (coverage-bump (reality-state-cov-matched state)
                                    (coverage-key mid mname sid vid))))))
-            (let ((activated (jget sr "activatedVectors")))
+            (let ((activated (jget sr "activatedEvents")))
               (when (jarray-p activated)
                 (dolist (vid (jarray-list activated))
                   (when (stringp vid)
@@ -395,7 +395,7 @@ IRIs are attached at read time by the /api/audit/semantics route."
     (when (jobject-p seq-results)
       (dolist (sid (object-keys-sorted seq-results))
         (let* ((sr (jget seq-results sid))
-               (matched (jget sr "matchedVectors"))
+               (matched (jget sr "matchedEvents"))
                (asserted (jget sr "assertedOutputs"))
                (outputs (and (jarray-p asserted) (jarray-list asserted)))
                (first-output (car outputs))
@@ -1298,7 +1298,7 @@ Replaces an NREVERSE, which only undid the push order and carried no meaning."
                      (obj "machineId"        id
                           "machineName"      (or (machine-name machine) "")
                           "inputRegion"      (region-json (mapping-input mapping))
-                          "inputVector"      (vectorize machine-input)
+                          "inputEvent"      (vectorize machine-input)
                           "outputRegion"     (if out-mapping
                                                 (region-json out-mapping)
                                                 +json-null+)
@@ -1424,7 +1424,7 @@ Replaces an NREVERSE, which only undid the push order and carried no meaning."
            ;; so the step itself contributed a spurious {"success": true}.
            ;; Key set fixed by SURFACE_SPEC.md, "POST /api/push response shape".
            ;;
-           ;; No "inputVector": this was the only runtime that emitted one. The
+           ;; No "inputEvent": this was the only runtime that emitted one. The
            ;; Perception Engine assembled that vector and sent it, so echoing it
            ;; back is redundant, and C++'s SimulationStep has no step-level
            ;; input vector to echo.
@@ -1720,7 +1720,7 @@ on this surface."
                                     (json-response
                                      (actor-ask actor
                                                 (lambda (state)
-                                                  (obj "vectorDimension" (reality-state-dimension state)
+                                                  (obj "eventDimension" (reality-state-dimension state)
                                                        "matchThreshold" 0.5d0
                                                        "qdrantUrl" (reality-state-qdrant-url state)
                                                        "collectionName" (reality-state-collection-name state)))))))
@@ -1849,7 +1849,7 @@ on this surface."
                                                                   "includePerceptualSpace" (json-bool (reality-state-include-perceptual-space-p state))))))))
    (make-route "GET" "/api/engine/active" (lambda (_ body query)
                                            (declare (ignore _ body query))
-                                           (json-response (actor-ask actor (lambda (state) (obj "activeVectors" (active-vectors-json state)))))))
+                                           (json-response (actor-ask actor (lambda (state) (obj "activeEvents" (active-vectors-json state)))))))
    (make-route "GET" "/api/engine/history" (lambda (_ body query)
                                             (declare (ignore _ body))
                                             (let ((limit (parse-integer (or (gethash "limit" query) "0") :junk-allowed t)))
@@ -1893,7 +1893,7 @@ on this surface."
                                                                   (when (transition-result-machine-output result)
                                                                     (push (output-vector-json (transition-result-machine-output result)) outputs))))
                                                               (reality-state-machines state))
-                                                             (let ((result (obj "inputVector" (vectorize input)
+                                                             (let ((result (obj "inputEvent" (vectorize input)
                                                                                 "timestamp" (now-ms)
                                                                                 "outputs" (vectorize (nreverse outputs)))))
                                                                (record-engine-history state (obj "type" "engine-process" "result" result))
@@ -2136,7 +2136,7 @@ on this surface."
      (make-route "GET" "/api/config" (lambda (_ body query)
                                        (declare (ignore _ body query))
                                        (state-json (lambda (state)
-                                                     (obj "vectorDimension" (reality-state-dimension state)
+                                                     (obj "eventDimension" (reality-state-dimension state)
                                                           "matchThreshold" 0.5d0
                                                           "qdrantUrl" (reality-state-qdrant-url state)
                                                           "collectionName" (reality-state-collection-name state))))))
@@ -2278,7 +2278,7 @@ on this surface."
                                                                              (when (transition-result-machine-output result)
                                                                                (push (output-vector-json (transition-result-machine-output result)) outputs))))
                                                                          (reality-state-machines state))
-                                                                (let ((result (obj "inputVector" (vectorize input)
+                                                                (let ((result (obj "inputEvent" (vectorize input)
                                                                                    "timestamp" (now-ms)
                                                                                    "outputs" (vectorize (nreverse outputs)))))
                                                                   (record-engine-history state (obj "type" "engine-process" "result" result))
@@ -2303,7 +2303,7 @@ on this surface."
                                                                                   (parse-integer (or (gethash "limit" query) "0") :junk-allowed t)))))))
      (make-route "GET" "/api/engine/active" (lambda (_ body query)
                                               (declare (ignore _ body query))
-                                              (state-json (lambda (state) (obj "activeVectors" (active-vectors-json state))))))
+                                              (state-json (lambda (state) (obj "activeEvents" (active-vectors-json state))))))
      (make-route "GET" "/api/machines" (lambda (_ body query)
                                          (declare (ignore _ body))
                                          (let ((summary-p (and (hash-table-p* query)
@@ -2796,7 +2796,7 @@ on this surface."
                                                 (declare (ignore _ query))
                                                 (state-json (lambda (state)
                                                               (incf (reality-state-sampler-sample-count state))
-                                                              (let ((result (obj "inputVector" (vectorize (numbers-from-json (jget body "data")))
+                                                              (let ((result (obj "inputEvent" (vectorize (numbers-from-json (jget body "data")))
                                                                                  "processingTimestamp" (now-ms))))
                                                                 (obj "success" t "result" result))))))
      (make-route "GET" "/api/sampler/stats" (lambda (_ body query)
@@ -2812,7 +2812,7 @@ on this surface."
                                                     (declare (ignore _ query))
                                                     (let ((data (numbers-from-json (jget body "data"))))
                                                       (json-response (obj "success" t
-                                                                          "inputVector" (vectorize data)
+                                                                          "inputEvent" (vectorize data)
                                                                           "transformations" (arr)
                                                                           "processingTimestamp" (now-ms))))))
      (make-route "POST" "/api/perception/diagnostic" (lambda (_ body query)
