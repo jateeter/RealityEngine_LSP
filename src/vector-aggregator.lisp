@@ -77,7 +77,31 @@
 
     ;; Use a simple-vector for O(1) random write access
     (let* ((base-arr  (coerce base-vector 'simple-vector))
-           (dim       (length base-arr)))
+           (dim       (length base-arr))
+           ;; A cell covered by more than one gated contributor was ARBITRATED by
+           ;; the Reality Engine, and BASE-VECTOR already carries that
+           ;; resolution. Writing it here would replace the arbiter's answer with
+           ;; last-writer-wins in machineName order, which is the merge the
+           ;; arbiter exists to replace (ARBITER_CONTRACT.md 2.1, "Nothing
+           ;; bypasses the arbiter").
+           ;;
+           ;; Reproduced before this guard: cell 2437 read 1 in the arbitrated
+           ;; space and 0 after aggregation, on a cell four Legal Services
+           ;; machines share and the registry declares PRECEDENCE-contended
+           ;; (RealityEngine_CI#263).
+           ;;
+           ;; Contention is derived from the gated contributors rather than read
+           ;; from the step: `arbitration` is not on the push wire, and 6
+           ;; observability is a separate GET.
+           (writers (make-array dim :initial-element 0)))
+      (dolist (rec records)
+        (destructuring-bind (_ offset length vec) rec
+          (declare (ignore _))
+          (let ((write-len (min (length vec) length)))
+            (dotimes (i write-len)
+              (let ((pos (+ offset i)))
+                (when (< pos dim)
+                  (incf (aref writers pos))))))))
       (dolist (rec records)
         (destructuring-bind (_ offset length vec) rec
           (declare (ignore _))
@@ -85,7 +109,7 @@
                  (write-len (min (length vec-arr) length)))
             (dotimes (i write-len)
               (let ((pos (+ offset i)))
-                (when (< pos dim)
+                (when (and (< pos dim) (<= (aref writers pos) 1))
                   (setf (svref base-arr pos) (svref vec-arr i))))))))
       ;; Return as list — matches what update-from-perceptual-space expects
       (coerce base-arr 'list))))
