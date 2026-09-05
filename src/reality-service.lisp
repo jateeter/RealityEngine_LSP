@@ -2301,17 +2301,35 @@ on this surface."
      (make-route "POST" "/api/engine/process" (lambda (_ body query)
                                                 (declare (ignore _ query))
                                                 (state-json (lambda (state)
-                                                              (let ((input (numbers-from-json (jget body "vector")))
-                                                                    (outputs nil))
-                                                                (maphash (lambda (_ machine)
-                                                                           (declare (ignore _))
-                                                                           (let ((result (process-machine-input machine input)))
-                                                                             (when (transition-result-machine-output result)
-                                                                               (push (output-vector-json (transition-result-machine-output result)) outputs))))
-                                                                         (reality-state-machines state))
+                                                              ;; Map across MACHINES, in parallel, over one atomic
+                                                              ;; collection of the active Reality Event space
+                                                              ;; (SURFACE_SPEC.md, "POST /api/engine/process";
+                                                              ;; RealityEngine_CI#254).
+                                                              ;;
+                                                              ;; This was a `maphash`, which had two defects and not
+                                                              ;; one: it is serial, and its order is unspecified. The
+                                                              ;; snapshot fixes both — it is the unit a worker can be
+                                                              ;; handed, and it is sorted by machine id, so `pmap`
+                                                              ;; returns results in a canonical order rather than in
+                                                              ;; completion order.
+                                                              ;;
+                                                              ;; Safe to fan out because machines are independent at
+                                                              ;; this boundary: `process-machine-input` touches only
+                                                              ;; its own machine's sequences. The one piece of shared
+                                                              ;; mutable state it reaches is `*random-state*` via
+                                                              ;; `make-id`, and each kernel worker is given its own —
+                                                              ;; see `ensure-kernel`.
+                                                              (let* ((input (numbers-from-json (jget body "vector")))
+                                                                     (snapshot (machine-snapshot (reality-state-machines state)))
+                                                                     (results (pmap-machines
+                                                                               (lambda (machine) (process-machine-input machine input))
+                                                                               snapshot))
+                                                                     (outputs (loop for r in results
+                                                                                    for out = (transition-result-machine-output r)
+                                                                                    when out collect (output-vector-json out))))
                                                                 (let ((result (obj "inputEvent" (vectorize input)
                                                                                    "timestamp" (now-ms)
-                                                                                   "outputs" (vectorize (nreverse outputs)))))
+                                                                                   "outputs" (vectorize outputs))))
                                                                   (record-engine-history state (obj "type" "engine-process" "result" result))
                                                                   (obj "result" result)))))))
      (make-route "GET" "/api/engine/history" (lambda (_ body query)
