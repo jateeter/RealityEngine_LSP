@@ -1,7 +1,7 @@
 (in-package #:reality-engine-lsp)
 
 (defstruct reality-state
-  dimension machines machine-dir perceptual-space history history-limit include-machine-results-p
+  dimension machines machine-dir perceptual-space history history-limit include-machine-results-p include-active-regions-p
   ;; Audit trail for POST /api/engine/process — what GET /api/engine/history
   ;; serves, here and on every other runtime.
   ;;
@@ -180,6 +180,9 @@ with two more O(n) LENGTH calls."
            :osre-history nil
            :history-limit (env-int "RE_HISTORY_LIMIT" 250)
            :include-machine-results-p (env-bool "RE_INCLUDE_MACHINE_RESULTS" t)
+           ;; Defaults stay full so no existing caller changes shape and the
+           ;; parity gates keep comparing identical key sets (SURFACE_SPEC.md).
+           :include-active-regions-p (env-bool "RE_INCLUDE_ACTIVE_REGIONS" t)
            :include-perceptual-space-p (env-bool "RE_INCLUDE_PERCEPTUAL_SPACE" t)
            :vector-store (make-hash-table :test #'equal)
            :sequences (make-hash-table :test #'equal)
@@ -1194,7 +1197,18 @@ Replaces an NREVERSE, which only undid the push order and carried no meaning."
         #'active-region-key<
         :key #'active-region-sort-key))
 
-(defun process-perceptual-input (state input &key override include-machine-results include-perceptual-space compact)
+;; include-active-regions defaults to the runtime option rather than to nil.
+;;
+;; A plain &key defaults to nil, which for an omission flag means "omit" — so
+;; every call site that forgot to pass it would silently drop the field from the
+;; response, and there are five of them. That is not a failure anything raises:
+;; the step is well formed, the key is simply gone, and a consumer walking the
+;; response sees a runtime that reports no active regions. Defaulting to the
+;; declared option makes the correct behaviour the one you get by saying
+;; nothing, so a future call site cannot omit the field by omission.
+(defun process-perceptual-input (state input &key override include-machine-results include-perceptual-space
+                                                  (include-active-regions (reality-state-include-active-regions-p state))
+                                                  compact)
   ;; include-perceptual-space is accepted and ignored: SURFACE_SPEC.md makes
   ;; perceptualSpace unconditional in the push response. Kept in the lambda list
   ;; so existing callers (and RE_INCLUDE_PERCEPTUAL_SPACE) do not become errors.
@@ -1435,9 +1449,16 @@ Replaces an NREVERSE, which only undid the push order and carried no meaning."
            (step (obj "stepNumber" step-number
                      "timestamp" (now-ms)
                      "mergeBatch" (vectorize merge-batch)
-                     "eventBus" (vectorize event-bus)
-                     "activeRegions" (vectorize (sort-active-regions active-regions)))))
+                     "eventBus" (vectorize event-bus))))
       (setf (reality-state-step-count state) (1+ step-number))
+      ;; activeRegions is omitted, not emptied, when not requested
+      ;; (SURFACE_SPEC.md, "Requesting less than the full step"). An empty array
+      ;; is the claim that no regions were active, which is a different
+      ;; statement from "not asked for" — and the parity stage compares key
+      ;; sets, so emptying it would read as agreement between a runtime with
+      ;; nothing to report and one that was never asked.
+      (when include-active-regions
+        (setf (jget step "activeRegions") (vectorize (sort-active-regions active-regions))))
       (when include-machine-results
         (setf (jget step "machineResults") machine-results))
       ;; Always present, compact or not. This was gated on
@@ -1832,7 +1853,8 @@ on this surface."
                                                          (lambda (state)
                                                            (obj "historyLimit" (reality-state-history-limit state)
                                                                 "includeMachineResults" (json-bool (reality-state-include-machine-results-p state))
-                                                                "includePerceptualSpace" (json-bool (reality-state-include-perceptual-space-p state))))))))
+                                                                "includePerceptualSpace" (json-bool (reality-state-include-perceptual-space-p state))
+                                                                "includeActiveRegions" (json-bool (reality-state-include-active-regions-p state))))))))
    (make-route "PATCH" "/api/runtime/options" (lambda (_ body query)
                                                (declare (ignore _ query))
                                                (json-response
@@ -1844,9 +1866,12 @@ on this surface."
                                                                (setf (reality-state-include-machine-results-p state) (jbool body "includeMachineResults" t)))
                                                              (when (not (eq (jget body "includePerceptualSpace" :missing) :missing))
                                                                (setf (reality-state-include-perceptual-space-p state) (jbool body "includePerceptualSpace" t)))
+                                                             (when (not (eq (jget body "includeActiveRegions" :missing) :missing))
+                                                               (setf (reality-state-include-active-regions-p state) (jbool body "includeActiveRegions" t)))
                                                              (obj "historyLimit" (reality-state-history-limit state)
                                                                   "includeMachineResults" (json-bool (reality-state-include-machine-results-p state))
-                                                                  "includePerceptualSpace" (json-bool (reality-state-include-perceptual-space-p state))))))))
+                                                                  "includePerceptualSpace" (json-bool (reality-state-include-perceptual-space-p state))
+                                                                "includeActiveRegions" (json-bool (reality-state-include-active-regions-p state))))))))
    (make-route "GET" "/api/engine/active" (lambda (_ body query)
                                            (declare (ignore _ body query))
                                            (json-response (actor-ask actor (lambda (state) (obj "activeEvents" (active-vectors-json state)))))))
@@ -2074,6 +2099,10 @@ on this surface."
                                                                                                 (reality-state-include-machine-results-p state)))
                                                             :include-perceptual-space (jbool body "includePerceptualSpace"
                                                                                              (reality-state-include-perceptual-space-p state))
+                                                            ;; Not folded into `compact`, which omits exactly
+                                                            ;; machineResults and nothing else.
+                                                            :include-active-regions (jbool body "includeActiveRegions"
+                                                                                          (reality-state-include-active-regions-p state))
                                                             :compact (or (jbool body "compact" nil)
                                                                          (compact-query-p query)))
                                                            (obj "error" "Provide exactly one of: vector, sparseVector, domainVectors"))))))))))
@@ -2214,7 +2243,8 @@ on this surface."
                                                 (state-json (lambda (state)
                                                               (obj "historyLimit" (reality-state-history-limit state)
                                                                    "includeMachineResults" (json-bool (reality-state-include-machine-results-p state))
-                                                                   "includePerceptualSpace" (json-bool (reality-state-include-perceptual-space-p state)))))))
+                                                                   "includePerceptualSpace" (json-bool (reality-state-include-perceptual-space-p state))
+                                                                "includeActiveRegions" (json-bool (reality-state-include-active-regions-p state)))))))
      (make-route "PATCH" "/api/runtime/options" (lambda (_ body query)
                                                    (declare (ignore _ query))
                                                    (state-json (lambda (state)
@@ -2226,7 +2256,8 @@ on this surface."
                                                                    (setf (reality-state-include-perceptual-space-p state) (jbool body "includePerceptualSpace" t)))
                                                                  (obj "historyLimit" (reality-state-history-limit state)
                                                                       "includeMachineResults" (json-bool (reality-state-include-machine-results-p state))
-                                                                      "includePerceptualSpace" (json-bool (reality-state-include-perceptual-space-p state)))))))
+                                                                      "includePerceptualSpace" (json-bool (reality-state-include-perceptual-space-p state))
+                                                                "includeActiveRegions" (json-bool (reality-state-include-active-regions-p state)))))))
      (make-route "GET" "/api/runtime/vector-space" (lambda (_ body query)
                                                      (declare (ignore _ body query))
                                                      (state-json (lambda (state)
@@ -2867,6 +2898,10 @@ on this surface."
                                                                                                                (reality-state-include-machine-results-p state)))
                                                                            :include-perceptual-space (jbool body "includePerceptualSpace"
                                                                                                             (reality-state-include-perceptual-space-p state))
+                                                                           ;; Not folded into `compact`, which omits exactly
+                                                                           ;; machineResults and nothing else (SURFACE_SPEC.md).
+                                                                           :include-active-regions (jbool body "includeActiveRegions"
+                                                                                                         (reality-state-include-active-regions-p state))
                                                                            :compact (or (jbool body "compact" nil)
                                                                                         (compact-query-p query)))))
                                                                 (re-broadcast (obj "type" "step-result" "step" step))
