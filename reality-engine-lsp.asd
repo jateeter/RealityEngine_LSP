@@ -7,6 +7,12 @@
   :depends-on (#:alexandria
                #:babel
                #:bordeaux-threads
+               ;; lparallel layers on bordeaux-threads, already required above,
+               ;; so this is not a second concurrency substrate — it is the
+               ;; queue, kernel and parallel-map that src/actor.lisp previously
+               ;; hand-rolled from locks and condition variables
+               ;; (RealityEngine_LSP#92, ARBITER_CONTRACT.md 7.4).
+               #:lparallel
                #:cl-base64
                #:hunchentoot
                #:drakma
