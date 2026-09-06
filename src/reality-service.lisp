@@ -2349,10 +2349,24 @@ on this surface."
                                                               ;; mutable state it reaches is `*random-state*` via
                                                               ;; `make-id`, and each kernel worker is given its own —
                                                               ;; see `ensure-kernel`.
+                                                              ;; A Universal Reality Event is decomposed; anything else
+                                                              ;; is applied whole. Length decides, against the declared
+                                                              ;; dimension (SURFACE_SPEC.md). The route used to hand the
+                                                              ;; raw vector to every machine, so a universal event met a
+                                                              ;; machine whose input region is a handful of cells,
+                                                              ;; matched nothing, and returned a well-formed empty
+                                                              ;; result (RealityEngine_CI#267).
                                                               (let* ((input (numbers-from-json (jget body "vector")))
+                                                                     (universal (= (length input)
+                                                                                   (reality-state-dimension state)))
                                                                      (snapshot (machine-snapshot (reality-state-machines state)))
                                                                      (results (pmap-machines
-                                                                               (lambda (machine) (process-machine-input machine input))
+                                                                               (lambda (machine)
+                                                                                 (process-machine-input
+                                                                                  machine
+                                                                                  (if universal
+                                                                                      (machine-slice machine input)
+                                                                                      input)))
                                                                                snapshot))
                                                                      (outputs (loop for r in results
                                                                                     for out = (transition-result-machine-output r)
