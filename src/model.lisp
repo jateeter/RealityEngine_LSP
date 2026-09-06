@@ -29,6 +29,16 @@
                    ;; is currently allowed to change it does not. Every restart
                    ;; comes up locked.
                    (output-merge-locked t)
+                   ;; SURFACE_SPEC.md, "transitionsInhibited". Defaults NIL —
+                   ;; false — which is the declared default and not this
+                   ;; runtime's choice: a machine flows the Universal Reality
+                   ;; Event through unless something inhibits it.
+                   ;;
+                   ;; Runtime state like the interlock above, not a corpus
+                   ;; property. It says whether this deployment currently
+                   ;; carries the event forward for this machine, which does not
+                   ;; travel with the machine definition.
+                   (transitions-inhibited nil)
                    sequences)
 
 (defparameter +boolean-output-merge-transformations+
@@ -669,6 +679,31 @@ was evaluated with the weaker predicate no matter what the loader recorded
   sequence)
 
 (defun process-machine-input (machine input &key override)
+  ;; transitionsInhibited: accept the Universal Reality Event and do not pass it
+  ;; forward (SURFACE_SPEC.md). The event is ADMITTED — this is not a refusal —
+  ;; so the shape returned is that of a machine which matched nothing: no
+  ;; sequence results, no output, no state change. Signalling instead would
+  ;; surface a condition the caller cannot act on, at a seam where the correct
+  ;; behaviour is a no-op.
+  (when (machine-transitions-inhibited machine)
+    (return-from process-machine-input
+      (make-transition-result
+       :input-vector input
+       :timestamp (now-ms)
+       :sequence-results (make-hash-table :test #'equal)
+       :sequence-outputs (make-hash-table :test #'equal)
+       :machine-output nil
+       :merged-output nil
+       :pending-outputs nil
+       ;; Same shape as a machine that matched nothing, arbiter metadata
+       ;; included: the caller reads shouldOutput either way, and omitting it
+       ;; here would make an inhibited machine distinguishable from an
+       ;; unmatched one by the SHAPE of the reply rather than by asking the
+       ;; control. C++ returns the rule and zeros for the same reason.
+       :arbiter-metadata (obj "rule" (arbiter-name (machine-arbiter-rule machine))
+                              "totalInputs" 0
+                              "sequencesWithOutput" 0
+                              "shouldOutput" (json-bool nil)))))
   (let ((sequence-results (make-hash-table :test #'equal))
         (sequence-outputs (make-hash-table :test #'equal))
         (all-outputs nil)

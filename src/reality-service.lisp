@@ -1725,6 +1725,36 @@ on this surface."
          "edges" (vectorize (nreverse edges))
          "perceptualSpaceDimension" (reality-state-dimension state))))
 
+(defun transitions-inhibited-control (state)
+  "The transitionsInhibited control, in the shape SURFACE_SPEC declares."
+  (let ((value (obj)))
+    (maphash (lambda (id machine)
+               (setf (jget value id) (json-bool (machine-transitions-inhibited machine))))
+             (reality-state-machines state))
+    (obj "name" "transitionsInhibited"
+         "scope" "machine"
+         "value" value
+         "default" (json-bool nil)
+         "mutable" (json-bool t))))
+
+(defun set-transitions-inhibited (state machine-id value)
+  "Set the control for one machine, or for every machine when MACHINE-ID is NIL.
+
+   Returns :MISSING when a named machine does not exist, so the route can answer
+   404 rather than accepting a write that lands nowhere."
+  (if machine-id
+      (let ((machine (gethash machine-id (reality-state-machines state))))
+        (if (null machine)
+            :missing
+            (progn (setf (machine-transitions-inhibited machine) value)
+                   (transitions-inhibited-control state))))
+      (progn
+        (maphash (lambda (id machine)
+                   (declare (ignore id))
+                   (setf (machine-transitions-inhibited machine) value))
+                 (reality-state-machines state))
+        (transitions-inhibited-control state))))
+
 (defun reality-routes (actor)
   (list
    (make-route "GET" "/" (lambda (_ body query)
@@ -2332,6 +2362,55 @@ on this surface."
                                                                                    "outputs" (vectorize outputs))))
                                                                   (record-engine-history state (obj "type" "engine-process" "result" result))
                                                                   (obj "result" result)))))))
+     ;; ── /api/engine/config — one pathway for every runtime control ─────
+     ;;
+     ;; SURFACE_SPEC.md, "/api/engine/config". The control's name, scope and
+     ;; default come from that document, not from here: three runtimes each
+     ;; choosing a reasonable value is how historyLimit became 256/250/1000.
+     (make-route "GET" "/api/engine/config" (lambda (_ body query)
+                                              (declare (ignore _ body query))
+                                              (json-response
+                                               (actor-ask actor
+                                                          (lambda (state)
+                                                            (obj "controls"
+                                                                 (vectorize (list (transitions-inhibited-control state)))))))))
+     (make-route "GET" "/api/engine/config/:control" (lambda (params body query)
+                                                       (declare (ignore body query))
+                                                       (let ((name (gethash "control" params)))
+                                                         (if (string/= name "transitionsInhibited")
+                                                             (error-response (format nil "Unknown control: ~a" name) 404)
+                                                             (json-response
+                                                              (actor-ask actor #'transitions-inhibited-control))))))
+     (make-route "PUT" "/api/engine/config/:control" (lambda (params body query)
+                                                       (declare (ignore query))
+                                                       (let ((name (gethash "control" params)))
+                                                         (cond
+                                                           ((string/= name "transitionsInhibited")
+                                                            (error-response (format nil "Unknown control: ~a" name) 404))
+                                                           ((eq (jget body "value" :missing) :missing)
+                                                            (error-response "transitionsInhibited requires a boolean `value`" 400))
+                                                           (t
+                                                            (let* ((value (jbool body "value" nil))
+                                                                   (machine-id (jstring body "machine" nil))
+                                                                   (result (actor-ask actor
+                                                                                      (lambda (state)
+                                                                                        (set-transitions-inhibited state machine-id value)))))
+                                                              ;; A write naming a machine that does not exist is 404,
+                                                              ;; never a silent no-op answering 200.
+                                                              (if (eq result :missing)
+                                                                  (error-response (format nil "Machine not found: ~a" machine-id) 404)
+                                                                  (json-response result))))))))
+     (make-route "DELETE" "/api/engine/config/:control" (lambda (params body query)
+                                                          (declare (ignore body query))
+                                                          (let ((name (gethash "control" params)))
+                                                            (if (string/= name "transitionsInhibited")
+                                                                (error-response (format nil "Unknown control: ~a" name) 404)
+                                                                ;; "Restore the declared default", not "remove the
+                                                                ;; control" — controls are fixed by the specification.
+                                                                (json-response
+                                                                 (actor-ask actor
+                                                                            (lambda (state)
+                                                                              (set-transitions-inhibited state nil nil))))))))
      (make-route "GET" "/api/engine/history" (lambda (_ body query)
                                                (declare (ignore _ body query))
                                                (state-json (lambda (state) (obj "history" (vectorize (reality-state-engine-history state)))))))
