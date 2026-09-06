@@ -184,6 +184,24 @@
     (maphash (lambda (id machine) (push (cons id machine) out)) machines-table)
     (map 'vector #'cdr (sort out #'string< :key #'car))))
 
+(defun machine-slice (machine universal)
+  "MACHINE's input region of UNIVERSAL — the mirror of merging its output back.
+
+   A machine's input is the slice at its declared perceptualMapping.input,
+   exactly as its output is written to a slice at another. A machine mapped
+   outside the presented space yields NIL rather than signalling: the universe is
+   larger than any one deployment's space, and refusing would make a partial
+   space unusable rather than partial."
+  (let* ((mapping (machine-mapping machine))
+         (region  (and mapping (mapping-input mapping))))
+    (if (null region)
+        nil
+        (let ((offset (region-offset region))
+              (len    (region-length region)))
+          (if (or (< offset 0) (< len 0) (> (+ offset len) (length universal)))
+              nil
+              (subseq universal offset (+ offset len)))))))
+
 (defmacro with-machine-snapshot ((var machines-table) &body body)
   "Collect the machines once, then run BODY over the snapshot.
 
