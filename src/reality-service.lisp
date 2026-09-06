@@ -3022,6 +3022,34 @@ on this surface."
 (defun start-reality-service (&key (port 5601) (machine-dir "../RealityEngine_Machines/machines") (dimension 7680))
   (let* ((state (make-reality-state-from-config :machine-dir machine-dir :dimension dimension))
          (actor (state-actor "reality-service" state)))
+    ;; WORKAROUND, not a fix — RealityEngine_CI#281.
+    ;;
+    ;; On the hosted regression lane this runtime reports one more trajectory
+    ;; entry than C++ and Scala — after a reset and eight pushes, isre- and
+    ;; osre-history hold 9 where the others hold 8 — and because the parity
+    ;; stage compares index-wise, that offset produced a second, downstream
+    ;; finding: "isre-history diverges at step 0 cell 0", this engine reading
+    ;; 0.5 where the other two read 0.0.
+    ;;
+    ;; The 0.5 is the tell. It is a half-activated cell, not a different answer:
+    ;; the first sequence of the corpus stutters as it is created, so the state
+    ;; the first step records is mid-activation rather than settled. Everything
+    ;; after it is downstream of that one entry.
+    ;;
+    ;; Sequences are created here, during `make-reality-state-from-config`. The
+    ;; part of `reset-reality-state` that matters is therefore not the history
+    ;; clearing but the `reset-sequence` it runs over every machine's sequences,
+    ;; which puts a stuttered first sequence back to its initial state before
+    ;; anything can observe it.
+    ;;
+    ;; Safe here specifically because nothing has been served — the HTTP server
+    ;; starts below — so this re-initialises load-time state only, never a
+    ;; caller's work. Machines stay registered; re-initialised sequences are
+    ;; where a freshly loaded corpus should already be.
+    ;;
+    ;; Remove this once the stutter itself is fixed. It treats the symptom, and
+    ;; leaving it unlabelled would hide the cause.
+    (reset-reality-state state)
     (start-http-server port (reality-routes actor) :name "reality-engine-lsp"
                        :extra-dispatchers
                        (list (hunchentoot:create-prefix-dispatcher
