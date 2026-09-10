@@ -447,16 +447,29 @@ than guessing (MV-FOLD-REFUSES-P)."
        "wasJustMatched" (json-bool (reality-event-just-matched-p vector))
        "metadata" (or (reality-event-metadata vector) (obj))))
 
+(defun sequence-initial-event-ids (sequence)
+  "Ids of SEQUENCE's Initial Reality Events, sorted by id.
+
+Its own function because `GET /api/machines` reports it on the *summary* form
+of a sequence, not only the full one, and the summary is built by
+`machine-json` rather than here.  `sequence-vectors` is keyed by event id and
+`object-values-sorted` orders by key, so this is already id-sorted and agrees
+with C++'s `initial_vector_ids` and Scala's `getInitialVectorIds.sorted`
+without a second sort — an unsorted answer would present the same set three
+ways and no comparison would find a majority (RealityEngine_CI#197)."
+  (mapcar #'reality-event-id
+          (remove-if-not #'reality-event-initial-p
+                         (object-values-sorted (sequence-vectors sequence)))))
+
 (defun sequence-json (sequence &key full)
   (let* ((vectors (object-values-sorted (sequence-vectors sequence)))
-         (initials (remove-if-not #'reality-event-initial-p vectors))
          (outputs (remove-if-not (lambda (v) (reality-event-output-vectors v)) vectors))
          (out (obj "id" (sequence-id sequence)
                    "name" (sequence-name sequence)
                    "events" (if full
                                  (vectorize (mapcar #'reality-event-json vectors))
                                  (vectorize (mapcar #'reality-event-json vectors)))
-                   "initialEventIds" (vectorize (mapcar #'reality-event-id initials))
+                   "initialEventIds" (vectorize (sequence-initial-event-ids sequence))
                    "outputEventIds" (vectorize (mapcar #'reality-event-id outputs))
                    "metadata" (or (sequence-metadata sequence) (obj)))))
     (when (sequence-schema-version sequence)
@@ -523,7 +536,22 @@ Omits sequences, vectors, and perceptualMapping to keep the response small."
          (sequence-ids (mapcar #'sequence-id sequences))
          (sequence-jsons (if full
                              (mapcar (lambda (s) (sequence-json s :full t)) sequences)
-                             (mapcar (lambda (s) (obj "id" (sequence-id s) "name" (sequence-name s))) sequences)))
+                             ;; The summary carries initialEventIds as well as id and
+                             ;; name.  It is not decoration: the Scala Perception
+                             ;; Engine builds its machine corpus from GET /api/machines
+                             ;; and reads this key in MachineCorpus.scala `provenance()`,
+                             ;; which ends `.toOption.getOrElse(Vector.empty)` — so an RE
+                             ;; that omits it hands the PE an empty audit trail and raises
+                             ;; nothing, in contradiction of that method's own documented
+                             ;; expectation that a fired sequence yields a non-empty one.
+                             ;; The alternative this rejects is a full-detail request per
+                             ;; machine to read one field.
+                             (mapcar (lambda (s)
+                                       (obj "id" (sequence-id s)
+                                            "name" (sequence-name s)
+                                            "initialEventIds"
+                                            (vectorize (sequence-initial-event-ids s))))
+                                     sequences)))
          (total-vectors (loop for s in sequences sum (hash-table-count (sequence-vectors s)))))
     (obj "id" (machine-id machine)
          "name" (machine-name machine)
