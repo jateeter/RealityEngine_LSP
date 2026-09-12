@@ -1857,9 +1857,28 @@ on this surface."
                                              (if result
                                                  (json-response (obj "sequence" (sequence-json result :full t)))
                                                  (error-response "Sequence not found" 404)))))
-   (make-route "POST" "/api/engine/reset" (lambda (_ body query)
-                                           (declare (ignore _ body query))
-                                           (json-response (actor-ask actor (lambda (state) (reset-reality-state state) (obj "success" t))))))
+   ;; clearAudit -- opt-in, default NIL (SURFACE_SPEC.md "Already-settled
+   ;; instances", 2026-09-12).  Absent or false, the re:SequenceObservation ring
+   ;; buffer SURVIVES the reset, which is what every runtime already did, so the
+   ;; default changes nothing: the audit trail is evidence, and a rewind of run
+   ;; state is not a reason to discard it.
+   ;;
+   ;; Read from the query string or the JSON body, because the resets are called
+   ;; both ways across the harness and a caller should not have to know which.
+   (make-route "POST" "/api/engine/reset"
+               (lambda (_ body query)
+                 (declare (ignore _))
+                 (let* ((q (and query (jget query "clearAudit")))
+                        (b (and body (jget body "clearAudit")))
+                        (clear-audit (or (eq q t) (equal q "true") (equal q "1")
+                                         (eq b t) (equal b "true"))))
+                   (json-response
+                    (actor-ask actor
+                               (lambda (state)
+                                 (reset-reality-state state)
+                                 (when clear-audit
+                                   (setf (reality-state-semantic-audit state) nil))
+                                 (obj "success" t "auditCleared" (if clear-audit t :false))))))))
    (make-route "GET" "/api/engine/stats" (lambda (_ body query)
                                           (declare (ignore _ body query))
                                           (json-response (actor-ask actor (lambda (state) (obj "stats" (stats-json state)))))))
