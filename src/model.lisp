@@ -387,7 +387,12 @@ than guessing (MV-FOLD-REFUSES-P)."
 ;; consumes exactly that list — so the value the machine presents and the
 ;; evidence for it are derived from one enumeration rather than two that could
 ;; drift. Mirrors C++ `PendingOutput`.
-(defstruct pending-output sequence-id values provenance)
+;; ACTION-CODE: the action the corpus prescribes for this output, from the
+;; output event's metadata. RESOLVE-GOVERNANCE matches a rule by sequence-id and
+;; values and never sees the output event, so the action cannot be recovered
+;; downstream and has to travel with the pending output
+;; (RealityEngine_CI#365).
+(defstruct pending-output sequence-id values provenance action-code)
 
 (defstruct transition-result input-vector timestamp sequence-results sequence-outputs
                              machine-output merged-output pending-outputs arbiter-metadata)
@@ -791,7 +796,10 @@ was evaluated with the weaker predicate no matter what the loader recorded
                                         (make-pending-output
                                          :sequence-id sequence-id
                                          :values (output-vector-vector output)
-                                         :provenance (output-vector-provenance output)))
+                                         :provenance (output-vector-provenance output)
+                                         :action-code
+                                         (let ((m (output-vector-metadata output)))
+                                           (and m (jstring m "action" nil)))))
                                       (gethash sequence-id sequence-outputs)))))
              ;; CHAIN-TOP comes from the machine's declared alphabet. It is NOT
              ;; derivable from `bitsPerElement`, so a machine that selects one of
@@ -862,6 +870,10 @@ was evaluated with the weaker predicate no matter what the loader recorded
                     "machineName" (machine-name machine)
                     "sequenceId" sequence-id
                     "ragStatusCode" (or (jstring match "ragStatusCode" nil) +json-null+)
+                    ;; Placeholder: JOIN-GOVERNANCE overwrites this with the
+                    ;; winning contributor's action, which is the only place
+                    ;; that knows which output won the severity join.
+                    "actionCode" +json-null+
                     "processStatus" (or process-status +json-null+)
                     "ownerTeam" (or (and has-rule-gov (jstring rule-gov "ownerTeam" nil))
                                      (and has-machine-gov (jstring machine-gov "ownerTeam" nil))

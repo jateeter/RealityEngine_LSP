@@ -962,6 +962,12 @@ is intended: the value is the machine's, the severity is the evidence's."
             (when (or (> rank best-rank)
                       (and (= rank best-rank)
                            (string< sequence-id best-sequence-id)))
+              ;; The winning decision takes the action of the output that won
+              ;; with it, not of whichever was examined last. The decision
+              ;; travels WHOLE, and an action from another contributor would
+              ;; describe a determination that never happened.
+              (setf (jget decision "actionCode")
+                    (or (pending-output-action-code po) +json-null+))
               (setf best decision
                     best-rank rank
                     best-sequence-id sequence-id))))))
