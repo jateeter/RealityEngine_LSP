@@ -306,12 +306,35 @@ load-bearing — a sensor fed and then lapsed keeps its stored flag, so a later
 value revives it without anything having to re-establish it.  The Scala and
 TypeScript PEs use this same rule.  C++ derives from liveness instead and does
 write the demotion back; all three refuse to originate activity, which is the
-invariant, and differ only on whether storage or serialization owns expiry."
-  (when (string= (source-kind source) "sensor")
-    (setf (source-active-p source)
-          (and (source-active-p source)
-               (source-last-updated source)
-               t)))
+invariant, and differ only on whether storage or serialization owns expiry.
+
+Test and simulated sources are evaluated HERE rather than deferred to the first
+reset (RealityEngine_CI#358, settled in SURFACE_SPEC.md \"Already-settled
+instances\" 2026-09-12).  Point 3's table is *the* activity rule, not a
+reset-only rule, and a test source's term -- its interned sequence is non-empty
+-- is answerable the moment the source is declared.  Point 2(a)'s \"declares
+... inactive\" is scoped to integration sources, matching 2(b)'s \"a source
+from an integration\".
+
+This runtime evaluated only the sensor term at registration and left the other
+two kinds holding whatever flag they arrived with, so it declared 0 of 1351
+active where cpp and scala declared 1336, agreeing only after a reset.
+Membership never differed -- activity did, at one observation point, and under
+the quorum contract that is a disagreement whichever side is right."
+  (let ((kind (source-kind source)))
+    (cond
+      ;; Sensor: activation is earned, never asserted.  Unchanged.
+      ((string= kind "sensor")
+       (setf (source-active-p source)
+             (and (source-active-p source)
+                  (source-last-updated source)
+                  t)))
+      ;; Test and simulated: validated by the same predicate the read path and
+      ;; the reset already use, so one definition answers the question wherever
+      ;; it is asked.  A test source with no interned sequence stays inactive --
+      ;; the rule evaluating to NIL, not a caller's flag being honoured.
+      (t
+       (setf (source-active-p source) (source-validated-active-p source)))))
   source)
 
 (defun ensure-source-id (engine source)
