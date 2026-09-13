@@ -23,7 +23,14 @@ fi
 REALITY_ENGINE_PORT="${REALITY_ENGINE_PORT:-5601}"
 PERCEPTION_ENGINE_PORT="${PERCEPTION_ENGINE_PORT:-5600}"
 VECTOR_DIMENSION="${VECTOR_DIMENSION:-7680}"
-SBCL_DYNAMIC_SPACE_SIZE="${SBCL_DYNAMIC_SPACE_SIZE:-4096}"
+# Raised 4096 -> 8192 on 2026-09-13. At 4096 the RE died mid-run recording the
+# energy domain's CES contracts: "Heap exhausted, game over" with
+# bytes_allocated = 4207746768, i.e. it hit the ceiling exactly. The backtrace
+# was SUB-GC inside WRITE-JSON -> JSON-STRINGIFY -> DISPATCH-ROUTE, so the
+# allocation is response serialization: with a large resident corpus each
+# POST /api/perceive answers ~600 KB, and a contract sweep issues thousands.
+# This is a reservation ceiling, not committed memory.
+SBCL_DYNAMIC_SPACE_SIZE="${SBCL_DYNAMIC_SPACE_SIZE:-8192}"
 MACHINES_DIR="${MACHINES_DIR:-../RealityEngine_Machines/machines}"
 RE_LOAD_MACHINES="${RE_LOAD_MACHINES:-1}"
 LOCAL_AI_API_URL="${LOCAL_AI_API_URL:-http://localhost:4000}"
