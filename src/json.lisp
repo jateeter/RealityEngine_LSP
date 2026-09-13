@@ -31,6 +31,17 @@
   (declare (ignore default))
   (setf (gethash (string key) object) value))
 
+(defun json-string-list (value)
+  "VALUE as a list of strings, or NIL when it is absent or not an array.
+
+Used by the /api/perceive subset selector (RealityEngine_CI#367), where NIL has
+to mean \"the caller supplied no selector\" and therefore \"keep everything\".
+An absent key and a present-but-empty array are deliberately both NIL here:
+`only: {}` is not a request to filter everything out, it is a request that names
+nothing. A caller filtering to nothing names a sequence id that does not match."
+  (when (jarray-p value)
+    (remove-if-not #'stringp (coerce value 'list))))
+
 (defun jobject-p (value)
   (hash-table-p* value))
 

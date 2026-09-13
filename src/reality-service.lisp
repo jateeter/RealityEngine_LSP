@@ -1212,9 +1212,26 @@ Replaces an NREVERSE, which only undid the push order and carried no meaning."
 ;; response sees a runtime that reports no active regions. Defaulting to the
 ;; declared option makes the correct behaviour the one you get by saying
 ;; nothing, so a future call site cannot omit the field by omission.
+(defun step-selector-keeps-p (only-sequence-ids only-machine-names selected-ids
+                              sequence-ids machine-id)
+  "True when this entry belongs to the caller's requested subset.
+
+RealityEngine_CI#367. Selection is by sequence id, not by region: a region can
+have more than one writer, a sequence id cannot. Machine *names* rather than
+ids, because ids are minted per runtime and a caller cannot know them --
+SELECTED-IDS is the set this runtime's ids resolve to.
+
+NIL for both selector lists means no selector was supplied and everything is
+kept, so the unfiltered wire is unchanged."
+  (if (and (null only-sequence-ids) (null only-machine-names))
+      t
+      (or (some (lambda (sid) (member sid only-sequence-ids :test #'string=))
+                (coerce (or sequence-ids #()) 'list))
+          (and machine-id (member machine-id selected-ids :test #'string=)))))
+
 (defun process-perceptual-input (state input &key override include-machine-results include-perceptual-space
                                                   (include-active-regions (reality-state-include-active-regions-p state))
-                                                  compact)
+                                                  compact only-sequence-ids only-machine-names)
   ;; include-perceptual-space is accepted and ignored: SURFACE_SPEC.md makes
   ;; perceptualSpace unconditional in the push response. Kept in the lambda list
   ;; so existing callers (and RE_INCLUDE_PERCEPTUAL_SPACE) do not become errors.
@@ -1452,6 +1469,37 @@ Replaces an NREVERSE, which only undid the push order and carried no meaning."
            ;; machineResults is omitted under compact rather than emitted empty.
            ;; An empty object is not the same as an absent key to a consumer
            ;; walking the response, and the other two omit it.
+           ;; Subset selection (RealityEngine_CI#367). Applied here, before the
+           ;; vectors are built, so the entries the caller did not ask for are
+           ;; never allocated -- filtering a fully-built batch would leave the
+           ;; allocation cost, which is the whole defect. Measured before this:
+           ;; a single push answered ~600 KB with 187 machines resident and
+           ;; exhausted the 4 GB heap mid-sweep.
+           (selected-ids
+             (when (or only-sequence-ids only-machine-names)
+               (loop for mid being the hash-keys of machine-results using (hash-value mr)
+                     when (member (jstring mr "machineName" "") only-machine-names :test #'string=)
+                       collect mid)))
+           (merge-batch
+             (if (or only-sequence-ids only-machine-names)
+                 (remove-if-not (lambda (op)
+                                  (step-selector-keeps-p only-sequence-ids only-machine-names
+                                                         selected-ids
+                                                         (jget op "sequenceIds")
+                                                         (jstring op "machineId" nil)))
+                                merge-batch)
+                 merge-batch))
+           (event-bus
+             (if (or only-sequence-ids only-machine-names)
+                 (remove-if-not (lambda (w)
+                                  (or (member (jstring w "producerSequenceId" "") only-sequence-ids
+                                              :test #'string=)
+                                      (member (jstring w "producerMachineId" "") selected-ids
+                                              :test #'string=)
+                                      (member (jstring w "subscriberMachineId" "") selected-ids
+                                              :test #'string=)))
+                                event-bus)
+                 event-bus))
            (step (obj "stepNumber" step-number
                      "timestamp" (now-ms)
                      "mergeBatch" (vectorize merge-batch)
@@ -1464,7 +1512,14 @@ Replaces an NREVERSE, which only undid the push order and carried no meaning."
       ;; sets, so emptying it would read as agreement between a runtime with
       ;; nothing to report and one that was never asked.
       (when include-active-regions
-        (setf (jget step "activeRegions") (vectorize (sort-active-regions active-regions))))
+        (setf (jget step "activeRegions")
+              (vectorize (sort-active-regions
+                          (if (or only-sequence-ids only-machine-names)
+                              (remove-if-not (lambda (r)
+                                               (member (jstring r "machineId" "") selected-ids
+                                                       :test #'string=))
+                                             active-regions)
+                              active-regions)))))
       (when include-machine-results
         (setf (jget step "machineResults") machine-results))
       ;; Always present, compact or not. This was gated on
@@ -2615,7 +2670,9 @@ on this surface."
                                                                            :include-active-regions (jbool body "includeActiveRegions"
                                                                                                          (reality-state-include-active-regions-p state))
                                                                            :compact (or (jbool body "compact" nil)
-                                                                                        (compact-query-p query)))))
+                                                                                        (compact-query-p query))
+                                                                           :only-sequence-ids (json-string-list (jget (jget body "only") "sequenceIds"))
+                                                                           :only-machine-names (json-string-list (jget (jget body "only") "machineNames")))))
                                                                 (re-broadcast (obj "type" "step-result" "step" step))
                                                                 step)
                                                               (obj "error" "Provide exactly one of: vector, sparseVector, domainVectors"))))))))))
