@@ -55,11 +55,25 @@ manifest; matching rows gain semanticsIri/semanticsHash (roadmap M4)."
   (let ((dir (uiop:ensure-directory-pathname machine-dir))
         (rows nil))
     (when (uiop:directory-exists-p dir)
-      ;; collect-json-files-recursive returns truenames; relativize against
-      ;; the directory truename so relFile survives symlinked roots.
+      ;; Relativize truename against truename. `collect-json-files-recursive`
+      ;; walks with `uiop:directory-files`, which does NOT resolve symlinks --
+      ;; the comment that once stood here claimed it returned truenames, and
+      ;; that claim is what made this look correct.
+      ;;
+      ;; On macOS /tmp is a symlink to /private/tmp, and the harness serves the
+      ;; corpus from /tmp/realityengine-<profile>-corpus/machines. So `full` was
+      ;; /tmp/... while `dir-name` was /private/tmp/..., the prefix test failed,
+      ;; and every row fell back to `(file-namestring path)` -- a bare basename.
+      ;;
+      ;; Two things broke silently. relFile stopped being path-aware, against
+      ;; the corpus addressing contract every engine is held to. And
+      ;; `semantics-key-for-rel` then derived core/<stem> instead of
+      ;; <domain>/<stem>, matched nothing in the manifest, and dropped
+      ;; semanticsIri/semanticsHash from every row -- measured 0 of 21 here
+      ;; against 18 of 21 on cpp and scala, which is roadmap M4's open item.
       (let ((dir-name (namestring (truename dir))))
         (dolist (path (collect-json-files-recursive dir))
-          (let* ((full (namestring path))
+          (let* ((full (namestring (truename path)))
                  (rel (if (and (> (length full) (length dir-name))
                                (string= dir-name full :end2 (length dir-name)))
                           (subseq full (length dir-name))
