@@ -122,6 +122,10 @@ the whole set sorted by key, per the contract."
   machine-catalog machine-catalog-lock machine-catalog-refreshed-at
   catalog-cold-warned-p
   dispatch-ledger dispatch-ledger-limit
+  ;; localAI/MCP invocation ledger (RealityEngine_Machines#152). Mirrors the
+  ;; dispatch ledger above: newest first, bounded, so a long-running PE cannot
+  ;; grow without bound and both ledgers read alike.
+  localai-ledger localai-ledger-limit
   ollama-base-url ollama-model ollama-completion-source-mapping-id
   openai-base-url openai-model openai-completion-source-mapping-id openai-api-key
   acp-enabled-p acp-platform acp-surface acp-command acp-gateway-url
@@ -161,6 +165,8 @@ the whole set sorted by key, per the contract."
    :catalog-cold-warned-p nil
    :dispatch-ledger nil
    :dispatch-ledger-limit (env-int "TRIGGER_DISPATCH_LEDGER_LIMIT" 100)
+   :localai-ledger nil
+   :localai-ledger-limit (env-int "LOCALAI_INVOCATION_LEDGER_LIMIT" 256)
    :ollama-base-url (trim-trailing-slashes (env "OLLAMA_BASE_URL" "http://localhost:11434"))
    ;; Canonical default shared by every runtime; override per engine with
    ;; OLLAMA_MODEL. See RealityEngine_CI/docs/OLLAMA_INTEGRATION.md.
@@ -459,23 +465,108 @@ Per-sequence boundaries live in metadata.segments for UI display."
                      (string-prefix-p (format nil "~a/" prefix) path))))
           allowed)))
 
+(defun localai-operation-id (state endpoint)
+  "The catalogue's own id for ENDPOINT, or NIL when it names none.
+
+Read from this runtime's /api/integrations/localai/catalog rather than a list
+kept here, so the ledger names the operation the deployment permits. An endpoint
+absent from the catalogue records no id, which is itself the finding."
+  (let* ((catalog (localai-catalog-json state))
+         (allowed (jget catalog "allowedEndpoints")))
+    (when allowed
+      (loop for entry across allowed
+            when (equal (jstring entry "path" nil) endpoint)
+              return (jstring entry "id" nil)))))
+
+(defun record-localai-invocation (state record)
+  "Append one invocation record, newest first, bounded like the dispatch ledger."
+  (push record (perception-state-localai-ledger state))
+  (when (> (length (perception-state-localai-ledger state))
+           (perception-state-localai-ledger-limit state))
+    (setf (perception-state-localai-ledger state)
+          (subseq (perception-state-localai-ledger state)
+                  0
+                  (perception-state-localai-ledger-limit state))))
+  record)
+
+(defun localai-ledger-json (state)
+  "GET /api/integrations/localai/ledger — wire-compatible with the C++ PE.
+
+Records are returned oldest-first to match the C++ ring, which appends; this
+implementation pushes, so the stored list is reversed on the way out rather than
+letting the two runtimes disagree on order for the same endpoint."
+  (obj "provider" "localai"
+       "endpoint" (perception-state-localai-url state)
+       "records" (vectorize (reverse (perception-state-localai-ledger state)))))
+
 (defun invoke-localai (state body)
   (let* ((method (string-upcase (or (jstring body "method" nil) "POST")))
-         (endpoint (or (jstring body "endpoint" nil) (jstring body "path" nil))))
+         (endpoint (or (jstring body "endpoint" nil) (jstring body "path" nil)))
+         ;; The correlation id is what lets a completion write-back be joined to
+         ;; the invocation that justified it. Taken from the caller when given so
+         ;; an existing chain is preserved, minted otherwise so no record is left
+         ;; unjoinable.
+         (correlation-id (or (jstring body "correlationId" nil) (make-id "localai-invocation")))
+         (invocation-id (make-id "localai-inv"))
+         (started-at (now-ms)))
     (unless endpoint
       (return-from invoke-localai (obj "success" +json-false+ "error" "localAI invocation requires endpoint or path")))
     (unless (char= (char endpoint 0) #\/)
       (setf endpoint (format nil "/~a" endpoint)))
-    (unless (endpoint-allowed-p endpoint)
-      (return-from invoke-localai (obj "success" +json-false+ "endpoint" endpoint "method" method "error" "localAI endpoint is not allowed")))
-    (handler-case
-        (let ((response (if (string= method "GET")
-                            (http-get-json (format nil "~a~a" (perception-state-localai-url state) endpoint))
-                            (http-post-json (format nil "~a~a" (perception-state-localai-url state) endpoint)
-                                            (or (jget body "payload") (obj))))))
-          (obj "success" t "endpoint" endpoint "method" method "response" response))
-      (error (condition)
-        (obj "success" +json-false+ "endpoint" endpoint "method" method "error" (princ-to-string condition))))))
+    (labels ((carry (key into)
+               ;; Machine and sequence are recorded only when the caller names
+               ;; them. An invocation with no authored occasion is a detectable
+               ;; condition; inventing one would hide it.
+               (let ((v (jstring body key nil)))
+                 (if (and v (plusp (length v))) (append into (list key v)) into)))
+             (record (success operation-id response error)
+               (let ((fields (list "id" invocation-id
+                                   "correlationId" correlation-id
+                                   "provider" "localai"
+                                   "endpoint" endpoint
+                                   "method" method
+                                   "startedAt" started-at
+                                   "completedAt" (now-ms)
+                                   "success" (if success t +json-false+))))
+                 (when operation-id (setf fields (append fields (list "operationId" operation-id))))
+                 (dolist (k '("machineName" "sequenceId" "requestClass" "resultClass"))
+                   (setf fields (carry k fields)))
+                 (when error (setf fields (append fields (list "error" error))))
+                 ;; The response is summarised, never stored whole: a ledger
+                 ;; holding every RAG passage becomes the largest object in the
+                 ;; process and is read by nobody. What a trace needs is that
+                 ;; evidence existed and where it came from.
+                 (when response
+                   (setf fields (append fields
+                                        (list "evidence"
+                                              (obj "uri" (format nil "~a~a" (perception-state-localai-url state) endpoint)
+                                                   "shape" "object")))))
+                 (record-localai-invocation state (apply #'obj fields)))))
+      (unless (endpoint-allowed-p endpoint)
+        ;; Recorded before the refusal is returned. An attempt on a forbidden
+        ;; endpoint is exactly the event a runtime trace must carry, and an
+        ;; unrecorded path loses it entirely.
+        (record nil (localai-operation-id state endpoint) nil "endpoint is not allowed")
+        (return-from invoke-localai
+          (obj "success" +json-false+ "endpoint" endpoint "method" method
+               "correlationId" correlation-id
+               "error" "localAI endpoint is not allowed")))
+      (handler-case
+          (let ((response (if (string= method "GET")
+                              (http-get-json (format nil "~a~a" (perception-state-localai-url state) endpoint))
+                              (http-post-json (format nil "~a~a" (perception-state-localai-url state) endpoint)
+                                              (or (jget body "payload") (obj))))))
+            (record t (localai-operation-id state endpoint) response nil)
+            (obj "success" t "endpoint" endpoint "method" method
+                 "correlationId" correlation-id "invocationId" invocation-id
+                 "response" response))
+        (error (condition)
+          ;; A call that failed is still a call that was made. A ledger of
+          ;; successes cannot answer "was this attempted".
+          (record nil (localai-operation-id state endpoint) nil (princ-to-string condition))
+          (obj "success" +json-false+ "endpoint" endpoint "method" method
+               "correlationId" correlation-id
+               "error" (princ-to-string condition)))))))
 
 (defun load-integrations-config (state)
   (let* ((configured (env "INTEGRATIONS_CONFIG" nil))
@@ -2127,6 +2218,9 @@ it is accepted as an alternative to the body bridgeToken/token fields."
    (make-route "POST" "/api/integrations/localai/invoke" (lambda (_ body query)
                                                           (declare (ignore _ query))
                                                           (json-response (actor-ask actor (lambda (state) (invoke-localai state body))))))
+   (make-route "GET" "/api/integrations/localai/ledger" (lambda (_ body query)
+                                                         (declare (ignore _ body query))
+                                                         (json-response (actor-ask actor #'localai-ledger-json))))
    (make-route "POST" "/api/signals" (lambda (_ body query)
                                       (declare (ignore _ query))
                                       (json-response
