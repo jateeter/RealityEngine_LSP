@@ -1878,8 +1878,20 @@ on this surface."
                                                                 (lambda (_ vector-json)
                                                                   (declare (ignore _))
                                                                   (when (< (length rows) limit)
+                                                                    ;; `elements` is the third branch, and the one that matters:
+                                                                    ;; a document posted to /api/vectors usually carries its
+                                                                    ;; numbers there, not in a top-level `vector` array. Without
+                                                                    ;; it this scored against an empty list -- cosine 0 -- while
+                                                                    ;; C++ (`searchable_vector_values`) and Scala
+                                                                    ;; (`searchableValues`) both scored ~1.0 for the same
+                                                                    ;; document and query. Surfaced by RealityEngine_CI#288 once
+                                                                    ;; Scala stored documents and the three could be compared.
+                                                                    ;; `numbers-from-json` already reads `value` out of array
+                                                                    ;; entries that are objects, so `elements` needs no
+                                                                    ;; special-casing beyond being looked at.
                                                                     (let ((score (cosine query-vector (numbers-from-json (or (jget vector-json "vector")
                                                                                                                              (jget vector-json "values")
+                                                                                                                             (jget vector-json "elements")
                                                                                                                              (arr))))))
                                                                       (when (or (null threshold) (>= score threshold))
                                                                         (push (obj "vector" vector-json "score" score) rows)))))
