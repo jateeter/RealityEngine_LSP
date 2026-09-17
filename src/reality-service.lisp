@@ -1800,17 +1800,133 @@ on this surface."
          "edges" (vectorize (nreverse edges))
          "perceptualSpaceDimension" (reality-state-dimension state))))
 
+(defun runtime-options-json (state)
+  "The flat view of the engine-scoped controls.
+
+   Built from the control table so this shape and /api/engine/config cannot
+   disagree about which controls exist. `projectionControls` is deliberately
+   absent: it was prose describing request-body fields, emitted by C++ and Scala
+   with different key sets and by this runtime not at all, and read by nothing.
+   Documentation of a request field belongs in SURFACE_SPEC, where there is one
+   copy."
+  (let ((options (obj)))
+    (dolist (control (engine-controls) options)
+      (when (string= (second control) "engine")
+        (setf (jget options (first control))
+              (jget (funcall (third control) state) "value"))))))
+
+(defun control-json (name scope value declared-default)
+  "A control in the five-field shape SURFACE_SPEC declares.
+
+   DECLARED-DEFAULT is the specification's value, restated in the response so a
+   reader can see what this runtime is supposed to hold as well as what it does
+   hold. Those are different questions, and /api/runtime/options answers only
+   the second — which is how a runtime someone had written to became
+   indistinguishable from one shipped that way."
+  (obj "name" name
+       "scope" scope
+       "value" value
+       "default" declared-default
+       "mutable" (json-bool t)))
+
 (defun transitions-inhibited-control (state)
   "The transitionsInhibited control, in the shape SURFACE_SPEC declares."
   (let ((value (obj)))
     (maphash (lambda (id machine)
                (setf (jget value id) (json-bool (machine-transitions-inhibited machine))))
              (reality-state-machines state))
-    (obj "name" "transitionsInhibited"
-         "scope" "machine"
-         "value" value
-         "default" (json-bool nil)
-         "mutable" (json-bool t))))
+    (control-json "transitionsInhibited" "machine" value (json-bool nil))))
+
+;; Every control on the pathway, in one table (SURFACE_SPEC.md,
+;; "/api/engine/config").
+;;
+;; Phase 1 carried its single control as `(string/= name "transitionsInhibited")`
+;; in each of four route handlers. A branch per control is how a runtime ends up
+;; implementing four of five and answering 404 for the rest — and this surface
+;; exists to be compared, so a control missing from one runtime is the defect
+;; rather than a difference.
+;;
+;; Each entry is (name scope reader writer resetter). READER takes state.
+;; WRITER takes state and the request body and returns the control on success,
+;; or a refusal `(:refused message status)` — a write that lands nowhere and
+;; answers 200 is the shape this pathway removes.
+;;
+;; The refusal is one value, not `(values nil message status)`, because writers
+;; run inside `actor-ask`, which returns `(second outcome)` and drops every
+;; other value. Secondary values would arrive as NIL and the route would answer
+;; with an empty error message. A control object is a hash table and a refusal
+;; is a list, so the two are told apart without a sentinel field.
+(defun engine-controls ()
+  "The control table. A list of (NAME SCOPE READER WRITER RESETTER)."
+  ;; READ and WRITE are passed explicitly rather than derived from the accessor
+  ;; name. `(fdefinition (list 'setf accessor))` would be shorter, but whether a
+  ;; defstruct slot has a setf *function* as opposed to only a setf expander is
+  ;; implementation-dependent, and a control whose writer fails to resolve would
+  ;; fail at request time rather than at load time.
+  (flet ((boolean-control (name read write declared-default)
+           ;; An engine-scoped boolean, written once rather than four times so
+           ;; the four cannot drift apart the way the runtimes they mirror did.
+           (flet ((current (state)
+                    (control-json name "engine"
+                                  (json-bool (funcall read state))
+                                  (json-bool declared-default))))
+             (list name "engine"
+                   #'current
+                   (lambda (state body)
+                     (if (eq (jget body "value" :missing) :missing)
+                         (list :refused (format nil "~a requires a boolean `value`" name) 400)
+                         (progn (funcall write state (jbool body "value" nil))
+                                (current state))))
+                   (lambda (state)
+                     (funcall write state declared-default)
+                     (current state))))))
+    (list
+     (list "historyLimit" "engine"
+           (lambda (state)
+             (control-json "historyLimit" "engine"
+                           (reality-state-history-limit state) 250))
+           (lambda (state body)
+             ;; A negative or fractional limit is refused rather than truncated
+             ;; into a bound that no longer bounds anything.
+             (let ((v (jget body "value" :missing)))
+               (if (or (eq v :missing) (not (realp v)) (minusp v) (/= v (truncate v)))
+                   (list :refused "historyLimit requires a non-negative whole-number `value`" 400)
+                   (progn (setf (reality-state-history-limit state) (truncate v))
+                          (control-json "historyLimit" "engine"
+                                        (reality-state-history-limit state) 250)))))
+           (lambda (state)
+             (setf (reality-state-history-limit state) 250)
+             (control-json "historyLimit" "engine"
+                           (reality-state-history-limit state) 250)))
+     (boolean-control "includeActiveRegions"
+                      #'reality-state-include-active-regions-p
+                      (lambda (state v) (setf (reality-state-include-active-regions-p state) v))
+                      t)
+     (boolean-control "includeMachineResults"
+                      #'reality-state-include-machine-results-p
+                      (lambda (state v) (setf (reality-state-include-machine-results-p state) v))
+                      t)
+     (boolean-control "includePerceptualSpace"
+                      #'reality-state-include-perceptual-space-p
+                      (lambda (state v) (setf (reality-state-include-perceptual-space-p state) v))
+                      t)
+     (list "transitionsInhibited" "machine"
+           #'transitions-inhibited-control
+           (lambda (state body)
+             (if (eq (jget body "value" :missing) :missing)
+                 (list :refused "transitionsInhibited requires a boolean `value`" 400)
+                 (let ((result (set-transitions-inhibited state
+                                                          (jstring body "machine" nil)
+                                                          (jbool body "value" nil))))
+                   (if (eq result :missing)
+                       (list :refused (format nil "Machine not found: ~a"
+                                              (jstring body "machine" nil)) 404)
+                       result))))
+           (lambda (state) (set-transitions-inhibited state nil nil))))))
+
+(defun find-engine-control (name)
+  "The table entry for NAME, or NIL."
+  (find name (engine-controls) :key #'first :test #'string=))
 
 (defun set-transitions-inhibited (state machine-id value)
   "Set the control for one machine, or for every machine when MACHINE-ID is NIL.
@@ -1952,26 +2068,30 @@ on this surface."
                                         (actor-ask actor (lambda (state) (prometheus-text-of state "lsp")))
                                         200
                                         "text/plain; version=0.0.4; charset=utf-8")))
+     ;; The flat view of the same state /api/engine/config enumerates. Two views,
+     ;; one store — a runtime holding two copies that can disagree does not
+     ;; conform (SURFACE_SPEC.md).
      (make-route "GET" "/api/runtime/options" (lambda (_ body query)
                                                 (declare (ignore _ body query))
-                                                (state-json (lambda (state)
-                                                              (obj "historyLimit" (reality-state-history-limit state)
-                                                                   "includeMachineResults" (json-bool (reality-state-include-machine-results-p state))
-                                                                   "includePerceptualSpace" (json-bool (reality-state-include-perceptual-space-p state))
-                                                                "includeActiveRegions" (json-bool (reality-state-include-active-regions-p state)))))))
+                                                (state-json #'runtime-options-json)))
+     ;; This handler used to set includeMachineResults and includePerceptualSpace
+     ;; and then echo includeActiveRegions back unchanged, so a PATCH asking for
+     ;; includeActiveRegions:false answered 200 with the old value and nothing
+     ;; recorded the refusal. Writing through the control table removes the
+     ;; possibility: a field this runtime does not carry is not silently
+     ;; dropped, it is absent from the table and therefore absent from the
+     ;; response.
      (make-route "PATCH" "/api/runtime/options" (lambda (_ body query)
                                                    (declare (ignore _ query))
-                                                   (state-json (lambda (state)
-                                                                 (when (jnumber body "historyLimit" nil)
-                                                                   (setf (reality-state-history-limit state) (truncate (jnumber body "historyLimit"))))
-                                                                 (when (not (eq (jget body "includeMachineResults" :missing) :missing))
-                                                                   (setf (reality-state-include-machine-results-p state) (jbool body "includeMachineResults" t)))
-                                                                 (when (not (eq (jget body "includePerceptualSpace" :missing) :missing))
-                                                                   (setf (reality-state-include-perceptual-space-p state) (jbool body "includePerceptualSpace" t)))
-                                                                 (obj "historyLimit" (reality-state-history-limit state)
-                                                                      "includeMachineResults" (json-bool (reality-state-include-machine-results-p state))
-                                                                      "includePerceptualSpace" (json-bool (reality-state-include-perceptual-space-p state))
-                                                                "includeActiveRegions" (json-bool (reality-state-include-active-regions-p state)))))))
+                                                   (state-json
+                                                    (lambda (state)
+                                                      (dolist (control (engine-controls))
+                                                        (let ((name (first control)))
+                                                          (when (and (string/= name "transitionsInhibited")
+                                                                     (not (eq (jget body name :missing) :missing)))
+                                                            (funcall (fourth control) state
+                                                                     (obj "value" (jget body name))))))
+                                                      (runtime-options-json state)))))
      (make-route "GET" "/api/runtime/vector-space" (lambda (_ body query)
                                                      (declare (ignore _ body query))
                                                      (state-json (lambda (state)
@@ -2090,44 +2210,42 @@ on this surface."
                                                (actor-ask actor
                                                           (lambda (state)
                                                             (obj "controls"
-                                                                 (vectorize (list (transitions-inhibited-control state)))))))))
+                                                                 (vectorize
+                                                                  (mapcar (lambda (c) (funcall (third c) state))
+                                                                          (engine-controls)))))))))
      (make-route "GET" "/api/engine/config/:control" (lambda (params body query)
                                                        (declare (ignore body query))
-                                                       (let ((name (gethash "control" params)))
-                                                         (if (string/= name "transitionsInhibited")
+                                                       (let* ((name (gethash "control" params))
+                                                              (control (find-engine-control name)))
+                                                         (if (null control)
                                                              (error-response (format nil "Unknown control: ~a" name) 404)
                                                              (json-response
-                                                              (actor-ask actor #'transitions-inhibited-control))))))
+                                                              (actor-ask actor (third control)))))))
+     ;; The write path decides outside the actor closure. `error-response` reads
+     ;; HUNCHENTOOT:*REPLY*, which is unbound on the actor thread, so the closure
+     ;; returns a refusal as values and the route turns it into a response here.
      (make-route "PUT" "/api/engine/config/:control" (lambda (params body query)
                                                        (declare (ignore query))
-                                                       (let ((name (gethash "control" params)))
-                                                         (cond
-                                                           ((string/= name "transitionsInhibited")
-                                                            (error-response (format nil "Unknown control: ~a" name) 404))
-                                                           ((eq (jget body "value" :missing) :missing)
-                                                            (error-response "transitionsInhibited requires a boolean `value`" 400))
-                                                           (t
-                                                            (let* ((value (jbool body "value" nil))
-                                                                   (machine-id (jstring body "machine" nil))
-                                                                   (result (actor-ask actor
-                                                                                      (lambda (state)
-                                                                                        (set-transitions-inhibited state machine-id value)))))
-                                                              ;; A write naming a machine that does not exist is 404,
-                                                              ;; never a silent no-op answering 200.
-                                                              (if (eq result :missing)
-                                                                  (error-response (format nil "Machine not found: ~a" machine-id) 404)
-                                                                  (json-response result))))))))
+                                                       (let* ((name (gethash "control" params))
+                                                              (control (find-engine-control name)))
+                                                         (if (null control)
+                                                             (error-response (format nil "Unknown control: ~a" name) 404)
+                                                             (let ((result (actor-ask actor
+                                                                                       (lambda (state)
+                                                                                         (funcall (fourth control) state body)))))
+                                                               (if (and (consp result) (eq (first result) :refused))
+                                                                   (error-response (second result) (third result))
+                                                                   (json-response result)))))))
      (make-route "DELETE" "/api/engine/config/:control" (lambda (params body query)
                                                           (declare (ignore body query))
-                                                          (let ((name (gethash "control" params)))
-                                                            (if (string/= name "transitionsInhibited")
+                                                          (let* ((name (gethash "control" params))
+                                                                 (control (find-engine-control name)))
+                                                            (if (null control)
                                                                 (error-response (format nil "Unknown control: ~a" name) 404)
                                                                 ;; "Restore the declared default", not "remove the
                                                                 ;; control" — controls are fixed by the specification.
                                                                 (json-response
-                                                                 (actor-ask actor
-                                                                            (lambda (state)
-                                                                              (set-transitions-inhibited state nil nil))))))))
+                                                                 (actor-ask actor (fifth control)))))))
      (make-route "GET" "/api/engine/history" (lambda (_ body query)
                                                (declare (ignore _ body query))
                                                (state-json (lambda (state) (obj "history" (vectorize (reality-state-engine-history state)))))))
