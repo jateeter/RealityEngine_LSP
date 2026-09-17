@@ -13,7 +13,14 @@
   value)
 
 (defun error-response (message &optional (status 500))
-  (json-response (obj "error" message "status" status) status))
+  "An error body carrying only `error`, matching C++ and Scala.
+
+   The status belongs in the HTTP status line, and it is already there — the
+   second argument to json-response. Repeating it in the body made every error
+   response from this runtime differ from the other two by one field, which a
+   byte-equivalence check reads as a divergence on every error path at once
+   (RealityEngine_CI#397). Nothing read the field."
+  (json-response (obj "error" message) status))
 
 (defun request-body-json ()
   (parse-json (or (hunchentoot:raw-post-data :force-text t) "")))
