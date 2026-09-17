@@ -32,7 +32,7 @@ Read the contract before building or deploying:
     RealityEngine_CI/docs/BUILD_CONTROL_CONTRACT.md
 
 ```bash
-cd ../RealityEngine_CI && ./scripts/regression-test.sh --build-only
+cd ../RealityEngine_CI && ./scripts/regression-test.sh --execute --build-only
 ```
 
 Quicklisp is bootstrapped by the harness, not by the caller's environment:
