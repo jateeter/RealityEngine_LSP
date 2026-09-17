@@ -1904,9 +1904,30 @@ on this surface."
                                                         (setf (jget body "id") id
                                                               (gethash id (reality-state-vector-store state)) body)
                                                         (obj "success" t "vector" body))))))
+     ;; Reads this runtime's own store. Vector ids are engine-scoped -- a
+     ;; document posted here exists here and on no other engine -- so 404 means
+     ;; "this engine does not hold it", which is the only thing this engine can
+     ;; honestly say about an id. This used to answer 200 with a fixed message
+     ;; for every id, including ids that existed nowhere, so a caller read
+     ;; "not found" as "found" (RealityEngine_CI#397).
+     ;;
+     ;; Internal surface. External callers reach it through the Manager's
+     ;; engine-qualified route, /api/engines/:id/vectors/:vid, so that an id is
+     ;; always used in the context of the engine that minted it.
      (make-route "GET" "/api/vectors/:id" (lambda (params body query)
                                            (declare (ignore body query))
-                                           (json-response (obj "message" "Vector retrieval endpoint" "id" (gethash "id" params)))))
+                                           ;; actor-ask to pull the document out, then decide the
+                                           ;; response OUT HERE. `state-json` always wraps its result
+                                           ;; as a 200 body, so returning an `error-response` from
+                                           ;; inside it yields a 500 with HUNCHENTOOT:*REPLY* unbound
+                                           ;; rather than a 404. Same shape as GET /api/sequences/:id.
+                                           (let ((doc (actor-ask actor
+                                                                 (lambda (state)
+                                                                   (gethash (gethash "id" params)
+                                                                            (reality-state-vector-store state))))))
+                                             (if doc
+                                                 (json-response (obj "vector" doc))
+                                                 (error-response "Vector not found" 404)))))
      (make-route "DELETE" "/api/vectors/:id" (lambda (params body query)
                                               (declare (ignore body query))
                                               (state-json (lambda (state)
