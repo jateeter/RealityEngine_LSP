@@ -356,8 +356,24 @@ Per-sequence boundaries live in metadata.segments for UI display."
                 ;; — a redefined machine may replace the old one entirely — so
                 ;; skipping the rebuild keeps a source describing a machine
                 ;; that no longer exists. PE_SOURCE_MERGE=true restores the skip.
+                ;; Default TRUE: skip a machine that already has a source.
+                ;;
+                ;; This defaulted to NIL, so every bootstrap rebuilt every
+                ;; source — and counted each rebuild as `created`, reporting
+                ;; 1336 created while the source count stayed at 1351 with no
+                ;; new names and no duplicates. CPP and Scala skip and report 0
+                ;; (RealityEngine_CI#413).
+                ;;
+                ;; The concern below is real and is why the default was NIL: a
+                ;; machine redefined since its source was built keeps a source
+                ;; describing the old definition. SURFACE_SPEC answers it — a
+                ;; redefined corpus is reloaded rather than merged, and
+                ;; PE_SOURCE_MERGE=false still forces the rebuild — and weighs
+                ;; it against the cost of not skipping, which is that every
+                ;; cross-runtime comparison arms its stimulus with this call and
+                ;; a rebuild on one runtime is different work from a skip on two.
                 ((or (null mid)
-                     (and (env-bool "PE_SOURCE_MERGE" nil) (gethash mid existing))
+                     (and (env-bool "PE_SOURCE_MERGE" t) (gethash mid existing))
                      (not (jobject-p input-region))
                      (null input-sequences))
                  (incf skipped))
