@@ -1350,12 +1350,45 @@ kept, so the unfiltered wire is unchanged."
                           "machineName"      (or (machine-name machine) "")
                           "inputRegion"      (region-json (mapping-input mapping))
                           "inputEvent"      (vectorize machine-input)
-                          "outputRegion"     (if out-mapping
+                          ;; Absence is NULL, in all three of these, because
+                          ;; they describe one thing: the output this step
+                          ;; produced. A machine that completed no Reality Event
+                          ;; produced none, so there is no vector and no region
+                          ;; it was written to.
+                          ;;
+                          ;; `outputRegion` used to report the machine's
+                          ;; *declared* region whenever it had one, and
+                          ;; `outputVector` used to report `[]` — while
+                          ;; `mergedOutputVector` beside them reported NULL for
+                          ;; the very same condition. One object, one condition,
+                          ;; two encodings (RealityEngine_CI#409).
+                          ;;
+                          ;; `[]` is not a neutral stand-in for absence. It is a
+                          ;; positive claim that an output vector exists and is
+                          ;; empty, which is the same error as the vector of
+                          ;; zeros the note below rejects: "zeros would be a
+                          ;; positive claim about every cell in the region". A
+                          ;; consumer asking "did this machine produce output?"
+                          ;; got yes-but-empty here and no from CPP and Scala.
+                          ;;
+                          ;; The machine's declared output region is still
+                          ;; reachable — it is a property of the machine, and
+                          ;; `GET /api/machines/:id` is where a caller asks for
+                          ;; one. This field answers a narrower question.
+                          ;; `(or out-values merged)`, not `out-values` alone:
+                          ;; this runtime's own PE aggregator merges using
+                          ;; `outputRegion` and prefers `mergedOutputVector` over
+                          ;; `outputVector`, so a region nulled while a merged
+                          ;; output existed would silently drop that machine's
+                          ;; contribution to the next InputSpaceVector. That is
+                          ;; the 2026-08-19 defect described above, and it showed
+                          ;; up only as a single divergent cell.
+                          "outputRegion"     (if (and out-mapping (or out-values merged))
                                                 (region-json out-mapping)
                                                 +json-null+)
                           "mergedOutputVector" (if merged (vectorize merged) +json-null+)
                           "outputMergeTransformation" transformation
-                          "outputVector"     (vectorize (or out-values nil))
+                          "outputVector"     (if out-values (vectorize out-values) +json-null+)
                           "transitionResult" (transition-result-json result)))))
            (push (obj "offset" (region-offset (mapping-input mapping))
                       "length" (region-length (mapping-input mapping))
