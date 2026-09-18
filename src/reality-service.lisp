@@ -1019,6 +1019,12 @@ every subscription that machine feeds — and those subscriptions write into the
 perceptual space, so meta machines downstream of a refusing producer would go
 quiet with nothing in the response to show it."
   (obj "machineId" (machine-id machine)
+       ;; Corpus-declared and globally unique, and the reason it is here: the
+       ;; batch is ordered by it. `machineId` is minted per runtime for any
+       ;; machine the corpus does not declare an id for, so sorting on that gave
+       ;; three runtimes three orders over identical content
+       ;; (RealityEngine_CI#374).
+       "machineName" (or (machine-name machine) "")
        "sequenceIds"
        (vectorize (sort (remove-duplicates (mapcar #'pending-output-sequence-id pending-outputs)
                                            :test #'string= :from-end t)
@@ -1090,6 +1096,13 @@ of CESs that completed."
          ;; the batch reports are the same set by construction.
          (out (obj "region" (region-json (mapping-output (machine-mapping machine)))
                    "machineId" (jstring contribution "machineId" "")
+                   ;; Taken from CONTRIBUTION like the other identity fields, so
+                   ;; the batch and the event-bus fan-out name the machine the
+                   ;; same way. The batch is ordered by it (SURFACE_SPEC.md,
+                   ;; "Merge batch") — machineId is minted per runtime and
+                   ;; cannot order a batch the same way on each
+                   ;; (RealityEngine_CI#374).
+                   "machineName" (jstring contribution "machineName" "")
                    "sequenceIds" (jget contribution "sequenceIds")
                    "values" (vectorize values)
                    "provenance" (jget contribution "provenance"))))
