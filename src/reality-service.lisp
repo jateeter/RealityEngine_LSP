@@ -280,7 +280,19 @@ with two more O(n) LENGTH calls."
                    selected))))
 
 (defun required-dimension (state)
-  (let ((required (reality-state-dimension state)))
+  "The furthest cell any resident machine declares, over input and output.
+
+This seeded from REALITY-STATE-DIMENSION, so it reported
+max(current width, corpus requirement) and a caller could not tell the two
+apart. They are different facts: one is what this engine happens to hold, the
+other is what its corpus needs. C++ folds machines only and SURFACE_SPEC
+defines the field that way, so seeding from the current width also made this
+runtime's `requiredDimension` a different quantity from the other two under the
+same name.
+
+Zero for an engine holding no mapped machine, which is what C++ reports for the
+same state — an engine with nothing loaded requires nothing."
+  (let ((required 0))
     (maphash
      (lambda (_ machine)
        (declare (ignore _))
@@ -2012,14 +2024,63 @@ on this surface."
                                                           "matchThreshold" 0.5d0
                                                           "qdrantUrl" (reality-state-qdrant-url state)
                                                           "collectionName" (reality-state-collection-name state))))))
-     (make-route "PUT" "/api/config/dimension" (lambda (_ body query)
-                                                 (declare (ignore _ body))
-                                                 (state-json (lambda (state)
-                                                               (let ((dim (parse-integer (or (gethash "dimension" query)
-                                                                                             (write-to-string (reality-state-dimension state)))
-                                                                                         :junk-allowed t)))
-                                                                 (setf (reality-state-dimension state) dim)
-                                                                 (obj "success" t "dimension" dim))))))
+     ;; Read-only downward (SURFACE_SPEC, "PUT /api/config/dimension is read-only
+     ;; downward"; RealityEngine_CI#425).
+     ;;
+     ;; This SETF'd the state dimension unconditionally, so a caller could shrink
+     ;; the perceptual space below what the resident corpus needs and the engine
+     ;; would agree — machines mapped past the new width become unaddressable and
+     ;; the route answers success. Of the three runtimes this was the only one
+     ;; whose write took effect at all, which made it the only one that could do
+     ;; damage: C++ assigned a seed member nothing reads and Scala assigned
+     ;; nothing whatsoever.
+     ;;
+     ;; The floor is max(corpus requirement, current width). Refused rather than
+     ;; clamped, and refused rather than accepted-and-ignored: answering success
+     ;; for a write that did not take effect is indistinguishable from one that
+     ;; did.
+     (make-route "PUT" "/api/config/dimension"
+                 (lambda (_ body query)
+                   (declare (ignore _ body))
+                   (let ((raw (gethash "dimension" query)))
+                     (if (null raw)
+                         ;; It defaulted to the current dimension, so a caller
+                         ;; omitting the parameter was told a write had
+                         ;; succeeded when none was requested.
+                         (error-response "dimension query parameter is required" 400)
+                         (let ((requested (parse-integer raw :junk-allowed t)))
+                           (if (null requested)
+                               (error-response "dimension must be an integer" 400)
+                               ;; The decision runs inside the actor because it
+                               ;; reads and writes state, and the refusal comes
+                               ;; back as a value: `error-response` reads
+                               ;; HUNCHENTOOT:*REPLY*, unbound on the actor
+                               ;; thread, so the route converts it here.
+                               (let ((result
+                                       (actor-ask
+                                        actor
+                                        (lambda (state)
+                                          (let* ((required (required-dimension state))
+                                                 (current (reality-state-dimension state)))
+                                            (if (< requested (max required current))
+                                                (list :refused
+                                                      (format nil "dimension ~a is below ~a; the perceptual space is read-only downward"
+                                                              requested
+                                                              (if (< requested required)
+                                                                  (format nil "the ~a the resident corpus requires" required)
+                                                                  (format nil "the ~a this engine already holds" current)))
+                                                      400)
+                                                (progn
+                                                  (ensure-space-length state requested)
+                                                  (obj "success" t
+                                                       ;; The width the engine
+                                                       ;; actually has, never the
+                                                       ;; value asked for.
+                                                       "dimension" (reality-state-dimension state)
+                                                       "requiredDimension" required))))))))
+                                 (if (and (consp result) (eq (first result) :refused))
+                                     (error-response (second result) (third result))
+                                     (json-response result)))))))))
      (make-route "PUT" "/api/config/threshold" (lambda (_ body query)
                                                  (declare (ignore _ body))
                                                  (state-json (lambda (state)
