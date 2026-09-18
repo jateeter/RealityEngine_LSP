@@ -760,7 +760,20 @@ was evaluated with the weaker predicate no matter what the loader recorded
                                (make-output-vector
                                 :id (make-id "machine-output")
                                 :vector (output-vector-vector first)
-                                :metadata (obj "arbiter" t "combinedFrom" (length all-outputs))
+                                ;; `sources` names the OUTPUT events folded here;
+                                ;; `provenance` below names the INPUT events that
+                                ;; caused them. Different facts, and both
+                                ;; contractual (SURFACE_SPEC.md, "A combined
+                                ;; machine output reports both where it came from
+                                ;; and what it is"). This runtime carried only
+                                ;; provenance and Scala only sources, so a
+                                ;; consumer asking either question got an answer
+                                ;; from some runtimes and null from the rest
+                                ;; (RealityEngine_CI#410).
+                                :metadata (obj "arbiter" t
+                                               "combinedFrom" (length all-outputs)
+                                               "sources" (vectorize
+                                                          (mapcar #'output-vector-id all-outputs)))
                                 :timestamp (now-ms)
                                 :provenance (output-vector-provenance first))))))
       ;; PENDING-OUTPUTS is the collection: one potential output per completed
