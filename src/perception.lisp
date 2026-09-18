@@ -234,7 +234,16 @@ and its machine never receives input."
        ;; `stale' was added for — a sensor past its TTL reports inactive. A
        ;; caller still wanting the arithmetic has `lastUpdated' and `ttlMs',
        ;; both of which stay on the payload.
-       (let* ((last-updated (or (source-last-updated source) 0))
+       ;; A sensor that has never received a value reports `lastUpdated: null`,
+       ;; not 0. `0` is a positive claim — the epoch — where the truth is that
+       ;; there has been no update; CPP and Scala both report null, and the
+       ;; difference is what made GET /api/sources fail a byte comparison on
+       ;; exactly the 15 sensors with no ingress (RealityEngine_Manager#151).
+       ;;
+       ;; Same error as the empty array this runtime used to report for a
+       ;; machine that produced no output (RealityEngine_CI#409): absence
+       ;; encoded as a value rather than as absence.
+       (let* ((last-updated (or (source-last-updated source) +json-null+))
               (ttl (or (source-ttl-ms source) 5000)))
          (setf (jget out "sensorId") (or (source-sensor-id source) "")
                (jget out "lastValue") (vectorize (or (source-last-value source) nil))
@@ -276,7 +285,10 @@ and its machine never receives input."
      :loop-p (jbool json "loop" t)
      :sensor-id (jstring json "sensorId" nil)
      :last-value (numbers-from-json (or (jget json "lastValue") (arr)))
-     :last-updated (or (jnumber json "lastUpdated" nil) 0)
+     ;; NIL, not 0: a source read back from JSON with no `lastUpdated` has
+     ;; never been updated, and storing 0 would reintroduce the epoch claim
+     ;; the emitter above removes.
+     :last-updated (jnumber json "lastUpdated" nil)
      :ttl-ms (or (jnumber json "ttlMs" nil) 5000)
      :origin (jstring json "origin" nil))))
 
