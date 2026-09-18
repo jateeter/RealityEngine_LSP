@@ -169,6 +169,51 @@ with two more O(n) LENGTH calls."
              (reality-state-event-bus-subscriptions state))
     count))
 
+(defun version-on-conflict (state machine)
+  "Resolve a name conflict by versioning MACHINE and reallocating its regions.
+
+Returns T when it versioned. SURFACE_SPEC, \"POST /api/machines always
+ingests\" (RealityEngine_CI#357): the route must never reject a resident name
+and never replace the machine holding it — it used to mint a fresh id and keep
+the requested name, so two resident machines answered to one name and a caller's
+bad retry became corrupted engine state.
+
+\"Resident\" is runtime state: a machine previously ingested and still held in
+THIS engine's machine corpus. DELETE frees the name, and the next POST of it is
+not a conflict — no suffix, declared mapping honoured.
+
+The allocation is fixed rather than free because regions are NOT engine-scoped
+the way ids are: mergeBatch carries region.offset, activeRegions is ordered on
+it, and the merge batch is ordered by (machineName, region.offset). An allocator
+choosing differently per runtime would place every conflicted machine's output
+somewhere different on each engine, and every comparison over those fields would
+report an allocation difference as an engine divergence.
+
+The RESIDENT machine is never touched, renamed or moved."
+  (let ((resident (make-hash-table :test #'equal)))
+    (maphash (lambda (_ m) (declare (ignore _))
+               (setf (gethash (machine-name m) resident) t))
+             (reality-state-machines state))
+    (when (gethash (machine-name machine) resident)
+      (let ((requested (machine-name machine)))
+        (loop for n from 2
+              for candidate = (format nil "~a v~d" requested n)
+              unless (gethash candidate resident)
+                do (setf (machine-name machine) candidate)
+                   (return))
+        ;; The declared mapping is DISCARDED. A machine with no mapping cannot
+        ;; be given one — it never enters the perceptual space — so it is
+        ;; ingested under the versioned name with nothing allocated.
+        (let ((mapping (machine-mapping machine)))
+          (when mapping
+            (let* ((base (reality-state-dimension state))
+                   (in-len (region-length (mapping-input mapping)))
+                   (out-len (region-length (mapping-output mapping))))
+              (setf (mapping-input mapping) (make-region :offset base :length in-len)
+                    (mapping-output mapping) (make-region :offset (+ base in-len)
+                                                          :length out-len)))))
+        t))))
+
 (defun put-machine (state machine)
   (unregister-compose-subscriptions state (machine-id machine))
   (setf (gethash (machine-id machine) (reality-state-machines state)) machine)
@@ -2442,12 +2487,20 @@ on this surface."
                                                (if machine
                                                    (json-response (obj "machine" (machine-json machine :full t)))
                                                    (error-response "Machine not found" 404)))))
+     ;; Always ingests. A resident name is versioned and reallocated rather than
+     ;; rejected or replaced (SURFACE_SPEC, "POST /api/machines always ingests";
+     ;; RealityEngine_CI#357). The reply carries the machine AS INGESTED —
+     ;; versioned name, minted id, allocated regions — plus `versioned`, because
+     ;; a caller has no other way to learn what it received.
      (make-route "POST" "/api/machines" (lambda (_ body query)
                                           (declare (ignore _ query))
                                           (state-json (lambda (state)
-                                                        (let ((machine (machine-from-json body)))
+                                                        (let* ((machine (machine-from-json body))
+                                                               (versioned (version-on-conflict state machine)))
                                                           (put-machine state machine)
-                                                          (obj "success" t "machine" (machine-json machine :full t)))))))
+                                                          (obj "success" t
+                                                               "versioned" (json-bool versioned)
+                                                               "machine" (machine-json machine :full t)))))))
      (make-route "PUT" "/api/machines/:id" (lambda (params body query)
                                              (declare (ignore query))
                                              (state-json (lambda (state)
