@@ -955,12 +955,36 @@ corpus-declared too, so neither half of the key is minted."
                    (or (jnumber (jget right "region") "offset" 0) 0)))))))
 
 (defun transition-result-json (result)
+  "Serialize a transition, reporting BOTH what the machine presents and the
+arbiter's representative member.
+
+`mergedOutput` is the asserted outputs folded by the machine's declared
+transformation — what the machine presents, and what a step writes to the
+perceptual space. `machineOutput` is the arbiter's pick.
+
+This computed the fold and then did not report it: the struct has carried
+`merged-output` all along, populated from FOLD-OUTPUT-VECTORS, while the only
+output field on the wire was the pick. So a caller of POST
+/api/machines/:id/process received [0,0,1,0] for localai/session_rag_context
+where the step wrote [1,1,1,0] for the same machine on the same stimulus — with
+`combinedFrom` and `sources` metadata on the pick describing a combination it
+was not. All three runtimes omitted it identically, which is why it read as
+agreement rather than as a defect (RealityEngine_CI#418).
+
+Null when the fold refuses — the Łukasiewicz pair without a declared chain top
+presents nothing rather than guessing a chain. `machineOutput` survives that,
+because the sequences did complete and the pick is the evidence they did, which
+is why this is an added field and not a redefinition. Null is the absence; an
+empty array would read as a machine that presented zeros."
   (obj "inputEvent" (vectorize (transition-result-input-vector result))
        "timestamp" (transition-result-timestamp result)
        "sequenceResults" (transition-result-sequence-results result)
        "machineOutput" (if (transition-result-machine-output result)
                            (output-vector-json (transition-result-machine-output result))
                            +json-null+)
+       "mergedOutput" (if (transition-result-merged-output result)
+                          (vectorize (transition-result-merged-output result))
+                          +json-null+)
        "arbiterMetadata" (transition-result-arbiter-metadata result)))
 
 (defun extract-region (space region)
