@@ -2118,7 +2118,16 @@ it is accepted as an alternative to the body bridgeToken/token fields."
                                                        (hash-table-count (perception-engine-sources engine))
                                                        (or (perception-engine-global-step engine) 0)
                                                        (or (perception-engine-dimension engine) 0)
-                                                       0)))))))
+                                                       ;; The last push's own timestamp, from the step
+                                                       ;; this engine stores in `last-push`. It was a
+                                                       ;; literal 0, so this runtime reported "never
+                                                       ;; pushed" forever while CPP and Scala reported
+                                                       ;; the real time — a metric that cannot change
+                                                       ;; is not a measurement (RealityEngine_CI#407).
+                                                       (let ((lp (perception-engine-last-push engine)))
+                                                         (if (jobject-p lp)
+                                                             (or (jnumber lp "timestamp" 0) 0)
+                                                             0)))))))))
    (make-route "GET" "/api/integrations/status" (lambda (_ body query)
                                                   (declare (ignore _ body query))
                                                   (json-response (actor-ask actor #'integrations-status-json))))
