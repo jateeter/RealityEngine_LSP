@@ -45,11 +45,14 @@
    :cov-paging     (make-hash-table :test #'equal)
    :cov-deprecated (make-hash-table :test #'equal)))
 
-(defun one-bit-machine (id sequence-id input-offset output-offset &key metadata value)
+(defun one-bit-machine (id sequence-id input-offset output-offset &key metadata value name)
   (machine-from-json
    (reality-engine-lsp::obj
     "id" id
-    "name" id
+    ;; Defaults to the id, so every existing caller is unchanged. Overridable
+    ;; because mergeBatch is ordered by NAME, and a fixture whose name equals
+    ;; its id cannot tell that order from ordering by id (RealityEngine_CI#374).
+    "name" (or name id)
     "arbiterRule" "passthrough"
     "metadata" (or metadata (reality-engine-lsp::obj))
     "perceptualMapping" (reality-engine-lsp::obj
@@ -1197,9 +1200,27 @@ ever have seen."
            (batch (coerce (reality-engine-lsp::jget step "mergeBatch") 'list)))
       (assert-equal (list "machine-a" "machine-z")
                     (mapcar (lambda (op) (reality-engine-lsp::jstring op "machineId" "")) batch)
-                    "mergeBatch should be sorted by machineId")
+                    "mergeBatch should be sorted by machineName (here equal to machineId)")
       (assert-equal (list 1) (merge-values (first batch))
                     "mergeBatch should carry output values")
+      ;; The order must follow machineName, not machineId. Ids and names sort in
+      ;; opposite directions here, so ordering by id would return these reversed
+      ;; — which is what every runtime did, and why the same operations came back
+      ;; permuted across runtimes for machines whose ids are minted rather than
+      ;; corpus-declared (RealityEngine_CI#374).
+      (let ((named (make-test-state 8)))
+        (reality-engine-lsp::put-machine named (one-bit-machine "machine-a" "seq-1" 0 5 :name "zzz-last"))
+        (reality-engine-lsp::put-machine named (one-bit-machine "machine-z" "seq-2" 0 6 :name "aaa-first"))
+        (let* ((step2 (reality-engine-lsp::process-perceptual-input named (list 1)
+                                                                    :include-machine-results t
+                                                                    :include-perceptual-space t))
+               (batch2 (coerce (reality-engine-lsp::jget step2 "mergeBatch") 'list)))
+          (assert-equal (list "aaa-first" "zzz-last")
+                        (mapcar (lambda (op) (reality-engine-lsp::jstring op "machineName" "")) batch2)
+                        "mergeBatch orders by machineName")
+          (assert-equal (list "machine-z" "machine-a")
+                        (mapcar (lambda (op) (reality-engine-lsp::jstring op "machineId" "")) batch2)
+                        "ordering by machineId would reverse these — it must not be the key")))
       (assert-equal (list "seq-a-vector")
                     (coerce (reality-engine-lsp::jget (first batch) "provenance") 'list)
                     "mergeBatch should carry provenance")))

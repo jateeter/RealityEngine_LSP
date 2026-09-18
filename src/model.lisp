@@ -928,17 +928,31 @@ was evaluated with the weaker predicate no matter what the loader recorded
       out)))
 
 (defun sorted-merge-operations (operations)
-  "Canonical merge ordering — by `machineId` alone.
+  "Canonical merge ordering — by `machineName`, then `region.offset`.
 
-`sequenceId` and `outputIndex` were the secondary and tertiary keys while a
-machine contributed one operation per asserted output. It now contributes one
-per output region, so `machineId` is unique across the batch and orders it
-totally on its own. Keeping the old keys would not be wrong, only inert: they
-are constant within every comparison the sort can now make."
+Both are corpus-declared (SURFACE_SPEC.md, \"Merge batch\").
+
+This sorted by `machineId` alone and called it total. Total it is, within one
+runtime; the same key on three runtimes it is not. `machineId` is minted per
+runtime for any machine the corpus does not declare an id for, so the same
+operations came back permuted — four of the five reproduced disagreements in
+domain:digital-logic were this, with region, values, provenance and sequenceIds
+identical on all three (RealityEngine_CI#374).
+
+RealityEngine_CI#270 had already rejected id-based ordering for the
+engine-process join — \"a minted id is per-runtime by construction\" — and moved
+that join to machineName. This field kept the key #270 had just discarded.
+
+`region.offset` breaks ties for a machine writing more than one region and is
+corpus-declared too, so neither half of the key is minted."
   (sort operations
         (lambda (left right)
-          (string< (jstring left "machineId" "")
-                   (jstring right "machineId" "")))))
+          (let ((ln (jstring left "machineName" ""))
+                (rn (jstring right "machineName" "")))
+            (if (string/= ln rn)
+                (string< ln rn)
+                (< (or (jnumber (jget left "region") "offset" 0) 0)
+                   (or (jnumber (jget right "region") "offset" 0) 0)))))))
 
 (defun transition-result-json (result)
   (obj "inputEvent" (vectorize (transition-result-input-vector result))
