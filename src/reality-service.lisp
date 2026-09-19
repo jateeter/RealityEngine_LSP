@@ -195,9 +195,20 @@ The RESIDENT machine is never touched, renamed or moved."
                (setf (gethash (machine-name m) resident) t))
              (reality-state-machines state))
     (when (gethash (machine-name machine) resident)
-      (let ((requested (machine-name machine)))
+      ;; The requested name's BASE — its trailing " v<n>" removed, if it has
+      ;; one. Appending to the requested name verbatim would give "Foo v2 v2"
+      ;; and then "Foo v2 v2 v2", so a caller re-posting what it received would
+      ;; drift further from the base on every attempt. Recovering the base keeps
+      ;; one version sequence per machine name however the caller addresses it.
+      (let ((base (let* ((name (machine-name machine))
+                         (marker (search " v" name :from-end t)))
+                    (if (and marker
+                             (> (length name) (+ marker 2))
+                             (every #'digit-char-p (subseq name (+ marker 2))))
+                        (subseq name 0 marker)
+                        name))))
         (loop for n from 2
-              for candidate = (format nil "~a v~d" requested n)
+              for candidate = (format nil "~a v~d" base n)
               unless (gethash candidate resident)
                 do (setf (machine-name machine) candidate)
                    (return))
