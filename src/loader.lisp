@@ -156,7 +156,21 @@
    :id (or (jstring item "id" nil) (make-id "output"))
    :vector (numbers-from-json (or (jget item "vector") (jget item "values") (arr)))
    :metadata (or (jget item "metadata") (obj))
-   :timestamp (or (jnumber item "timestamp" nil) 0)
+   ;; Stamped at ingestion, as C++ and Scala both do —
+   ;; `reality.cpp:2335` passes now_ms() and `MachineLoader.scala:151`
+   ;; System.currentTimeMillis(), neither reading a declared value.
+   ;;
+   ;; This defaulted to 0, and the corpus declares no timestamp because it is
+   ;; runtime state rather than corpus data — so every output event this runtime
+   ;; exported carried 0. It was the ONLY value-level difference between the LSP
+   ;; and C++ export payloads, whose field sets are otherwise identical, and it
+   ;; defeated byte equivalence on every machine that asserts an output
+   ;; (RealityEngine_LSP#104).
+   ;;
+   ;; A declared timestamp is deliberately ignored rather than preferred: C++
+   ;; ignores one too, and honouring it here would make this runtime differ from
+   ;; the other two for exactly the corpus that supplied it.
+   :timestamp (now-ms)
    :provenance (jarray-list (or (jget item "provenance") (arr)))))
 
 (defun parse-reality-event (item &optional machine-match-algorithm)
