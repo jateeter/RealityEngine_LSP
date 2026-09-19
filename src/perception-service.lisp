@@ -2009,7 +2009,83 @@ it is accepted as an alternative to the body bridgeToken/token fields."
                      "noWaitDispatch" t
                      "handoff" handoff)))))
 
-(defun push-perception (state include-machine-results &key compact)
+(defun apply-step-selector (step only)
+  "Narrow STEP to the caller's requested subset, in place (RealityEngine_CI#367).
+
+The Reality Engine applies the same selector to the step it builds, and this
+must produce the identical payload: the acceptance criterion is tri-runtime
+byte equivalence, and a caller cannot be expected to know whether it reached
+the engine directly or through here.
+
+Applied to the reply, never to the request this service makes. The RE filters
+`machineResults` by the selector like every other field, and
+`aggregate-machine-outputs` reads that field to build the next input vector --
+so asking the engine for a subset would change what a push *does*, which is the
+rule the comment on the request payload above already records.
+
+ONLY being a present object is what activates the selector; an object naming
+nothing then selects nothing. Every array test goes through `jarray-present-p':
+a missing key is NIL, NIL satisfies `listp', and `jarray-p' alone would
+therefore answer true for a key that is not there."
+  (when (and (jobject-p step) (jobject-p only))
+    (let* ((want-seq  (json-string-list (jget only "sequenceIds")))
+           (want-name (json-string-list (jget only "machineNames")))
+           (results   (jget step "machineResults"))
+           ;; Both sets are read from the UNFILTERED step, so the order the
+           ;; fields are rewritten in below cannot change the answer.
+           (selected-ids
+             (when (jobject-p results)
+               (loop for mid being the hash-keys of results using (hash-value mr)
+                     when (member (jstring mr "machineName" "") want-name :test #'string=)
+                       collect mid)))
+           (batch (when (jarray-present-p step "mergeBatch")
+                    (jarray-list (jget step "mergeBatch"))))
+           ;; Machines carrying a requested sequence id on an operation they
+           ;; actually produced this step. Declared membership is not enough: a
+           ;; machine whose sequence did not fire produced no operation, and the
+           ;; engine keeps it out.
+           (sequence-machines
+             (loop for op in batch
+                   when (some (lambda (sid) (member sid want-seq :test #'string=))
+                              (jarray-list (jget op "sequenceIds")))
+                     collect (jstring op "machineId" ""))))
+      (flet ((keep-id (id)
+               (or (member id selected-ids :test #'string=)
+                   (member id sequence-machines :test #'string=))))
+        (when (jobject-p results)
+          (let ((kept (make-hash-table :test #'equal)))
+            (loop for mid being the hash-keys of results using (hash-value mr)
+                  when (keep-id mid)
+                    do (setf (gethash mid kept) mr))
+            (setf (jget step "machineResults") kept)))
+        (when batch
+          (setf (jget step "mergeBatch")
+                (vectorize
+                 (remove-if-not
+                  (lambda (op)
+                    (or (member (jstring op "machineId" "") selected-ids :test #'string=)
+                        (some (lambda (sid) (member sid want-seq :test #'string=))
+                              (jarray-list (jget op "sequenceIds")))))
+                  batch))))
+        (when (jarray-present-p step "eventBus")
+          (setf (jget step "eventBus")
+                (vectorize
+                 (remove-if-not
+                  (lambda (w)
+                    (or (member (jstring w "producerSequenceId" "") want-seq :test #'string=)
+                        (member (jstring w "producerMachineId" "") selected-ids :test #'string=)
+                        (member (jstring w "subscriberMachineId" "") selected-ids :test #'string=)))
+                  (jarray-list (jget step "eventBus"))))))
+        (when (jarray-present-p step "activeRegions")
+          (setf (jget step "activeRegions")
+                (vectorize
+                 (remove-if-not
+                  (lambda (r)
+                    (member (jstring r "machineId" "") selected-ids :test #'string=))
+                  (jarray-list (jget step "activeRegions")))))))))
+  step)
+
+(defun push-perception (state include-machine-results &key compact only)
   (let* ((engine (perception-state-engine state))
          (vector (assemble-perception-vector engine))
          ;; Always ask the Reality Engine for the perceptual space and the
@@ -2070,6 +2146,11 @@ it is accepted as an alternative to the body bridgeToken/token fields."
           ;; vector at all. The engine computed the right answer and did not
           ;; report it, which the cross-runtime parity stage read as engine
           ;; divergence (RealityEngine_Scala#43).
+          ;; Narrowed before the machineResults removal, because the selector
+          ;; is defined in terms of that field: SELECTED-IDS resolves the
+          ;; caller's machine *names* to this runtime's minted ids, and there
+          ;; is nowhere else in the step those two are carried together.
+          (apply-step-selector step only)
           (when (jobject-p step)
             (when (or compact (not include-machine-results))
               (remhash "machineResults" step)))
@@ -2264,7 +2345,8 @@ it is accepted as an alternative to the body bridgeToken/token fields."
                                                  (push-perception state
                                                                   (jbool body "includeMachineResults"
                                                                          (not (jbool body "compact" nil)))
-                                                                  :compact (jbool body "compact" nil)))
+                                                                  :compact (jbool body "compact" nil)
+                                                                  :only (jget body "only")))
                                                :timeout 120))))
    (make-route "GET" "/api/push/:id" (lambda (params body query)
                                       (declare (ignore body query))

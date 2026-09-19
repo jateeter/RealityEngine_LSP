@@ -1357,17 +1357,21 @@ have more than one writer, a sequence id cannot. Machine *names* rather than
 ids, because ids are minted per runtime and a caller cannot know them --
 SELECTED-IDS is the set this runtime's ids resolve to.
 
-NIL for both selector lists means no selector was supplied and everything is
-kept, so the unfiltered wire is unchanged."
-  (if (and (null only-sequence-ids) (null only-machine-names))
-      t
-      (or (some (lambda (sid) (member sid only-sequence-ids :test #'string=))
-                (coerce (or sequence-ids #()) 'list))
-          (and machine-id (member machine-id selected-ids :test #'string=)))))
+Whether a selector exists at all is ONLY-PRESENT, decided by the caller and
+passed in; this function is the membership test and nothing else. It used to
+answer T when both lists were empty, which made `only: {}` keep the whole
+universe. That is the behaviour #367 rules out in the same breath as the
+unknown-sequence-id case: a caller that built `sequenceIds` from a list that
+happened to be empty was handed everything and had no way to tell. C++ has
+always treated presence as activation; this runtime is the one that differed."
+  (or (some (lambda (sid) (member sid only-sequence-ids :test #'string=))
+            (coerce (or sequence-ids #()) 'list))
+      (and machine-id (member machine-id selected-ids :test #'string=))))
 
 (defun process-perceptual-input (state input &key override include-machine-results include-perceptual-space
                                                   (include-active-regions (reality-state-include-active-regions-p state))
-                                                  compact only-sequence-ids only-machine-names)
+                                                  compact only-sequence-ids only-machine-names
+                                                  only-present)
   ;; include-perceptual-space is accepted and ignored: SURFACE_SPEC.md makes
   ;; perceptualSpace unconditional in the push response. Kept in the lambda list
   ;; so existing callers (and RE_INCLUDE_PERCEPTUAL_SPACE) do not become errors.
@@ -1645,12 +1649,39 @@ kept, so the unfiltered wire is unchanged."
            ;; a single push answered ~600 KB with 187 machines resident and
            ;; exhausted the 4 GB heap mid-sweep.
            (selected-ids
-             (when (or only-sequence-ids only-machine-names)
+             (when only-present
                (loop for mid being the hash-keys of machine-results using (hash-value mr)
                      when (member (jstring mr "machineName" "") only-machine-names :test #'string=)
                        collect mid)))
+           ;; machineResults is filtered too, and it is the term that matters.
+           ;; At the full corpus it is 1422 KB of a 1637 KB response -- 1328
+           ;; entries where the caller asked about one. This runtime honoured
+           ;; the selector for mergeBatch, eventBus and activeRegions and still
+           ;; answered 1.36 MB, which satisfies the shape of the selector and
+           ;; none of its purpose: the allocation *is* the defect, and it is
+           ;; this field (RealityEngine_CI#367).
+           ;;
+           ;; Attribution is by merge operation, not by the machine's own
+           ;; declared sequences: a machine is kept when an operation it
+           ;; actually produced this step carries a requested sequence id. That
+           ;; is what C++ `keepResult` does, and the acceptance criterion is a
+           ;; byte-identical payload across the quorum, so the rule cannot be
+           ;; approximated -- a machine whose sequence is declared but did not
+           ;; fire has no operation and is not kept.
+           ;;
+           ;; Read off the UNFILTERED merge-batch, before the binding below
+           ;; shadows it. Filtering the already-filtered batch happens to give
+           ;; the same set, but only by an argument about how the two
+           ;; predicates overlap; taking it from the batch C++ reads needs no
+           ;; such argument.
+           (selected-result-ids
+             (when only-present
+               (loop for op in merge-batch
+                     when (some (lambda (sid) (member sid only-sequence-ids :test #'string=))
+                                (coerce (or (jget op "sequenceIds") #()) 'list))
+                       collect (jstring op "machineId" ""))))
            (merge-batch
-             (if (or only-sequence-ids only-machine-names)
+             (if only-present
                  (remove-if-not (lambda (op)
                                   (step-selector-keeps-p only-sequence-ids only-machine-names
                                                          selected-ids
@@ -1659,7 +1690,7 @@ kept, so the unfiltered wire is unchanged."
                                 merge-batch)
                  merge-batch))
            (event-bus
-             (if (or only-sequence-ids only-machine-names)
+             (if only-present
                  (remove-if-not (lambda (w)
                                   (or (member (jstring w "producerSequenceId" "") only-sequence-ids
                                               :test #'string=)
@@ -1683,14 +1714,24 @@ kept, so the unfiltered wire is unchanged."
       (when include-active-regions
         (setf (jget step "activeRegions")
               (vectorize (sort-active-regions
-                          (if (or only-sequence-ids only-machine-names)
+                          (if only-present
                               (remove-if-not (lambda (r)
                                                (member (jstring r "machineId" "") selected-ids
                                                        :test #'string=))
                                              active-regions)
                               active-regions)))))
       (when include-machine-results
-        (setf (jget step "machineResults") machine-results))
+        ;; SELECTED-IDS is exactly the set of ids whose machineName the caller
+        ;; named, so testing membership in it is the machineName test.
+        (setf (jget step "machineResults")
+              (if only-present
+                  (let ((kept (make-hash-table :test #'equal)))
+                    (loop for mid being the hash-keys of machine-results using (hash-value mr)
+                          when (or (member mid selected-ids :test #'string=)
+                                   (member mid selected-result-ids :test #'string=))
+                            do (setf (gethash mid kept) mr))
+                    kept)
+                  machine-results)))
       ;; Always present, compact or not. This was gated on
       ;; include-perceptual-space, so a compact push returned no Reality Event
       ;; at all — the engine computed the right answer and did not report it,
@@ -3068,7 +3109,10 @@ on this surface."
                                                                            :compact (or (jbool body "compact" nil)
                                                                                         (compact-query-p query))
                                                                            :only-sequence-ids (json-string-list (jget (jget body "only") "sequenceIds"))
-                                                                           :only-machine-names (json-string-list (jget (jget body "only") "machineNames")))))
+                                                                           :only-machine-names (json-string-list (jget (jget body "only") "machineNames"))
+                                                                           ;; Presence activates the selector, not
+                                                                           ;; content (#367).
+                                                                           :only-present (jobject-p (jget body "only")))))
                                                                 (re-broadcast (obj "type" "step-result" "step" step))
                                                                 step)
                                                               (obj "error" "Provide exactly one of: vector, sparseVector, domainVectors"))))))))))
