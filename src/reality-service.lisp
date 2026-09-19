@@ -246,7 +246,24 @@ schema does not declare — isActive, state, wasJustMatched — which
     (setf (jget doc "arbiterRule") (string-upcase (or (jget doc "arbiterRule") "passthrough")))
     (when sequences
       (setf (jget doc "inputSequences") sequences)
-      (remhash "inputSequences" metadata))
+      ;; A COPY of the metadata table, without inputSequences.
+      ;;
+      ;; MACHINE-JSON returns the machine's own metadata hash table rather than
+      ;; a copy of it, so REMHASH here mutated the stored machine: the first
+      ;; export lifted the sequences out and every export after it returned
+      ;; none. Measured before the fix — export #1 carried 3, #2 and #3 carried
+      ;; 0 — and the damage outlived the request, because the machine in the
+      ;; corpus had lost them.
+      ;;
+      ;; The round-trip check did not catch it: it exports, re-ingests, and
+      ;; exports the NEW machine, which has its own metadata. Only exporting the
+      ;; SAME machine twice shows it.
+      (let ((trimmed (obj)))
+        (maphash (lambda (k v)
+                   (unless (string= k "inputSequences")
+                     (setf (gethash k trimmed) v)))
+                 metadata)
+        (setf (jget doc "metadata") trimmed)))
     doc))
 
 (defun put-machine (state machine)
