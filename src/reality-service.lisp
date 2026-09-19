@@ -225,6 +225,30 @@ The RESIDENT machine is never touched, renamed or moved."
                                                           :length out-len)))))
         t))))
 
+(defun corpus-document (machine)
+  "MACHINE as a corpus document: the internal form converted back to the shape
+machine.schema.json declares (RealityEngine_CI#436).
+
+Two conversions, both undoing a normalisation applied at load:
+
+  - `arbiterRule` upper-cased, because the schema's enum is (\"PASSTHROUGH\")
+    and ARBITER-NAME lower-cases on the way in;
+  - `inputSequences` lifted out of `metadata` to machine level, where the schema
+    declares it. All three runtimes store it in metadata internally; exporting
+    it there exports the storage rather than the document.
+
+Everything else is carried through unchanged, including the runtime state the
+schema does not declare — isActive, state, wasJustMatched — which
+`additionalProperties: true` permits and the Manager's live layer reads."
+  (let* ((doc (machine-json machine :full t))
+         (metadata (jget doc "metadata"))
+         (sequences (and (jobject-p metadata) (jget metadata "inputSequences"))))
+    (setf (jget doc "arbiterRule") (string-upcase (or (jget doc "arbiterRule") "passthrough")))
+    (when sequences
+      (setf (jget doc "inputSequences") sequences)
+      (remhash "inputSequences" metadata))
+    doc))
+
 (defun put-machine (state machine)
   (unregister-compose-subscriptions state (machine-id machine))
   (setf (gethash (machine-id machine) (reality-state-machines state)) machine)
@@ -2621,6 +2645,25 @@ on this surface."
                                                                    (let ((machine (machine-from-json body)))
                                                                      (put-machine state machine)
                                                                      (obj "success" t "machine" (machine-json machine :full t)))))))
+     ;; The export is a CORPUS DOCUMENT and must satisfy the corpus schema.
+     ;;
+     ;; It declares `version: "1.0.0"` in the `{version, machine}` envelope,
+     ;; which is exactly RealityEngine_Machines/schemas/machine.schema.json — so
+     ;; the payload claims to be a corpus file and ought to validate as one. It
+     ;; did not, in two ways, both from exporting this engine's INTERNAL form
+     ;; rather than the document (RealityEngine_CI#436):
+     ;;
+     ;;   arbiterRule "passthrough"  against  enum: ["PASSTHROUGH"]
+     ;;   inputSequences inside metadata, where the schema declares it at
+     ;;   machine level — `machine-from-json` stores it there at load
+     ;;
+     ;; Scala converts back to the corpus form on export and its payload
+     ;; validates; this runtime and C++ did not, which is the opposite of how
+     ;; #436 was first written.
+     ;;
+     ;; Scoped to the export rather than to MACHINE-JSON, which also serves
+     ;; GET /api/machines. That listing is a runtime view, makes no claim to be
+     ;; a corpus document, and consumers read its lower-case arbiterRule today.
      (make-route "GET" "/api/machines/:id/export" (lambda (params body query)
                                                    (declare (ignore body query))
                                                    (let ((machine (actor-ask actor
@@ -2629,7 +2672,7 @@ on this surface."
                                                                                         (reality-state-machines state))))))
                                                      (if machine
                                                          (json-response (obj "version" "1.0.0"
-                                                                             "machine" (machine-json machine :full t)))
+                                                                             "machine" (corpus-document machine)))
                                                          (error-response "Machine not found" 404)))))
      ;; The merge knob, readable always and settable only while unlocked.
      ;;
