@@ -2019,6 +2019,9 @@ it is accepted as an alternative to the body bridgeToken/token fields."
 (defun dispatch-acp (state body)
   (let* ((id (or (jstring body "dispatchId" nil) (jstring body "id" nil)))
          (record (and id (lookup-dispatch-record state id))))
+    ;; A missing id is a bad request, not an unknown record -- as in C++.
+    (unless id
+      (return-from dispatch-acp (cons 400 (obj "error" "ACP dispatch requires dispatchId"))))
     (unless record
       (return-from dispatch-acp (cons 404 (obj "error" "Dispatch record not found"))))
     (let* ((target-agent (or (jstring body "targetAgent" nil)
@@ -2052,13 +2055,19 @@ it is accepted as an alternative to the body bridgeToken/token fields."
                          "correlationId" (or (jstring record "correlationId" nil) +json-null+))))
       (when (jobject-p (jget body "metadata"))
         (setf (jget handoff "metadata") (jget body "metadata")))
+      ;; The handoff travels as the record's providerReceipt, as in C++. It was
+      ;; passed as "metadata", which the 3-of-3 PATCH semantics (SURFACE_SPEC.md,
+      ;; Dispatch surface shapes) no longer accept -- so the handoff stopped
+      ;; reaching the record, and test-openclaw-integration.sh's
+      ;; providerReceipt.dispatchId check would fail.
       (update-dispatch-record state id
                               (obj "status" (or (jstring body "status" nil) "accepted")
                                    "adapter" "openclaw-xacp"
                                    "provider" "acp"
                                    "externalRunId" external-run-id
-                                   "incrementAttempts" t
-                                   "metadata" handoff))
+                                   "incrementAttempts" (if (eq (jget body "incrementAttempts") +json-false+) +json-false+ t)
+                                   "clearError" t
+                                   "providerReceipt" handoff))
       (cons 202 (obj "success" t
                      "accepted" t
                      "dispatchId" id
