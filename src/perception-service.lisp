@@ -159,6 +159,9 @@ the whole set sorted by key, per the contract."
   ;; INTEGRATIONS_CONFIG, and the path it came from. NIL = none configured,
   ;; which allows nothing (SURFACE_SPEC.md, localAI invoke contract).
   localai-allowed-operations localai-allowed-source
+  ;; HealthKit scope per bridgeId (INGEST_CONTRACT.md, Scope and resync):
+  ;; bridgeId -> plist (:declared :generation :types :sensors :resync).
+  healthkit-scopes
   ollama-base-url ollama-model ollama-completion-source-mapping-id
   openai-base-url openai-model openai-completion-source-mapping-id openai-api-key
   acp-enabled-p acp-platform acp-surface acp-command acp-gateway-url
@@ -205,6 +208,7 @@ the whole set sorted by key, per the contract."
    :localai-ledger nil
    :localai-ledger-limit (env-int "LOCALAI_INVOCATION_LEDGER_LIMIT" 256)
    :localai-allowed-operations nil
+   :healthkit-scopes (make-hash-table :test #'equal)
    :localai-allowed-source nil
    :ollama-base-url (trim-trailing-slashes (env "OLLAMA_BASE_URL" "http://localhost:11434"))
    ;; Canonical default shared by every runtime; override per engine with
@@ -1532,7 +1536,127 @@ dispatch_triggers and TS Dispatcher.onStep: drop ops without governance
        "contract" (obj "transport" "https"
                        "singleSample" (arr "type" "value" "sourceName")
                        "batchSamples" (arr "bridgeId" "samples[]")
-                       "auth" (if (perception-state-healthkit-bridge-token state) "bridgeToken|bearer" "none"))))
+                       "auth" (if (perception-state-healthkit-bridge-token state) "bridgeToken|bearer" "none"))
+       "scope" (healthkit-scope-json state (perception-state-healthkit-bridge-id state))))
+
+;; ── HealthKit scope and resync (localHealthkitBridge INGEST_CONTRACT.md,
+;;    "Scope and resync") ────────────────────────────────────────────────────
+;; The data scope changes through an authorization workflow tied to the
+;; owner's Solid pod. The PE is the scope authority: a bridge is open until its
+;; first scope message, then only active types are ingested. Resync runs the
+;; other way -- a consumer asks, through the PE, for a re-send.
+
+(defun healthkit-scope-of (state bridge-id)
+  (or (gethash bridge-id (perception-state-healthkit-scopes state))
+      (setf (gethash bridge-id (perception-state-healthkit-scopes state))
+            (list :declared nil :generation 0
+                  :types (make-hash-table :test #'equal)
+                  :sensors (make-hash-table :test #'equal)
+                  :resync nil))))
+
+(defun healthkit-scope-json (state bridge-id)
+  (let* ((scope (healthkit-scope-of state bridge-id))
+         (types (make-hash-table :test #'equal)))
+    (maphash (lambda (k v) (setf (gethash k types) v)) (getf scope :types))
+    (obj "declared" (json-bool (getf scope :declared))
+         "generation" (getf scope :generation)
+         "types" types
+         "resyncRequests" (vectorize (getf scope :resync)))))
+
+(defun healthkit-scope-refusal (state bridge-id type)
+  "NIL when TYPE may be ingested, otherwise the refusal reason."
+  (let ((scope (healthkit-scope-of state bridge-id)))
+    (when (getf scope :declared)
+      (let ((entry (gethash type (getf scope :types))))
+        (cond ((null entry) "not-in-scope")
+              ((equal (jstring entry "state" "") "active") nil)
+              ((equal (jstring entry "state" "") "locked") "locked")
+              (t "not-in-scope"))))))
+
+(defun healthkit-authorized-p (state body bearer-token)
+  (let ((required (perception-state-healthkit-bridge-token state)))
+    (or (null required)
+        (string= required (or (jstring body "token" nil) (jstring body "bridgeToken" nil) ""))
+        (equal required bearer-token))))
+
+(defun healthkit-scope-change (state body &optional bearer-token)
+  "Returns (STATUS . BODY)."
+  (unless (healthkit-authorized-p state body bearer-token)
+    (return-from healthkit-scope-change
+      (cons 401 (obj "success" +json-false+ "error" "invalid HealthKit bridge token"))))
+  (let* ((bridge-id (or (jstring body "bridgeId" nil) (perception-state-healthkit-bridge-id state)))
+         (action (jstring body "action" ""))
+         (target (cdr (assoc action '(("add" . "active") ("lock" . "locked") ("remove" . "removed"))
+                             :test #'string=)))
+         (types (remove-if-not #'stringp (jarray-list (jget body "types"))))
+         (source (jstring body "source" nil))
+         (now (now-ms)))
+    (unless target
+      (return-from healthkit-scope-change (cons 400 (obj "error" "scope action must be add, lock or remove"))))
+    (unless types
+      (return-from healthkit-scope-change (cons 400 (obj "error" "scope requires a non-empty types array"))))
+    (let* ((scope (healthkit-scope-of state bridge-id))
+           (applied nil))
+      (setf (getf scope :declared) t)
+      (dolist (type types)
+        (let ((prev (gethash type (getf scope :types))))
+          (setf (gethash type (getf scope :types))
+                (obj "state" target "source" (or source +json-null+) "updatedAt" now))
+          (when (string= action "remove")
+            ;; Removed means absent, not zero: the type's sources leave the PE.
+            (let ((sensors (gethash type (getf scope :sensors)))
+                  (sources (perception-engine-sources (perception-state-engine state))))
+              (dolist (sid sensors)
+                (let ((doomed nil))
+                  (maphash (lambda (id src) (when (equal (source-sensor-id src) sid) (push id doomed))) sources)
+                  (dolist (id doomed) (remhash id sources))))
+              (remhash type (getf scope :sensors))))
+          (push (obj "type" type "state" target
+                     "previous" (if prev (jstring prev "state" nil) +json-null+))
+                applied)))
+      (incf (getf scope :generation))
+      (setf (gethash bridge-id (perception-state-healthkit-scopes state)) scope)
+      (broadcast (obj "type" "healthkit.scope.changed" "bridgeId" bridge-id "action" action
+                      "types" (vectorize types) "generation" (getf scope :generation)))
+      (cons 200 (obj "success" t "bridgeId" bridge-id "action" action
+                     "generation" (getf scope :generation)
+                     "applied" (vectorize (nreverse applied)))))))
+
+(defun healthkit-resync-request (state body &optional bearer-token)
+  "Returns (STATUS . BODY)."
+  (unless (healthkit-authorized-p state body bearer-token)
+    (return-from healthkit-resync-request
+      (cons 401 (obj "success" +json-false+ "error" "invalid HealthKit bridge token"))))
+  (let* ((bridge-id (or (jstring body "bridgeId" nil) (perception-state-healthkit-bridge-id state)))
+         (requested-by (jstring body "requestedBy" nil))
+         (requested (remove-if-not #'stringp (jarray-list (jget body "types"))))
+         (scope (healthkit-scope-of state bridge-id)))
+    (unless (and requested-by (plusp (length requested-by)))
+      (return-from healthkit-resync-request (cons 400 (obj "error" "resync requires requestedBy"))))
+    (unless requested
+      (if (getf scope :declared)
+          (maphash (lambda (k v) (when (equal (jstring v "state" "") "active") (push k requested)))
+                   (getf scope :types))
+          (maphash (lambda (k v) (declare (ignore v)) (push k requested)) (getf scope :sensors)))
+      (setf requested (sort requested #'string<)))
+    (let ((accepted nil) (refused nil))
+      (dolist (type requested)
+        (let ((reason (when (getf scope :declared)
+                        (let ((entry (gethash type (getf scope :types))))
+                          (cond ((null entry) "not-in-scope")
+                                ((equal (jstring entry "state" "") "locked") "locked")
+                                ((equal (jstring entry "state" "") "active") nil)
+                                (t "not-in-scope"))))))
+          (if reason (push (obj "type" type "reason" reason) refused) (push type accepted))))
+      (setf accepted (nreverse accepted) refused (nreverse refused))
+      (if (null accepted)
+          (cons 409 (obj "success" +json-false+ "request" +json-null+ "refused" (vectorize refused)))
+          (let ((request (obj "id" (make-id "hk-resync") "bridgeId" bridge-id
+                              "types" (vectorize accepted) "requestedBy" requested-by
+                              "requestedAt" (now-ms) "state" "pending" "fulfilledAt" +json-null+)))
+            (setf (getf scope :resync) (last (append (getf scope :resync) (list request)) 32))
+            (setf (gethash bridge-id (perception-state-healthkit-scopes state)) scope)
+            (cons 202 (obj "success" t "request" request "refused" (vectorize refused))))))))
 
 ;; ── HealthKit AI-model helpers ────────────────────────────────────────────
 
@@ -1662,13 +1786,31 @@ it is accepted as an alternative to the body bridgeToken/token fields."
                (not (equal required-token bearer-token)))
       (return-from ingest-healthkit
         (cons 401 (obj "success" +json-false+ "error" "invalid HealthKit bridge token")))))
-  (let ((resolved nil) (unmapped nil))
-    (if (jget body "samples")
-        (dolist (sample (jarray-list (jget body "samples")))
-          (let ((r (ingest-healthkit-one state sample)))
-            (if (jget r "resolved") (push r resolved) (push r unmapped))))
-        (let ((r (ingest-healthkit-one state body)))
-          (if (jget r "resolved") (push r resolved) (push r unmapped))))
+  (let* ((resolved nil) (unmapped nil)
+         (bridge-id (or (jstring body "bridgeId" nil) (perception-state-healthkit-bridge-id state)))
+         (scope (healthkit-scope-of state bridge-id))
+         (resync-id (jstring body "resyncId" nil)))
+    (flet ((one (sample)
+             (let* ((type (or (jstring sample "type" nil) (jstring sample "sampleType" nil) ""))
+                    (refusal (healthkit-scope-refusal state bridge-id type)))
+               (if refusal
+                   (push (obj "unmapped" t "type" type "sourceName" (jstring sample "sourceName" "")
+                              "reason" refusal)
+                         unmapped)
+                   (let ((r (ingest-healthkit-one state sample)))
+                     (if (jget r "resolved")
+                         (progn
+                           (pushnew (jstring r "sensorId" "") (gethash type (getf scope :sensors)) :test #'equal)
+                           (push r resolved))
+                         (push r unmapped)))))))
+      (if (jget body "samples")
+          (dolist (sample (jarray-list (jget body "samples"))) (one sample))
+          (one body)))
+    (when resync-id
+      (dolist (req (getf scope :resync))
+        (when (and (equal (jstring req "id" "") resync-id) (equal (jstring req "state" "") "pending"))
+          (setf (jget req "state") "fulfilled" (jget req "fulfilledAt") (now-ms)))))
+    (setf (gethash bridge-id (perception-state-healthkit-scopes state)) scope)
     (let* ((resolved-list (nreverse resolved))
            (unmapped-list (nreverse unmapped))
            (status (cond ((and unmapped-list (null resolved-list)) 400)
@@ -1680,11 +1822,12 @@ it is accepted as an alternative to the body bridgeToken/token fields."
                       "resolved" (length resolved-list)
                       "unmapped" (length unmapped-list)
                       "timestamp" (now-ms)))
-      (cons status
-            (obj "success"  (json-bool (null unmapped-list))
-                 "bridgeId" (perception-state-healthkit-bridge-id state)
-                 "resolved" (vectorize resolved-list)
-                 "unmapped" (vectorize unmapped-list))))))
+      (let ((out (obj "success"  (json-bool (null unmapped-list))
+                      "bridgeId" (perception-state-healthkit-bridge-id state)
+                      "resolved" (vectorize resolved-list)
+                      "unmapped" (vectorize unmapped-list))))
+        (when resync-id (setf (jget out "resyncId") resync-id))
+        (cons status out)))))
 
 (defun carekit-status-json (state)
   (let ((token-set (perception-state-carekit-bridge-token state)))
@@ -2397,6 +2540,18 @@ therefore answer true for a key that is not there."
    (make-route "GET" "/api/integrations/healthkit/status" (lambda (_ body query)
                                                             (declare (ignore _ body query))
                                                             (json-response (actor-ask actor #'healthkit-status-json))))
+   (make-route "POST" "/api/integrations/healthkit/scope"
+               (lambda (_ body query)
+                 (declare (ignore _ query))
+                 (let* ((bearer (request-bearer-token))
+                        (result (actor-ask actor (lambda (state) (healthkit-scope-change state body bearer)))))
+                   (json-response (cdr result) (car result)))))
+   (make-route "POST" "/api/integrations/healthkit/resync"
+               (lambda (_ body query)
+                 (declare (ignore _ query))
+                 (let* ((bearer (request-bearer-token))
+                        (result (actor-ask actor (lambda (state) (healthkit-resync-request state body bearer)))))
+                   (json-response (cdr result) (car result)))))
    (make-route "POST" "/api/integrations/healthkit/ingest" (lambda (_ body query)
                                                              (declare (ignore _ query))
                                                              (let* ((bearer (request-bearer-token))
