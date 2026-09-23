@@ -146,7 +146,7 @@ the whole set sorted by key, per the contract."
 (defstruct perception-state
   engine reality-url localai-url localai-machine-dir push-records started-at
   integrations-config-path integrations-loaded-p integrations-load-error integrations source-mappings
-  triggers-enabled-p trigger-dispatch-mode trigger-graphql-url envelopes-created dispatch-errors
+  triggers-enabled-p trigger-dispatch-mode trigger-graphql-url envelopes-created replays-created dispatch-errors
   dropped-no-governance dropped-no-dispatch dropped-catalog-cold
   machine-catalog machine-catalog-lock machine-catalog-refreshed-at
   catalog-cold-warned-p
@@ -186,6 +186,7 @@ the whole set sorted by key, per the contract."
    :trigger-dispatch-mode (env "TRIGGER_DISPATCH_MODE" "dry-run")
    :trigger-graphql-url (env "TRIGGER_GRAPHQL_URL" (format nil "~a/graphql" localai-url))
    :envelopes-created 0
+   :replays-created 0
    :dispatch-errors 0
    :dropped-no-governance 0
    :dropped-no-dispatch 0
@@ -828,6 +829,7 @@ graphqlEndpoint and ledgerSize became records, the names consumers read."
          ;; Previously these inflated droppedNoDispatch, which reads as "the
          ;; machine declares no agent/trigger" — the opposite of the truth (#63).
          "droppedCatalogCold" (perception-state-dropped-catalog-cold state)
+         "replaysCreated" (perception-state-replays-created state)
          "machineCatalogSize" catalog-size
          "machineCatalogCold" (json-bool (machine-catalog-cold-p state))
          "machineCatalogRefreshedAt" (perception-state-machine-catalog-refreshed-at state)
@@ -881,30 +883,34 @@ other field is ignored, so the envelope cannot be rewritten."
     (setf (jget record "updatedAt") (now-ms))
     record))
 
-(defun replay-dispatch-record (state dispatch-id)
-  "Create a new ledger entry that replays an existing dispatch record.
-Wire-compatible with _AI Dispatcher.replay() — same mode:\"replay\" + replayOf fields."
+(defun replay-dispatch-record (state dispatch-id &key fresh-ids)
+  "POST /api/dispatch/records/:id/replay, settled 3-of-3 (SURFACE_SPEC.md,
+\"Dispatch replay\"; INTEGRATION_ROADMAP §6 Q6). A new record re-emitting the
+original's envelope: mode replay, replayOf set, delivery state reset, no
+provider called. With FRESH-IDS the envelope and correlation ids are re-minted,
+in the envelope too. Implemented long before any route called it (#100)."
   (let ((original (lookup-dispatch-record state dispatch-id)))
     (when original
       (let* ((now (now-ms))
+             (envelope-id (if fresh-ids (make-id "trigger-envelope") (jstring original "envelopeId" "")))
+             (correlation-id (if fresh-ids (make-id "trigger-correlation") (jstring original "correlationId" "")))
+             (envelope (let ((e (jget original "envelope")))
+                         (if (and fresh-ids (jobject-p e))
+                             (let ((copy (make-hash-table :test #'equal)))
+                               (maphash (lambda (k v) (setf (gethash k copy) v)) e)
+                               (setf (gethash "envelopeId" copy) envelope-id
+                                     (gethash "correlationId" copy) correlation-id
+                                     (gethash "emittedAtMs" copy) now)
+                               copy)
+                             (or e +json-null+))))
              (record (obj "id" (make-id "dispatch")
-                          "envelopeId" (or (jstring original "envelopeId" nil) (make-id "trigger-envelope"))
-                          "correlationId" (or (jstring original "correlationId" nil) (make-id "trigger-correlation"))
+                          "envelopeId" envelope-id
+                          "correlationId" correlation-id
                           "status" "recorded"
                           "mode" "replay"
                           "replayOf" dispatch-id
-                          "target" (or (jstring original "target" nil) +json-null+)
+                          "target" (or (jget original "target") +json-null+)
                           "machineId" (or (jstring original "machineId" nil) "")
-                          ;; The contributing SET, carried across verbatim.
-                          ;; This read scalar `sequenceId` until the fold moved
-                          ;; into the machine's atomic step; once the ledger
-                          ;; started recording `sequenceIds`, the old read found
-                          ;; no key and quietly wrote "" — a replay that had
-                          ;; forgotten which CESs produced the determination it
-                          ;; was replaying, with nothing in the record to show
-                          ;; it. `jarray-list` of a missing key is NIL, so a
-                          ;; record predating the change replays as an empty set
-                          ;; rather than erroring.
                           "sequenceIds" (vectorize (jarray-list (jget original "sequenceIds")))
                           "ragStatusCode" (json-null-if-empty (jstring original "ragStatusCode" nil))
                           "processStatus" (json-null-if-empty (jstring original "processStatus" nil))
@@ -913,18 +919,16 @@ Wire-compatible with _AI Dispatcher.replay() — same mode:\"replay\" + replayOf
                                           (obj "machineIri" +json-null+ "sequenceIri" +json-null+
                                                "actionCode" +json-null+))
                           "attempts" 0 "createdAt" now "updatedAt" now
-                          "envelope" (or (jget original "envelope") +json-null+))))
+                          "envelope" envelope)))
         (push record (perception-state-dispatch-ledger state))
+        (when (> (length (perception-state-dispatch-ledger state))
+                 (perception-state-dispatch-ledger-limit state))
+          (setf (perception-state-dispatch-ledger state)
+                (subseq (perception-state-dispatch-ledger state)
+                        0 (perception-state-dispatch-ledger-limit state))))
+        (incf (perception-state-envelopes-created state))
+        (incf (perception-state-replays-created state))
         record))))
-
-;; ── Dispatch helpers — wire-compatible with CPP dispatch_triggers /
-;;    TypeScript Dispatcher.onStep.  Drop rules and full envelope shape
-;;    match both reference implementations exactly. ───────────────────────────
-
-;; ── Machine catalog cache ─────────────────────────────────────────────────────
-;; Mirrors CPP machine_catalog_snapshot / TS machineCatalog + refreshMachineCatalog.
-;; The catalog is populated by a background thread; dispatch lookups are O(1)
-;; and never block the actor (push cycle) on a RE HTTP round-trip.
 
 (defun refresh-machine-catalog (state &key quiet)
   "Fetch /api/machines from RE and atomically replace the local catalog.
@@ -2327,6 +2331,25 @@ therefore answer true for a key that is not there."
                                                      (if record
                                                          (json-response (obj "record" record))
                                                          (error-response "Dispatch record not found" 404)))))
+   (make-route "POST" "/api/dispatch/records/:id/replay"
+               (lambda (params body query)
+                 (declare (ignore query))
+                 (let* ((id (gethash "id" params))
+                        (fresh (eq (jget body "freshIds") t))
+                        (record (actor-ask actor (lambda (state)
+                                                   (replay-dispatch-record state id :fresh-ids fresh)))))
+                   (if record
+                       (progn
+                         (broadcast (obj "type" "trigger.envelope.created"
+                                         "envelopeId" (jget record "envelopeId")
+                                         "correlationId" (jget record "correlationId")
+                                         "dispatchId" (jget record "id")
+                                         "target" (jget record "target")
+                                         "mode" "replay"
+                                         "replayOf" id))
+                         (json-response (obj "success" t "record" record "replayOf" id
+                                             "freshIds" (if fresh t +json-false+))))
+                       (error-response "Dispatch record not found" 404)))))
    (make-route "PATCH" "/api/dispatch/records/:id" (lambda (params body query)
                                                      (declare (ignore query))
                                                      (let ((record (actor-ask actor

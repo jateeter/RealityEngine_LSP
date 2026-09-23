@@ -1908,7 +1908,7 @@ ever have seen."
       (assert-equal '("dispatchErrors" "droppedCatalogCold" "droppedNoDispatch"
                       "droppedNoGovernance" "enabled" "envelopesCreated"
                       "graphqlEndpoint" "machineCatalogCold" "machineCatalogRefreshedAt"
-                      "machineCatalogSize" "mode" "participation" "records")
+                      "machineCatalogSize" "mode" "participation" "records" "replaysCreated")
                     (sort (loop for k being the hash-keys of status collect k) #'string<)
                     "triggers status carries exactly the agreed keys")))
 
