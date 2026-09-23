@@ -2679,6 +2679,28 @@ ever have seen."
                    (list 1 2 3 4) (reality-engine-lsp::make-region :offset 1 :length 2))
                   "extract-region still reads a list"))
 
+  ;; localAI invoke allow-list: configured policy, exact (method, path), deny by
+  ;; default (RealityEngine_CI SURFACE_SPEC.md, localAI invoke contract).
+  (let ((state (reality-engine-lsp::make-perception-state-from-config
+                :dimension 8
+                :reality-url "http://localhost:3299"
+                :localai-url "http://localhost:8000"
+                :localai-machine-dir "../localAIStack/data/machines")))
+    (assert-true (null (reality-engine-lsp::localai-operation-for-id state "GET" "/health"))
+                 "no configured allow-list allows nothing")
+    (setf (reality-engine-lsp::perception-state-localai-allowed-operations state)
+          (reality-engine-lsp::vectorize
+           (list (reality-engine-lsp::obj "id" "health" "method" "GET" "path" "/health")
+                 (reality-engine-lsp::obj "id" "graph_rag" "method" "POST" "path" "/graph/rag"))))
+    (assert-equal "graph_rag" (reality-engine-lsp::localai-operation-for-id state "POST" "/graph/rag")
+                  "an allowed (method, path) resolves to its id")
+    (assert-true (null (reality-engine-lsp::localai-operation-for-id state "GET" "/graph/rag"))
+                 "the method is part of the match")
+    (assert-true (null (reality-engine-lsp::localai-operation-for-id state "GET" "/health/deep"))
+                 "no prefix matching")
+    (assert-true (null (reality-engine-lsp::localai-operation-for-id state "GET" "/"))
+                 "\"/\" is not a wildcard"))
+
   (output-merge-tests)
   (fold-placement-tests)
 

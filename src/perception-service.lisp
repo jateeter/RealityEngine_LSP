@@ -155,6 +155,10 @@ the whole set sorted by key, per the contract."
   ;; dispatch ledger above: newest first, bounded, so a long-running PE cannot
   ;; grow without bound and both ledgers read alike.
   localai-ledger localai-ledger-limit
+  ;; The invoke allow-list: allowedOperations on the localai integration of
+  ;; INTEGRATIONS_CONFIG, and the path it came from. NIL = none configured,
+  ;; which allows nothing (SURFACE_SPEC.md, localAI invoke contract).
+  localai-allowed-operations localai-allowed-source
   ollama-base-url ollama-model ollama-completion-source-mapping-id
   openai-base-url openai-model openai-completion-source-mapping-id openai-api-key
   acp-enabled-p acp-platform acp-surface acp-command acp-gateway-url
@@ -199,6 +203,8 @@ the whole set sorted by key, per the contract."
    :dispatch-ledger-limit (env-int "TRIGGER_DISPATCH_LEDGER_LIMIT" 256)
    :localai-ledger nil
    :localai-ledger-limit (env-int "LOCALAI_INVOCATION_LEDGER_LIMIT" 256)
+   :localai-allowed-operations nil
+   :localai-allowed-source nil
    :ollama-base-url (trim-trailing-slashes (env "OLLAMA_BASE_URL" "http://localhost:11434"))
    ;; Canonical default shared by every runtime; override per engine with
    ;; OLLAMA_MODEL. See RealityEngine_CI/docs/OLLAMA_INTEGRATION.md.
@@ -483,48 +489,35 @@ Per-sequence boundaries live in metadata.segments for UI display."
          "machineDirectory" (perception-state-localai-machine-dir state))))
 
 (defun localai-catalog-json (state)
-  (obj "success" t
-       "status" (localai-status-json state)
-       "graphSchema" +json-null+
-       "recentGraphQLEvents" +json-null+
-       "invokeEndpoint" "/api/integrations/localai/invoke"
-       "allowedEndpoints" (vectorize
-                           (list (obj "id" "health" "method" "GET" "path" "/health")
-                                 (obj "id" "graph_schema" "method" "GET" "path" "/graph/schema")
-                                 (obj "id" "graph_rag" "method" "POST" "path" "/graph/rag")
-                                 (obj "id" "graph_agent" "method" "POST" "path" "/graph/agent")
-                                 (obj "id" "rag_query" "method" "POST" "path" "/rag/query")
-                                 (obj "id" "rag_ingest_text" "method" "POST" "path" "/rag/ingest/text")
-                                 (obj "id" "chat" "method" "POST" "path" "/chat")
-                                 (obj "id" "graphql" "method" "POST" "path" "/graphql")))
-       "realityBridge" (obj "sensors" (vectorize '("localai_rag_retrieval"
-                                                    "localai_rag_grading"
-                                                    "localai_agent_activity"))
-                            "bootstrapEndpoint" "/api/integrations/localai/bootstrap"
-                            "signalEndpoint" "/api/signals")))
+  "Shape settled 3-of-3 (SURFACE_SPEC.md, localAI invoke contract). The allow-list
+is the configured policy, verbatim; graphSchema and recentGraphQLEvents are
+fetched from localAIStack, null when it does not answer."
+  (let ((base (perception-state-localai-url state)))
+    (obj "success" t
+         "status" (localai-status-json state)
+         "graphSchema" (handler-case (http-get-json (format nil "~a/graph/schema" base))
+                         (error () +json-null+))
+         "recentGraphQLEvents" (handler-case (http-get-json (format nil "~a/graphql/events" base))
+                                 (error () +json-null+))
+         "invokeEndpoint" "/api/integrations/localai/invoke"
+         "allowedEndpoints" (vectorize (localai-allowed-operations state))
+         "allowedEndpointsSource" (or (perception-state-localai-allowed-source state) +json-null+)
+         "realityBridge" (obj "sensors" (vectorize '("localai_rag_retrieval"
+                                                      "localai_rag_grading"
+                                                      "localai_agent_activity"))
+                              "bootstrapEndpoint" "/api/integrations/localai/bootstrap"
+                              "signalEndpoint" "/api/signals"))))
 
-(defun endpoint-allowed-p (endpoint)
-  (let ((path (first (split-string endpoint #\?)))
-        (allowed '("/" "/health" "/chat" "/rag/query" "/rag/ingest/text"
-                   "/graph/schema" "/graph/rag" "/graph/agent" "/graphql")))
-    (some (lambda (prefix)
-            (or (string= path prefix)
-                (and (not (string= prefix "/"))
-                     (string-prefix-p (format nil "~a/" prefix) path))))
-          allowed)))
+(defun localai-allowed-operations (state)
+  (jarray-list (perception-state-localai-allowed-operations state)))
 
-(defun localai-operation-id (state endpoint)
-  "The catalogue's own id for ENDPOINT, or NIL when it names none.
-
-Read from this runtime's /api/integrations/localai/catalog rather than a list
-kept here, so the ledger names the operation the deployment permits. An endpoint
-absent from the catalogue records no id, which is itself the finding."
-  (let* ((catalog (localai-catalog-json state))
-         (allowed (jget catalog "allowedEndpoints")))
-    (when allowed
-      (loop for entry across allowed
-            when (equal (jstring entry "path" nil) endpoint)
-              return (jstring entry "id" nil)))))
+(defun localai-operation-for-id (state method path)
+  "The configured operation's id for exactly (METHOD, PATH), or NIL. No prefixes
+and no \"/\" wildcard: this used to prefix-match, and allowed \"/\"."
+  (loop for op in (localai-allowed-operations state)
+        when (and (string-equal (jstring op "method" "") method)
+                  (equal (jstring op "path" nil) path))
+          return (jstring op "id" nil)))
 
 (defun record-localai-invocation (state record)
   "Append one invocation record, newest first, bounded like the dispatch ledger."
@@ -548,8 +541,8 @@ letting the two runtimes disagree on order for the same endpoint."
        "records" (vectorize (reverse (perception-state-localai-ledger state)))))
 
 (defun invoke-localai (state body)
-  (let* ((method (string-upcase (or (jstring body "method" nil) "POST")))
-         (endpoint (or (jstring body "endpoint" nil) (jstring body "path" nil)))
+  (let* ((endpoint (or (jstring body "endpoint" nil) (jstring body "path" nil)))
+         (method nil)
          ;; The correlation id is what lets a completion write-back be joined to
          ;; the invocation that justified it. Taken from the caller when given so
          ;; an existing chain is preserved, minted otherwise so no record is left
@@ -557,10 +550,20 @@ letting the two runtimes disagree on order for the same endpoint."
          (correlation-id (or (jstring body "correlationId" nil) (make-id "localai-invocation")))
          (invocation-id (make-id "localai-inv"))
          (started-at (now-ms)))
-    (unless endpoint
-      (return-from invoke-localai (obj "success" +json-false+ "error" "localAI invocation requires endpoint or path")))
+    ;; Returns (STATUS . BODY): SURFACE_SPEC.md, localAI invoke contract.
+    (unless (and endpoint (plusp (length endpoint)))
+      (return-from invoke-localai
+        (cons 400 (obj "success" +json-false+ "error" "localAI invocation requires endpoint or path"))))
     (unless (char= (char endpoint 0) #\/)
       (setf endpoint (format nil "/~a" endpoint)))
+    ;; METHOD defaults to the allowed operation's own method for this path.
+    (let ((route-path (first (split-string endpoint #\?))))
+      (setf method (string-upcase
+                    (or (jstring body "method" nil)
+                        (loop for op in (localai-allowed-operations state)
+                              when (equal (jstring op "path" nil) route-path)
+                                return (jstring op "method" nil))
+                        "POST"))))
     (labels ((carry (key into)
                ;; Machine and sequence are recorded only when the caller names
                ;; them. An invocation with no authored occasion is a detectable
@@ -590,31 +593,32 @@ letting the two runtimes disagree on order for the same endpoint."
                                               (obj "uri" (format nil "~a~a" (perception-state-localai-url state) endpoint)
                                                    "shape" "object")))))
                  (record-localai-invocation state (apply #'obj fields)))))
-      (unless (endpoint-allowed-p endpoint)
-        ;; Recorded before the refusal is returned. An attempt on a forbidden
-        ;; endpoint is exactly the event a runtime trace must carry, and an
-        ;; unrecorded path loses it entirely.
-        (record nil (localai-operation-id state endpoint) nil "endpoint is not allowed")
-        (return-from invoke-localai
-          (obj "success" +json-false+ "endpoint" endpoint "method" method
-               "correlationId" correlation-id
-               "error" "localAI endpoint is not allowed")))
-      (handler-case
-          (let ((response (if (string= method "GET")
-                              (http-get-json (format nil "~a~a" (perception-state-localai-url state) endpoint))
-                              (http-post-json (format nil "~a~a" (perception-state-localai-url state) endpoint)
-                                              (or (jget body "payload") (obj))))))
-            (record t (localai-operation-id state endpoint) response nil)
-            (obj "success" t "endpoint" endpoint "method" method
-                 "correlationId" correlation-id "invocationId" invocation-id
-                 "response" response))
-        (error (condition)
-          ;; A call that failed is still a call that was made. A ledger of
-          ;; successes cannot answer "was this attempted".
-          (record nil (localai-operation-id state endpoint) nil (princ-to-string condition))
-          (obj "success" +json-false+ "endpoint" endpoint "method" method
-               "correlationId" correlation-id
-               "error" (princ-to-string condition)))))))
+      (let ((operation-id (localai-operation-for-id state method (first (split-string endpoint #\?)))))
+        (unless (and operation-id (not (search ".." endpoint)) (not (search "//" endpoint)))
+          ;; Recorded before the refusal is returned. An attempt on a forbidden
+          ;; endpoint is exactly the event a runtime trace must carry, and an
+          ;; unrecorded path loses it entirely.
+          (record nil nil nil "endpoint is not allowed")
+          (return-from invoke-localai
+            (cons 403 (obj "success" +json-false+ "endpoint" endpoint "method" method
+                           "correlationId" correlation-id "invocationId" invocation-id
+                           "error" "localAI endpoint is not allowed"))))
+        (handler-case
+            (let ((response (if (string= method "GET")
+                                (http-get-json (format nil "~a~a" (perception-state-localai-url state) endpoint))
+                                (http-post-json (format nil "~a~a" (perception-state-localai-url state) endpoint)
+                                                (or (jget body "payload") (jget body "body") (obj))))))
+              (record t operation-id response nil)
+              (cons 200 (obj "success" t "endpoint" endpoint "method" method
+                             "correlationId" correlation-id "invocationId" invocation-id
+                             "response" response)))
+          (error (condition)
+            ;; A call that failed is still a call that was made. A ledger of
+            ;; successes cannot answer "was this attempted".
+            (record nil operation-id nil (princ-to-string condition))
+            (cons 502 (obj "success" +json-false+ "endpoint" endpoint "method" method
+                           "correlationId" correlation-id "invocationId" invocation-id
+                           "error" (princ-to-string condition)))))))))
 
 (defun load-integrations-config (state)
   (let* ((configured (env "INTEGRATIONS_CONFIG" nil))
@@ -635,6 +639,10 @@ letting the two runtimes disagree on order for the same endpoint."
               (dolist (item (jarray-list integrations))
                 (let ((kind (jstring item "kind" "")))
                   (cond
+                    ((string= kind "localai")
+                     (when (jarray-p (jget item "allowedOperations"))
+                       (setf (perception-state-localai-allowed-operations state) (jget item "allowedOperations")
+                             (perception-state-localai-allowed-source state) path)))
                     ((string= kind "ollama")
                      ;; The registry supplies defaults; an explicit environment
                      ;; variable outranks them. This applied the file's values
@@ -2388,7 +2396,8 @@ therefore answer true for a key that is not there."
                                                              (json-response (actor-ask actor #'bootstrap-localai))))
    (make-route "POST" "/api/integrations/localai/invoke" (lambda (_ body query)
                                                           (declare (ignore _ query))
-                                                          (json-response (actor-ask actor (lambda (state) (invoke-localai state body))))))
+                                                          (let ((result (actor-ask actor (lambda (state) (invoke-localai state body)))))
+                                                            (json-response (cdr result) (car result)))))
    (make-route "GET" "/api/integrations/localai/ledger" (lambda (_ body query)
                                                          (declare (ignore _ body query))
                                                          (json-response (actor-ask actor #'localai-ledger-json))))
