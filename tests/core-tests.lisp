@@ -1803,7 +1803,8 @@ ever have seen."
       ;; (RealityEngine_CI SURFACE_SPEC.md, Dispatch surface shapes).
       (assert-equal '("attempts" "correlationId" "createdAt" "envelope" "envelopeId"
                       "error" "id" "machineId" "mode" "processStatus" "providerReceipt"
-                      "ragStatusCode" "sequenceIds" "status" "target" "updatedAt")
+                      "ragStatusCode" "replayOf" "semantics" "sequenceIds" "status"
+                      "target" "updatedAt")
                     (sort (loop for k being the hash-keys of record collect k) #'string<)
                     "dispatch record carries exactly the agreed keys")
       (let* ((id (reality-engine-lsp::jstring record "id" ""))

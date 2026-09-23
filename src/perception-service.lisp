@@ -55,6 +55,35 @@
                 (setf *semantics-bases-cache* (cons stamp bases))
                 bases))))))
 
+(defun json-null-if-empty (value)
+  "NIL or \"\" becomes JSON null: the dispatch record contract says a field with
+no value is null, never the empty string."
+  (if (or (null value) (and (stringp value) (string= value ""))) +json-null+ value))
+
+(defun sanitize-iri-local (local)
+  (let ((cleaned (map 'string (lambda (c) (if (or (alphanumericp c) (char= c #\_) (char= c #\-)) c #\_))
+                      local)))
+    (if (> (length cleaned) 0) cleaned "unnamed")))
+
+(defun dispatch-semantics (machine-name governance sequence-ids)
+  "The dispatch record's link to the corpus ABox: {machineIri, sequenceIri,
+actionCode}, fields null when absent. Same derivation in every runtime
+(RealityEngine_CI SURFACE_SPEC.md, Dispatch surface shapes): base IRI from the
+manifest entry for the machine's name; sequence from governance's sequenceId,
+else the sole contributing sequence. Also feeds semantic_dispatch_records_*,
+which were exported but never incremented."
+  (let* ((base (and machine-name (gethash machine-name (semantics-manifest-bases))))
+         (seq (let ((g (and governance (jstring governance "sequenceId" nil))))
+                (cond ((and g (> (length g) 0)) g)
+                      ((= (length sequence-ids) 1) (first sequence-ids))
+                      (t nil))))
+         (action (and governance (jstring governance "actionCode" nil))))
+    (incf *semantic-dispatch-total*)
+    (when base (incf *semantic-dispatch-joined*))
+    (obj "machineIri" (if base (format nil "~a#machine" base) +json-null+)
+         "sequenceIri" (if (and base seq) (format nil "~a#seq-~a" base (sanitize-iri-local seq)) +json-null+)
+         "actionCode" (json-null-if-empty action))))
+
 (defun record-perception-event (integration joined)
   (incf (gethash integration *semantic-events* 0))
   (incf (gethash integration *semantic-events-joined* 0) (if joined 1 0))
@@ -808,11 +837,6 @@ stay cheap; it is reversed here, at the wire."
        "records" (vectorize (mapcar #'dispatch-record-json
                                     (reverse (perception-state-dispatch-ledger state))))))
 
-(defun json-null-if-empty (value)
-  "NIL or \"\" becomes JSON null: the dispatch record contract says a field with
-no value is null, never the empty string."
-  (if (or (null value) (and (stringp value) (string= value ""))) +json-null+ value))
-
 (defun lookup-dispatch-record (state id)
   (find id (perception-state-dispatch-ledger state)
         :test #'string=
@@ -877,6 +901,9 @@ Wire-compatible with _AI Dispatcher.replay() — same mode:\"replay\" + replayOf
                           "ragStatusCode" (json-null-if-empty (jstring original "ragStatusCode" nil))
                           "processStatus" (json-null-if-empty (jstring original "processStatus" nil))
                           "providerReceipt" +json-null+ "error" +json-null+
+                          "semantics" (or (jget original "semantics")
+                                          (obj "machineIri" +json-null+ "sequenceIri" +json-null+
+                                               "actionCode" +json-null+))
                           "attempts" 0 "createdAt" now "updatedAt" now
                           "envelope" (or (jget original "envelope") +json-null+))))
         (push record (perception-state-dispatch-ledger state))
@@ -1216,6 +1243,9 @@ unaffected."
                         "processStatus" (json-null-if-empty (jstring governance "processStatus" nil))
                         "providerReceipt" +json-null+
                         "error" +json-null+
+                        "semantics" (dispatch-semantics (jstring machine "name" nil) governance
+                                                        (jarray-list (jget operation "sequenceIds")))
+                        "replayOf" +json-null+
                         "attempts" 0
                         "createdAt" now
                         "updatedAt" now
