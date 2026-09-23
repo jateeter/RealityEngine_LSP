@@ -164,7 +164,10 @@ the whole set sorted by key, per the contract."
    :machine-catalog-refreshed-at 0
    :catalog-cold-warned-p nil
    :dispatch-ledger nil
-   :dispatch-ledger-limit (env-int "TRIGGER_DISPATCH_LEDGER_LIMIT" 100)
+   ;; A diagnostic window, not an audit trail (INTEGRATION_ROADMAP.md §6 Q2):
+   ;; default 256 in every runtime. It was 100 here and in Scala, 256 in C++,
+   ;; so one run left different ledger histories on different engines.
+   :dispatch-ledger-limit (env-int "TRIGGER_DISPATCH_LEDGER_LIMIT" 256)
    :localai-ledger nil
    :localai-ledger-limit (env-int "LOCALAI_INVOCATION_LEDGER_LIMIT" 256)
    :ollama-base-url (trim-trailing-slashes (env "OLLAMA_BASE_URL" "http://localhost:11434"))
