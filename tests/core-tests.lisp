@@ -1798,7 +1798,55 @@ ever have seen."
                     "dispatch envelope should be PE-owned ledger record")
       (assert-equal 1
                     (length (reality-engine-lsp::perception-state-dispatch-ledger state))
-                    "dispatch ledger should retain PE-owned record")))
+                    "dispatch ledger should retain PE-owned record")
+      ;; Record shape, PATCH semantics and ledger order are settled 3-of-3
+      ;; (RealityEngine_CI SURFACE_SPEC.md, Dispatch surface shapes).
+      (assert-equal '("attempts" "correlationId" "createdAt" "envelope" "envelopeId"
+                      "error" "id" "machineId" "mode" "processStatus" "providerReceipt"
+                      "ragStatusCode" "sequenceIds" "status" "target" "updatedAt")
+                    (sort (loop for k being the hash-keys of record collect k) #'string<)
+                    "dispatch record carries exactly the agreed keys")
+      (let* ((id (reality-engine-lsp::jstring record "id" ""))
+             (patched (reality-engine-lsp::update-dispatch-record
+                       state id
+                       (reality-engine-lsp::obj "status" "delivered"
+                                                "provider" "ollama"
+                                                "externalRunId" "run-1"
+                                                "error" "boom"
+                                                "incrementAttempts" t
+                                                "envelope" "must not be written"))))
+        (assert-equal "ollama"
+                      (reality-engine-lsp::jstring
+                       (reality-engine-lsp::jget patched "providerReceipt") "provider" "")
+                      "provider folds into providerReceipt")
+        (assert-equal "run-1"
+                      (reality-engine-lsp::jstring
+                       (reality-engine-lsp::jget patched "providerReceipt") "externalRunId" "")
+                      "externalRunId folds into providerReceipt")
+        (assert-equal "boom" (reality-engine-lsp::jstring patched "error" "")
+                      "error is written by PATCH")
+        (assert-equal 1 (reality-engine-lsp::jnumber patched "attempts" 0)
+                      "incrementAttempts increments")
+        (assert-true (reality-engine-lsp::jobject-p (reality-engine-lsp::jget patched "envelope"))
+                     "PATCH cannot rewrite the envelope")
+        (reality-engine-lsp::update-dispatch-record
+         state id (reality-engine-lsp::obj "clearError" t))
+        (assert-equal :null (reality-engine-lsp::jget patched "error")
+                      "clearError resets error to null"))
+      (reality-engine-lsp::record-dispatch-envelope
+       state
+       (reality-engine-lsp::obj
+        "machineId" "machine-e2e" "sequenceId" "seq-e2e-2"
+        "values" (reality-engine-lsp::vectorize (list 0 1))
+        "region" (reality-engine-lsp::obj "offset" 4 "length" 2)
+        "governance" (reality-engine-lsp::obj "ownerTeam" "e2e-team")))
+      (let ((records (reality-engine-lsp::jarray-list
+                      (reality-engine-lsp::jget (reality-engine-lsp::ledger-json state) "records"))))
+        (assert-equal (reality-engine-lsp::jstring record "id" "")
+                      (reality-engine-lsp::jstring (first records) "id" "")
+                      "the ledger is served oldest first")
+        (assert-equal :null (reality-engine-lsp::jget (second records) "ragStatusCode")
+                      "a missing ragStatusCode is null, never the empty string"))))
   ;; ── Cold catalog vs no dispatch binding (#63) ─────────────────────────
   ;; Both used to leave record-dispatch-envelope as a bare NIL and land on the
   ;; droppedNoDispatch counter, so a PE that lost the startup race with its RE
@@ -1854,7 +1902,14 @@ ever have seen."
       (assert-equal 0 (reality-engine-lsp::jnumber status "droppedCatalogCold" nil)
                     "triggers status exposes the cold-drop counter")
       (assert-true (not (reality-engine-lsp::jbool status "machineCatalogCold" t))
-                   "triggers status reports the warm catalog as not cold")))
+                   "triggers status reports the warm catalog as not cold")
+      ;; The key set is settled 3-of-3 (SURFACE_SPEC.md, Dispatch surface shapes).
+      (assert-equal '("dispatchErrors" "droppedCatalogCold" "droppedNoDispatch"
+                      "droppedNoGovernance" "enabled" "envelopesCreated"
+                      "graphqlEndpoint" "machineCatalogCold" "machineCatalogRefreshedAt"
+                      "machineCatalogSize" "mode" "participation" "records")
+                    (sort (loop for k being the hash-keys of status collect k) #'string<)
+                    "triggers status carries exactly the agreed keys")))
 
   (let* ((state (make-test-state 8))
          (text (reality-engine-lsp::prometheus-text-of state "lsp")))

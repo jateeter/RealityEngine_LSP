@@ -515,9 +515,12 @@
                 "properties" (obj "limit" (obj "type" "number")))
            (lambda (args)
              (let* ((limit (jnumber args "limit" nil))
+                    ;; Oldest first, as on the wire. The internal list is
+                    ;; newest first, so without the reverse LAST below kept the
+                    ;; oldest N records rather than the newest.
                     (records (actor-ask actor (lambda (s)
                                                 (mapcar #'dispatch-record-json
-                                                        (perception-state-dispatch-ledger s)))))
+                                                        (reverse (perception-state-dispatch-ledger s))))))
                     (trimmed (if limit
                                  (let ((n (truncate limit)))
                                    (if (> (length records) n)

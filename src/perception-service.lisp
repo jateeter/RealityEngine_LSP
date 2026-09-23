@@ -774,11 +774,15 @@ letting the two runtimes disagree on order for the same endpoint."
        "carekit" (carekit-status-json state)))
 
 (defun triggers-status-json (state)
+  "Shape settled 3-of-3 in RealityEngine_CI SURFACE_SPEC.md, \"Dispatch surface
+shapes\": every runtime emits exactly these keys. graphqlUrl became
+graphqlEndpoint and ledgerSize became records, the names consumers read."
   (let ((catalog-size (bt:with-lock-held ((perception-state-machine-catalog-lock state))
                         (hash-table-count (perception-state-machine-catalog state)))))
-    (obj "enabled" (json-bool (perception-state-triggers-enabled-p state))
+    (obj "participation" (if (perception-state-triggers-enabled-p state) "active" "not-active")
+         "enabled" (json-bool (perception-state-triggers-enabled-p state))
          "mode" (perception-state-trigger-dispatch-mode state)
-         "graphqlUrl" (perception-state-trigger-graphql-url state)
+         "graphqlEndpoint" (perception-state-trigger-graphql-url state)
          "envelopesCreated" (perception-state-envelopes-created state)
          "dispatchErrors" (perception-state-dispatch-errors state)
          "droppedNoGovernance" (perception-state-dropped-no-governance state)
@@ -790,15 +794,24 @@ letting the two runtimes disagree on order for the same endpoint."
          "machineCatalogSize" catalog-size
          "machineCatalogCold" (json-bool (machine-catalog-cold-p state))
          "machineCatalogRefreshedAt" (perception-state-machine-catalog-refreshed-at state)
-         "ledgerSize" (length (perception-state-dispatch-ledger state)))))
+         "records" (length (perception-state-dispatch-ledger state)))))
 
 (defun dispatch-record-json (record)
   record)
 
 (defun ledger-json (state)
-  (obj "records" (vectorize (mapcar #'dispatch-record-json (perception-state-dispatch-ledger state)))
-       "count" (length (perception-state-dispatch-ledger state))
-       "triggers" (triggers-status-json state)))
+  "{enabled, mode, records}, records oldest first (SURFACE_SPEC.md, Dispatch
+surface shapes). The ledger list is kept newest first so PUSH and the ring trim
+stay cheap; it is reversed here, at the wire."
+  (obj "enabled" (json-bool (perception-state-triggers-enabled-p state))
+       "mode" (perception-state-trigger-dispatch-mode state)
+       "records" (vectorize (mapcar #'dispatch-record-json
+                                    (reverse (perception-state-dispatch-ledger state))))))
+
+(defun json-null-if-empty (value)
+  "NIL or \"\" becomes JSON null: the dispatch record contract says a field with
+no value is null, never the empty string."
+  (if (or (null value) (and (stringp value) (string= value ""))) +json-null+ value))
 
 (defun lookup-dispatch-record (state id)
   (find id (perception-state-dispatch-ledger state)
@@ -806,16 +819,33 @@ letting the two runtimes disagree on order for the same endpoint."
         :key (lambda (record) (jstring record "id" ""))))
 
 (defun update-dispatch-record (state id body)
+  "PATCH semantics settled 3-of-3 (SURFACE_SPEC.md, Dispatch surface shapes):
+status, error, clearError, attempts or incrementAttempts, providerReceipt
+(merged), and provider/adapter/externalRunId folded into providerReceipt. Any
+other field is ignored, so the envelope cannot be rewritten."
   (let ((record (lookup-dispatch-record state id)))
     (unless record
       (return-from update-dispatch-record nil))
-    (dolist (field '("status" "adapter" "provider" "externalRunId" "lastError"))
-      (when (jstring body field nil)
-        (setf (jget record field) (jstring body field))))
-    (when (jobject-p (jget body "metadata"))
-      (setf (jget record "metadata") (jget body "metadata")))
-    (when (jbool body "incrementAttempts" nil)
-      (setf (jget record "attempts") (1+ (or (jnumber record "attempts" nil) 0))))
+    (let ((status (jstring body "status" nil)))
+      (when status (setf (jget record "status") status)))
+    (let ((err (jstring body "error" nil)))
+      (when err (setf (jget record "error") err)))
+    (when (jbool body "clearError" nil)
+      (setf (jget record "error") +json-null+))
+    (let ((attempts (jnumber body "attempts" nil)))
+      (cond (attempts (setf (jget record "attempts") attempts))
+            ((jbool body "incrementAttempts" nil)
+             (setf (jget record "attempts") (1+ (or (jnumber record "attempts" nil) 0))))))
+    (let* ((existing (jget record "providerReceipt"))
+           (receipt (if (jobject-p existing) existing (obj)))
+           (changed nil))
+      (when (jobject-p (jget body "providerReceipt"))
+        (maphash (lambda (k v) (setf (gethash k receipt) v changed t))
+                 (jget body "providerReceipt")))
+      (dolist (field '("provider" "adapter" "externalRunId"))
+        (let ((value (jstring body field nil)))
+          (when value (setf (gethash field receipt) value changed t))))
+      (when changed (setf (jget record "providerReceipt") receipt)))
     (setf (jget record "updatedAt") (now-ms))
     record))
 
@@ -844,10 +874,9 @@ Wire-compatible with _AI Dispatcher.replay() — same mode:\"replay\" + replayOf
                           ;; record predating the change replays as an empty set
                           ;; rather than erroring.
                           "sequenceIds" (vectorize (jarray-list (jget original "sequenceIds")))
-                          "ragStatusCode" (or (jstring original "ragStatusCode" nil) "")
-                          "processStatus" (or (jstring original "processStatus" nil) "")
-                          "adapter" +json-null+ "provider" +json-null+
-                          "externalRunId" +json-null+ "lastError" +json-null+
+                          "ragStatusCode" (json-null-if-empty (jstring original "ragStatusCode" nil))
+                          "processStatus" (json-null-if-empty (jstring original "processStatus" nil))
+                          "providerReceipt" +json-null+ "error" +json-null+
                           "attempts" 0 "createdAt" now "updatedAt" now
                           "envelope" (or (jget original "envelope") +json-null+))))
         (push record (perception-state-dispatch-ledger state))
@@ -1183,12 +1212,10 @@ unaffected."
                         ;; named one CES would misattribute a determination the
                         ;; machine reached from several.
                         "sequenceIds" (vectorize (jarray-list (jget operation "sequenceIds")))
-                        "ragStatusCode" (jstring governance "ragStatusCode" "")
-                        "processStatus" (jstring governance "processStatus" "")
-                        "adapter" +json-null+
-                        "provider" +json-null+
-                        "externalRunId" +json-null+
-                        "lastError" +json-null+
+                        "ragStatusCode" (json-null-if-empty (jstring governance "ragStatusCode" nil))
+                        "processStatus" (json-null-if-empty (jstring governance "processStatus" nil))
+                        "providerReceipt" +json-null+
+                        "error" +json-null+
                         "attempts" 0
                         "createdAt" now
                         "updatedAt" now
@@ -1827,7 +1854,7 @@ it is accepted as an alternative to the body bridgeToken/token fields."
         (update-dispatch-record state id (obj "status" "failed"
                                               "adapter" "ollama"
                                               "provider" "ollama"
-                                              "lastError" (princ-to-string condition)
+                                              "error" (princ-to-string condition)
                                               "providerReceipt" (obj "model" (or (jstring body "model" nil)
                                                                                  (perception-state-ollama-model state)))))
         (obj "success" +json-false+
@@ -1931,7 +1958,7 @@ it is accepted as an alternative to the body bridgeToken/token fields."
         (update-dispatch-record state id (obj "status" "failed"
                                               "adapter" "openai"
                                               "provider" "openai"
-                                              "lastError" (princ-to-string condition)
+                                              "error" (princ-to-string condition)
                                               "providerReceipt" (obj "model" (or (jstring body "model" nil)
                                                                                  (perception-state-openai-model state)))))
         (obj "success" +json-false+
@@ -2251,7 +2278,7 @@ therefore answer true for a key that is not there."
                                                                             (lambda (state)
                                                                               (lookup-dispatch-record state (gethash "id" params))))))
                                                      (if record
-                                                         (json-response record)
+                                                         (json-response (obj "record" record))
                                                          (error-response "Dispatch record not found" 404)))))
    (make-route "PATCH" "/api/dispatch/records/:id" (lambda (params body query)
                                                      (declare (ignore query))
@@ -2260,8 +2287,13 @@ therefore answer true for a key that is not there."
                                                                                 (update-dispatch-record state (gethash "id" params) body)))))
                                                        (if record
                                                            (progn
-                                                             (broadcast (obj "type" "dispatch-updated" "record" record))
-                                                             (json-response record))
+                                                             (broadcast (obj "type" "dispatch.record.updated"
+                                                                             "dispatchId" (jstring record "id" "")
+                                                                             "status" (jget record "status")
+                                                                             "target" (jget record "target")
+                                                                             "attempts" (jget record "attempts")
+                                                                             "timestamp" (jget record "updatedAt")))
+                                                             (json-response (obj "success" t "record" record)))
                                                            (error-response "Dispatch record not found" 404)))))
    (make-route "GET" "/api/integrations/ollama/status" (lambda (_ body query)
                                                          (declare (ignore _ body query))
