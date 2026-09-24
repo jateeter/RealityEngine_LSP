@@ -1609,6 +1609,34 @@ ever have seen."
       (assert-equal "Unknown sourceMappingId \"missing-completion-mapping\""
                     (reality-engine-lsp::jstring (cdr missing) "error" "")
                     "unknown completion mapping should match CPP/AI error text"))
+    ;; Body before mapping for region and ttlMs, as C++ ingest_completion.
+    ;; The MCP smoke's ttlMs 60000 was declared as 300000 here, lsp-1 only
+    ;; (regression reset-contract, run 20260924T213725Z).
+    (let* ((own (reality-engine-lsp::ingest-completion
+                 state
+                 (reality-engine-lsp::obj
+                  "provider" "mcp-smoke" "agent" "deployment-smoke"
+                  "sensorId" "t.self.describing"
+                  "region" (reality-engine-lsp::obj "offset" 4300 "length" 4)
+                  "ttlMs" 60000
+                  "values" (reality-engine-lsp::vectorize (list 1 0 0.75 0)))))
+           (src (reality-engine-lsp::jget (reality-engine-lsp::jget own "signal") "source")))
+      (assert-equal 4300 (reality-engine-lsp::jnumber (reality-engine-lsp::jget src "region") "offset" nil)
+                    "a completion's own region wins")
+      (assert-equal 60000 (reality-engine-lsp::jnumber src "ttlMs" nil)
+                    "a completion's own ttlMs wins over the 300000 default"))
+    (let* ((over (reality-engine-lsp::ingest-completion
+                  state
+                  (reality-engine-lsp::obj
+                   "provider" "e2e" "agent" "ttl-override"
+                   "sourceMappingId" "agent-completion-risk"
+                   "ttlMs" 45000
+                   "values" (reality-engine-lsp::vectorize (list 1 0 0.75 0)))))
+           (src (reality-engine-lsp::jget (reality-engine-lsp::jget over "signal") "source")))
+      (assert-equal 45000 (reality-engine-lsp::jnumber src "ttlMs" nil)
+                    "a completion's own ttlMs wins over the mapping's")
+      (assert-equal 4200 (reality-engine-lsp::jnumber (reality-engine-lsp::jget src "region") "offset" nil)
+                    "without a body region, the mapping's region applies"))
     (let* ((mapping (reality-engine-lsp::source-mapping-by-id state "agent-completion-risk"))
            (values (reality-engine-lsp::completion-values-from-content
                     "{\"completed\":1,\"failed\":0,\"confidence\":0.75,\"actionClass\":0}"

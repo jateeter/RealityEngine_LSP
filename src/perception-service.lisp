@@ -1488,10 +1488,19 @@ dispatch_triggers and TS Dispatcher.onStep: drop ops without governance
                                  (cons "agent" agent)
                                  (cons "correlationId" (or (jstring body "correlationId" nil) ""))
                                  (cons "envelopeId"    (or (jstring body "envelopeId"    nil) ""))))))
+           ;; Body before mapping, as C++ ingest_completion (and Scala since
+           ;; RealityEngine_Scala#158): a self-describing completion places its
+           ;; own signal.  Both used to read the mapping alone, so the MCP
+           ;; smoke's ttlMs 60000 was declared as 300000 here, lsp-1 only
+           ;; (regression reset-contract, run 20260924T213725Z), and a body
+           ;; region was honoured only when it happened to equal the default.
            (region (make-region-from-json
-                    (or (and mapping (jget mapping "region"))
+                    (or (and (jobject-p (jget body "region")) (jget body "region"))
+                        (and mapping (jget mapping "region"))
                         (obj "offset" 4200 "length" (length numbers)))))
-           (ttl-ms (or (and mapping (jnumber mapping "ttlMs" nil)) 300000))
+           (ttl-ms (or (jnumber body "ttlMs" nil)
+                       (and mapping (jnumber mapping "ttlMs" nil))
+                       300000))
            (name (or (jstring body "name" nil)
                      (and mapping (jstring mapping "name" nil))
                      (format nil "agent:~a/~a/completion" provider agent)))
