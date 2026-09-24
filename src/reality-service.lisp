@@ -30,6 +30,11 @@
   match-threshold
   sampler-running-p sampler-strategy sampler-interval-ms sampler-sample-count
   sim-buffer sim-buffered-region sim-buffered-delay
+  ;; GET /api/perceptual-simulation/state: currentStep counts
+  ;; /perceptual-simulation/step calls since reset; isRunning is the start/stop
+  ;; flag.  Same fields as C++ PerceptualSpaceRuntime::state_json and the Scala
+  ;; route (RealityEngine_CI#453).
+  sim-current-step sim-running-p
   ;; Arbitration records for the most recent step (ARBITER_CONTRACT.md 6).
   ;; A resolution nobody can observe is indistinguishable from no resolution,
   ;; and a suppressed contribution has to stay attributable.
@@ -318,7 +323,9 @@ schema does not declare — isActive, state, wasJustMatched — which
            :sampler-sample-count 0
            :sim-buffer nil
            :sim-buffered-region nil
-           :sim-buffered-delay 100)))
+           :sim-buffered-delay 100
+           :sim-current-step 0
+           :sim-running-p nil)))
     (dolist (machine (load-machines-from-directory machine-dir))
       (put-machine state machine))
     state))
@@ -437,7 +444,9 @@ same state — an engine with nothing loaded requires nothing."
         (reality-state-isre-history state) nil
         (reality-state-osre-history state) nil
         (reality-state-latched-event-bits state) (make-hash-table :test #'equal)
-        (reality-state-step-count state) 0)
+        (reality-state-step-count state) 0
+        (reality-state-sim-current-step state) 0
+        (reality-state-sim-running-p state) nil)
   ;; CES coverage deliberately survives the reset.
   ;;
   ;; It answers "has this sequence EVER emitted output" — the help text says
@@ -2142,6 +2151,19 @@ on this surface."
                  (reality-state-machines state))
         (transitions-inhibited-control state))))
 
+(defun perceptual-simulation-state-json (state)
+  "GET /api/perceptual-simulation/state: {\"state\": {...}}, as C++
+   PerceptualSpaceRuntime::state_json and the Scala route (RealityEngine_CI#453).
+   The fields used to be returned flat, so every consumer reading
+   state.perceptualSpace saw nothing from this runtime."
+  (obj "state"
+       (obj "perceptualSpace" (perceptual-space-snapshot (reality-state-perceptual-space state))
+            "currentStep" (or (reality-state-sim-current-step state) 0)
+            "isRunning" (json-bool (reality-state-sim-running-p state))
+            "machines" (vectorize
+                        (mapcar #'machine-json
+                                (machines-in-canonical-order (reality-state-machines state)))))))
+
 (defun reality-routes (actor)
   (labels ((state-json (fn)
              (json-response (actor-ask actor fn))))
@@ -2970,22 +2992,28 @@ on this surface."
                                                                           (let ((step (process-perceptual-input state (reality-state-perceptual-space state)
                                                                                                                 :include-machine-results t
                                                                                                                 :include-perceptual-space t)))
+                                                                            (setf (reality-state-sim-current-step state)
+                                                                                  (1+ (or (reality-state-sim-current-step state) 0)))
                                                                             (obj "success" t "step" step))))))
      (make-route "POST" "/api/perceptual-simulation/reset" (lambda (_ body query)
                                                              (declare (ignore _ body query))
                                                              (state-json (lambda (state) (reset-reality-state state) (obj "success" t)))))
      (make-route "POST" "/api/perceptual-simulation/start" (lambda (_ body query)
                                                              (declare (ignore _ body query))
-                                                             (json-response (obj "success" t))))
+                                                             (state-json (lambda (state)
+                                                                           (setf (reality-state-sim-running-p state) t)
+                                                                           (obj "success" t)))))
      (make-route "POST" "/api/perceptual-simulation/stop" (lambda (_ body query)
                                                             (declare (ignore _ body query))
-                                                            (json-response (obj "success" t))))
+                                                            (state-json (lambda (state)
+                                                                          (setf (reality-state-sim-running-p state) nil)
+                                                                          (obj "success" t)))))
      (make-route "GET" "/api/perceptual-simulation/state" (lambda (_ body query)
                                                             (declare (ignore _ body query))
-                                                            (state-json (lambda (state)
-                                                                          (obj "running" +json-false+
-                                                                               "dimension" (reality-state-dimension state)
-                                                                               "perceptualSpace" (perceptual-space-snapshot (reality-state-perceptual-space state)))))))
+                                                            ;; {"state": {...}}, as C++ and Scala (RealityEngine_CI#453).
+                                                            ;; This returned the fields flat, so every consumer
+                                                            ;; reading state.perceptualSpace saw nothing on LSP.
+                                                            (state-json #'perceptual-simulation-state-json)))
      (make-route "GET" "/api/perceptual-simulation/history" (lambda (_ body query)
                                                               (declare (ignore _ body query))
                                                               (state-json (lambda (state)
@@ -3018,7 +3046,7 @@ on this surface."
                                                                    (reality-state-sampler-strategy state)    (or (jstring body "strategy" nil) "manual")
                                                                    (reality-state-sampler-interval-ms state) (truncate (or (jnumber body "intervalMs" 0) 0)))
                                                              (obj "success" t
-                                                                  "stats" (obj "isRunning" +json-true+
+                                                                  "stats" (obj "isRunning" t
                                                                                "sampleCount" (reality-state-sampler-sample-count state)
                                                                                "strategy" (reality-state-sampler-strategy state)
                                                                                "intervalMs" (reality-state-sampler-interval-ms state)))))))

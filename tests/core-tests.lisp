@@ -1522,6 +1522,34 @@ ever have seen."
       (assert-true (find pattern patterns :test #'string=)
                    (format nil "Reality routes should expose ~a" pattern))))
 
+  ;; GET /api/perceptual-simulation/state nests its payload under "state", as
+  ;; C++ and Scala do (RealityEngine_CI#453); it was flat here.
+  (let* ((state (cascade-state))
+         (body (reality-engine-lsp::perceptual-simulation-state-json state))
+         (inner (reality-engine-lsp::jget body "state")))
+    (assert-true (reality-engine-lsp::jobject-p inner) "state payload is nested under \"state\"")
+    (assert-true (null (reality-engine-lsp::jget body "perceptualSpace"))
+                 "no flat perceptualSpace beside \"state\"")
+    (assert-equal 0 (reality-engine-lsp::jget inner "currentStep") "a fresh state has taken no step")
+    (assert-true (eq reality-engine-lsp::+json-false+ (reality-engine-lsp::jget inner "isRunning"))
+                 "a fresh state is not running")
+    (assert-equal (hash-table-count (reality-engine-lsp::reality-state-machines state))
+                  (length (reality-engine-lsp::jget inner "machines"))
+                  "machines lists every loaded machine")
+    (setf (reality-engine-lsp::reality-state-sim-current-step state) 3
+          (reality-engine-lsp::reality-state-sim-running-p state) t)
+    (let ((inner (reality-engine-lsp::jget
+                  (reality-engine-lsp::perceptual-simulation-state-json state) "state")))
+      (assert-equal 3 (reality-engine-lsp::jget inner "currentStep") "currentStep is reported")
+      (assert-true (eq t (reality-engine-lsp::jget inner "isRunning"))
+                   "isRunning follows start/stop"))
+    (reality-engine-lsp::reset-reality-state state)
+    (let ((inner (reality-engine-lsp::jget
+                  (reality-engine-lsp::perceptual-simulation-state-json state) "state")))
+      (assert-equal 0 (reality-engine-lsp::jget inner "currentStep") "reset zeroes currentStep")
+      (assert-true (eq reality-engine-lsp::+json-false+ (reality-engine-lsp::jget inner "isRunning"))
+                   "reset stops the simulation")))
+
   ;; /api/metrics Prometheus text-format emission — verifies cross-runtime
   ;; parity with AI/CPP.  Every metric line must carry runtime="lsp" and the
   ;; canonical metric names (ces_*, re_runtime_*) must all be present.
