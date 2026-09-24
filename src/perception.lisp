@@ -70,8 +70,15 @@ two identically configured sensors must not validate differently because the
 loop crossed a millisecond boundary."
   (let ((kind (source-kind source)))
     (cond
+      ;; A value that *arrived*: LAST-UPDATED set, inside the TTL.  A
+      ;; lastValue supplied at declaration is not ingress, and SENSOR-STALE-P
+      ;; answers "not stale" for a sensor that was never updated, so without
+      ;; the LAST-UPDATED term a declared-with-a-value sensor validated active
+      ;; at every reset (regression reset-contract: 'acp arbitration replay',
+      ;; active with lastUpdated null, lsp-1 only).
       ((string= kind "sensor")
        (and (source-last-value source)
+            (source-last-updated source)
             (not (sensor-stale-p source now))
             t))
       ((string= kind "test")
@@ -347,6 +354,21 @@ the quorum contract that is a disagreement whichever side is right."
       ;; the rule evaluating to NIL, not a caller's flag being honoured.
       (t
        (setf (source-active-p source) (source-validated-active-p source)))))
+  source)
+
+(defun patch-source-activity (source requested)
+  "Apply a PATCH's `active': activation is earned, deactivation is not.
+
+DERIVE-SENSOR-ACTIVITY refuses an unearned T (#199).  It also recomputes test
+and simulated sources from the rule alone, so on its own a requested NIL on a
+test source came straight back as T, and the reset controls could not be set
+over the API (regression reset-contract, 'Arbitration Reader', lsp-1 only).
+A pause is honoured for every kind; reset still re-validates it, because a
+pause is run state (RealityEngine_CI#163 point 3)."
+  (setf (source-active-p source) requested)
+  (derive-sensor-activity source)
+  (unless requested
+    (setf (source-active-p source) nil))
   source)
 
 (defun ensure-source-id (engine source)
