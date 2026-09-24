@@ -2685,8 +2685,7 @@ therefore answer true for a key that is not there."
                                                                           ;; honoured — activation is earned,
                                                                           ;; deactivation is not (RealityEngine_CPP#43).
                                                                           (when (not (eq (jget body "active" :missing) :missing))
-                                                                            (setf (source-active-p source) (jbool body "active" t))
-                                                                            (derive-sensor-activity source))
+                                                                            (patch-source-activity source (jbool body "active" t)))
                                                                           (source-json source)))))))
                                              (if result (json-response (obj "source" result)) (error-response "Source not found" 404)))))
    (make-route "POST" "/api/sources/bootstrap-from-machines" (lambda (_ body query)

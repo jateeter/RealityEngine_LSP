@@ -2029,6 +2029,54 @@ ever have seen."
     (assert-equal 0.9d0 (nth 1 (reality-engine-lsp::assemble-perception-vector engine))
                   "the re-activated sensor contributes its value again"))
 
+  ;; A value supplied at declaration is not ingress.  The regression arbiter
+  ;; stage declares its replay sensor with a lastValue and no lastUpdated;
+  ;; SENSOR-STALE-P answers "not stale" for a never-updated sensor, so this
+  ;; runtime alone validated it active at every reset (reset-contract:
+  ;; 'acp arbitration replay', lsp-1).
+  (let* ((engine (reality-engine-lsp::make-perception-engine-state 4))
+         (declared (reality-engine-lsp::make-source
+                    :id "s-declared" :kind "sensor" :name "declared with a value"
+                    :active-p t
+                    :region (reality-engine-lsp::make-region :offset 0 :length 2)
+                    :sensor-id "declared-sid"
+                    :last-value (list 1.0d0 1.0d0)
+                    :last-updated nil :ttl-ms 300000)))
+    (reality-engine-lsp::ensure-source-id engine declared)
+    (assert-true (not (reality-engine-lsp::source-active-p declared))
+                 "registration: a sensor declared with a value but never fed is inactive")
+    (assert-true (not (reality-engine-lsp::source-validated-active-p declared))
+                 "the sensor rule requires a value that arrived, not one declared")
+    (reality-engine-lsp::reset-perception-engine engine)
+    (assert-true (not (reality-engine-lsp::source-active-p declared))
+                 "reset: a declared-but-never-fed sensor validates inactive")
+    (reality-engine-lsp::record-sensor-value declared (list 1.0d0 1.0d0))
+    (assert-true (reality-engine-lsp::source-active-p declared)
+                 "ingress activates it"))
+
+  ;; PATCH active=false is a pause, and it holds for a test source until the
+  ;; next reset.  DERIVE-SENSOR-ACTIVITY recomputed test sources from the rule
+  ;; alone, so the pause came straight back (reset-contract:
+  ;; 'Arbitration Reader', lsp-1).
+  (let* ((engine (reality-engine-lsp::make-perception-engine-state 4))
+         (paused (reality-engine-lsp::make-source
+                  :id "t-paused" :kind "test" :name "paused test"
+                  :active-p t
+                  :region (reality-engine-lsp::make-region :offset 0 :length 1)
+                  :inputs (list (list 1.0d0)) :loop-p t)))
+    (reality-engine-lsp::ensure-source-id engine paused)
+    (assert-true (reality-engine-lsp::source-active-p paused) "a non-empty test source registers active")
+    (reality-engine-lsp::patch-source-activity paused nil)
+    (assert-true (not (reality-engine-lsp::source-active-p paused)) "PATCH active=false pauses a test source")
+    (assert-true (not (reality-engine-lsp::jbool (reality-engine-lsp::source-json paused) "active" t))
+                 "the pause survives a re-read of /api/sources")
+    (reality-engine-lsp::patch-source-activity paused t)
+    (assert-true (reality-engine-lsp::source-active-p paused) "PATCH active=true resumes it: the rule validates")
+    (reality-engine-lsp::patch-source-activity paused nil)
+    (reality-engine-lsp::reset-perception-engine engine)
+    (assert-true (reality-engine-lsp::source-active-p paused)
+                 "reset re-validates: a pause is run state (#163 point 3)"))
+
   ;; Reset validates the other kinds too: a test source with an empty
   ;; sequence supplies nothing, so calling it active would be assignment
   ;; rather than validation.  Reset does not preserve an explicit pause —
