@@ -1,6 +1,6 @@
 # RealityEngine_LSP Guidance
 
-Last reviewed: 2026-06-22
+Last reviewed: 2026-09-25
 
 See `/Users/johnt/workspace/GitHub/CLAUDE.md` for the integrated application map. Update both this file and the root map when Lisp engine startup, API parity, PE behavior, or integration support changes.
 
@@ -41,8 +41,11 @@ Quicklisp is bootstrapped by the harness, not by the caller's environment:
 `scripts/bootstrap-quicklisp.sh --home` having run first. The harness does this
 itself so every lane is self-sufficient.
 
-This engine has no compiled artifact — SBCL loads the `.lisp` files at start —
-so the provenance gate checks its git state rather than an artifact mtime.
+`make build` saves an image to `bin/reality-engine-lsp`, and `start.sh` launches
+it when it is current (see Startup). The provenance gate
+(`RealityEngine_CI/scripts/verify-build-provenance.py`) treats it as an
+*optional* artifact: a source-mode run has none, but a stale image is refused,
+because `LSP_LAUNCH_MODE=auto` would prefer it.
 
 ## Key Commands
 
@@ -71,10 +74,6 @@ It must not appear on a service launch path — there it is a latent full-system
 rebuild, three times per launch, the first time a runner comes up with a cold
 `~/.cache/common-lisp` (#62).
 
-Note for CI: LSP now has a launched artifact when the binary path is taken, so
-`RealityEngine_CI/scripts/verify-build-provenance.py` — which records LSP as
-"runs from source" — may need its expectation widened to accept either path.
-
 ## Runtime Contract
 
 - Keep RE/PE routes and payloads aligned with C++ and Scala.
@@ -92,18 +91,18 @@ Use SLY/SLIME or Alive with SBCL and Quicklisp. Use markdown LSP for docs and JS
 
 ## Standing rules — authoritative in `../RealityEngine_CI/docs/ENGINEERING_CONTRACT.md`
 
-These apply here and are **not** restated in this file. They were previously
-copied into eighteen `CLAUDE.md` files across six repositories, which is the
-duplication problem the rules themselves warn about: copies drift, a rule added
-to one applies only where someone looked, and with no authority a reader cannot
-tell which copy is current.
+These apply here and are **not** restated in this file. The table is an index
+to the contract, not a copy of it: it names every rule so you know what to look
+up, and the contract's wording governs wherever the two differ.
 
 | Rule | In short |
 | --- | --- |
 | Qualify every "registry" | Never the bare word — instance / machine / cesgen / arbitration / domain / semantic-bus / tag. |
+| Regenerate a stale `<name>` registry, don't fail it | Each `<name>` registry is a view of the running system. A gate regenerates it and fails only on a disagreement that survives regeneration. |
 | Verify a merge beyond the hosted checks | A green PR is not a verified PR; the hosted path cannot reach the integration points. Name what you could not exercise, and record what you noticed but did not chase. |
-| Never commit to main | Branch from `origin/main`, PR, verify, squash-merge, clean up. |
 | _CI is the authority | Peripheral repos keep minimal CI that forces local validation; RealityEngine_CI verifies fixes against a live universe. Check its `docs/` before adding CI anywhere else. |
+| Name it `CLAUDE.md` | Uppercase, always. On a case-insensitive filesystem `claude.md` is the same inode; dedupe on `st_ino`, never on a resolved path. |
+| Never commit to main | Branch from `origin/main`, PR, verify, squash-merge, clean up. |
 | Use bash, not zsh | Shell work runs in `/opt/homebrew/bin/bash` (5.x), not zsh or macOS `/bin/bash` 3.2: any loop, unquoted variable, glob or `set --` goes through it with `set -euo pipefail`, and you check the command's exit status, not the pipeline tail. |
 
 Read the contract for the full text, the qualifier table, and the cleanup steps.
