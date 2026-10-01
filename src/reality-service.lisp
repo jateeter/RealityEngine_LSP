@@ -29,12 +29,18 @@
   checkpoints
   match-threshold
   sampler-running-p sampler-strategy sampler-interval-ms sampler-sample-count
-  sim-buffer sim-buffered-region sim-buffered-delay
+  sim-buffer sim-buffered-region sim-buffered-delay sim-buffered-max-steps
   ;; GET /api/perceptual-simulation/state: currentStep counts
   ;; /perceptual-simulation/step calls since reset; isRunning is the start/stop
   ;; flag.  Same fields as C++ PerceptualSpaceRuntime::state_json and the Scala
   ;; route (RealityEngine_CI#453).
   sim-current-step sim-running-p
+  ;; The committed simulation (RealityEngine_LSP#141): the input sequence a
+  ;; /perceptual-simulation/step walks, the region each vector is written to,
+  ;; and its bounds. Configuration rather than run state, so
+  ;; reset-reality-state leaves it alone, as C++ PerceptualSpaceRuntime::reset
+  ;; leaves `configured`.
+  sim-sequence sim-region sim-delay sim-max-steps sim-configured-p
   ;; Arbitration records for the most recent step (ARBITER_CONTRACT.md 6).
   ;; A resolution nobody can observe is indistinguishable from no resolution,
   ;; and a suppressed contribution has to stay attributable.
@@ -2164,6 +2170,72 @@ on this surface."
                         (mapcar #'machine-json
                                 (machines-in-canonical-order (reality-state-machines state)))))))
 
+;; ── Perceptual simulation (RealityEngine_LSP#141) ──────────────────────────
+;; The configured-sequence simulation C++ PerceptualSpaceRuntime and the Scala
+;; runtime implement: commit stores the buffered sequence, step applies
+;; sequence[currentStep] to the configured region and runs the phases, and an
+;; unconfigured simulation refuses to start or step. This runtime used to
+;; discard the buffer at commit and step the current perceptual space, so a
+;; harness driving a configured simulation got different evolution here.
+
+(defun commit-perceptual-simulation (state)
+  "POST /api/perceptual-simulation/configure/commit. As C++
+   PerceptualSpaceRuntime::configure: the buffered vectors become the
+   configured sequence and the runtime resets, so the walk starts at step 0."
+  (let ((sequence (coerce (reverse (reality-state-sim-buffer state)) 'vector))
+        (region (or (reality-state-sim-buffered-region state)
+                    (make-region :offset 0 :length 0))))
+    (reset-reality-state state)
+    (setf (reality-state-sim-sequence state) sequence
+          (reality-state-sim-region state) region
+          (reality-state-sim-delay state) (reality-state-sim-buffered-delay state)
+          (reality-state-sim-max-steps state) (reality-state-sim-buffered-max-steps state)
+          (reality-state-sim-configured-p state) t
+          (reality-state-sim-buffer state) nil
+          ;; A bound belongs to the sequence it was sent with; the next
+          ;; configuration does not inherit it (Scala clears its buffered
+          ;; config at commit for the same reason).
+          (reality-state-sim-buffered-max-steps state) nil)
+    state))
+
+(defun start-perceptual-simulation (state)
+  "POST /api/perceptual-simulation/start. Returns :not-configured when nothing
+   has been committed, as C++ and Scala refuse."
+  (if (reality-state-sim-configured-p state)
+      (progn (setf (reality-state-sim-running-p state) t) t)
+      :not-configured))
+
+(defun step-perceptual-simulation (state)
+  "POST /api/perceptual-simulation/step. Returns the step record, :done once the
+   sequence or maxSteps is exhausted (which also stops the run), or
+   :not-configured."
+  (let ((current (or (reality-state-sim-current-step state) 0))
+        (sequence (reality-state-sim-sequence state))
+        (max-steps (reality-state-sim-max-steps state)))
+    (cond
+      ((not (reality-state-sim-configured-p state)) :not-configured)
+      ((or (>= current (length sequence))
+           (and max-steps (>= current max-steps)))
+       (setf (reality-state-sim-running-p state) nil)
+       :done)
+      (t
+       (let* ((vector (aref sequence current))
+              (offset (region-offset (reality-state-sim-region state))))
+         ;; space.update_region(offset, vector): write the configured vector at
+         ;; the region and leave every other cell as the last step left it.
+         (ensure-space-length state (+ offset (length vector)))
+         (let ((space (reality-state-perceptual-space state)))
+           (loop for value in vector
+                 for i from offset
+                 do (setf (aref space i) (coerce (or value 0) 'double-float))))
+         ;; The space itself is the input, so process-perceptual-input steps it
+         ;; in place rather than reseeding it.
+         (let ((step (process-perceptual-input state (reality-state-perceptual-space state)
+                                               :include-machine-results t
+                                               :include-perceptual-space t)))
+           (setf (reality-state-sim-current-step state) (1+ current))
+           step))))))
+
 (defun reality-routes (actor)
   (labels ((state-json (fn)
              (json-response (actor-ask actor fn))))
@@ -2988,21 +3060,22 @@ on this surface."
      ;; ── Perceptual simulation ─────────────────────────────────────────────────
      (make-route "POST" "/api/perceptual-simulation/step" (lambda (_ body query)
                                                             (declare (ignore _ body query))
-                                                            (state-json (lambda (state)
-                                                                          (let ((step (process-perceptual-input state (reality-state-perceptual-space state)
-                                                                                                                :include-machine-results t
-                                                                                                                :include-perceptual-space t)))
-                                                                            (setf (reality-state-sim-current-step state)
-                                                                                  (1+ (or (reality-state-sim-current-step state) 0)))
-                                                                            (obj "success" t "step" step))))))
+                                                            ;; The refusal comes back from the actor as a
+                                                            ;; value: error-response reads HUNCHENTOOT:*REPLY*,
+                                                            ;; which is unbound on the actor thread.
+                                                            (let ((step (actor-ask actor #'step-perceptual-simulation)))
+                                                              (case step
+                                                                (:not-configured (error-response "Simulation not configured" 500))
+                                                                (:done (json-response (obj "done" t "success" t)))
+                                                                (t (json-response (obj "success" t "step" step)))))))
      (make-route "POST" "/api/perceptual-simulation/reset" (lambda (_ body query)
                                                              (declare (ignore _ body query))
                                                              (state-json (lambda (state) (reset-reality-state state) (obj "success" t)))))
      (make-route "POST" "/api/perceptual-simulation/start" (lambda (_ body query)
                                                              (declare (ignore _ body query))
-                                                             (state-json (lambda (state)
-                                                                           (setf (reality-state-sim-running-p state) t)
-                                                                           (obj "success" t)))))
+                                                             (if (eq (actor-ask actor #'start-perceptual-simulation) :not-configured)
+                                                                 (error-response "Simulation not configured" 500)
+                                                                 (json-response (obj "success" t)))))
      (make-route "POST" "/api/perceptual-simulation/stop" (lambda (_ body query)
                                                             (declare (ignore _ body query))
                                                             (state-json (lambda (state)
@@ -3023,7 +3096,10 @@ on this surface."
                                                                        (state-json (lambda (state)
                                                                                      (when (jbool body "reset" nil)
                                                                                        (setf (reality-state-sim-buffer state) nil))
-                                                                                     (dolist (v (jarray-list (or (jget body "events") (arr))))
+                                                                                     ;; "vectors", as the OpenAPI SimulationConfigureChunk
+                                                                                     ;; schema, C++ and Scala read it. This read "events",
+                                                                                     ;; which no other runtime accepts (RealityEngine_LSP#141).
+                                                                                     (dolist (v (jarray-list (or (jget body "vectors") (arr))))
                                                                                        (push (numbers-from-json v) (reality-state-sim-buffer state)))
                                                                                      (let ((cfg (or (and (jobject-p (jget body "config")) (jget body "config")) body)))
                                                                                        (when (jobject-p (jget cfg "inputRegion"))
@@ -3031,12 +3107,15 @@ on this surface."
                                                                                                (make-region-from-json (jget cfg "inputRegion"))))
                                                                                        (when (jnumber cfg "stepDelayMs" nil)
                                                                                          (setf (reality-state-sim-buffered-delay state)
-                                                                                               (truncate (jnumber cfg "stepDelayMs" 100)))))
+                                                                                               (truncate (jnumber cfg "stepDelayMs" 100))))
+                                                                                       (when (jnumber cfg "maxSteps" nil)
+                                                                                         (setf (reality-state-sim-buffered-max-steps state)
+                                                                                               (truncate (jnumber cfg "maxSteps" 0)))))
                                                                                      (obj "success" t "bufferedVectors" (length (reality-state-sim-buffer state)))))))
      (make-route "POST" "/api/perceptual-simulation/configure/commit" (lambda (_ body query)
                                                                         (declare (ignore _ body query))
                                                                         (state-json (lambda (state)
-                                                                                      (setf (reality-state-sim-buffer state) nil)
+                                                                                      (commit-perceptual-simulation state)
                                                                                       (obj "success" t)))))
      ;; ── Sampler ───────────────────────────────────────────────────────────────
      (make-route "POST" "/api/sampler/start" (lambda (_ body query)
