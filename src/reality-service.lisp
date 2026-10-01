@@ -36,11 +36,14 @@
   ;; route (RealityEngine_CI#453).
   sim-current-step sim-running-p
   ;; The committed simulation (RealityEngine_LSP#141): the input sequence a
-  ;; /perceptual-simulation/step walks, the region each vector is written to,
+  ;; /perceptual-simulation/step walks, the region each Reality Event is written to,
   ;; and its bounds. Configuration rather than run state, so
   ;; reset-reality-state leaves it alone, as C++ PerceptualSpaceRuntime::reset
   ;; leaves `configured`.
   sim-sequence sim-region sim-delay sim-max-steps sim-configured-p
+  ;; Auto-play (RealityEngine_CI#489): each start takes a new generation, so a
+  ;; loop left from an earlier start exits instead of stepping alongside it.
+  sim-autoplay-generation
   ;; Arbitration records for the most recent step (ARBITER_CONTRACT.md 6).
   ;; A resolution nobody can observe is indistinguishable from no resolution,
   ;; and a suppressed contribution has to stay attributable.
@@ -331,7 +334,8 @@ schema does not declare — isActive, state, wasJustMatched — which
            :sim-buffered-region nil
            :sim-buffered-delay 100
            :sim-current-step 0
-           :sim-running-p nil)))
+           :sim-running-p nil
+           :sim-autoplay-generation 0)))
     (dolist (machine (load-machines-from-directory machine-dir))
       (put-machine state machine))
     state))
@@ -2181,10 +2185,14 @@ on this surface."
 (defun commit-perceptual-simulation (state)
   "POST /api/perceptual-simulation/configure/commit. As C++
    PerceptualSpaceRuntime::configure: the buffered vectors become the
-   configured sequence and the runtime resets, so the walk starts at step 0."
+   configured sequence and the runtime resets, so the walk starts at step 0.
+   Returns :no-config when no inputRegion has been buffered: there is nowhere
+   to write the sequence (RealityEngine_CI#489). It used to configure it on
+   cell 0."
   (let ((sequence (coerce (reverse (reality-state-sim-buffer state)) 'vector))
-        (region (or (reality-state-sim-buffered-region state)
-                    (make-region :offset 0 :length 0))))
+        (region (reality-state-sim-buffered-region state)))
+    (unless region
+      (return-from commit-perceptual-simulation :no-config))
     (reset-reality-state state)
     (setf (reality-state-sim-sequence state) sequence
           (reality-state-sim-region state) region
@@ -2195,15 +2203,45 @@ on this surface."
           ;; A bound belongs to the sequence it was sent with; the next
           ;; configuration does not inherit it (Scala clears its buffered
           ;; config at commit for the same reason).
-          (reality-state-sim-buffered-max-steps state) nil)
+          (reality-state-sim-buffered-max-steps state) nil
+          (reality-state-sim-buffered-region state) nil)
     state))
 
 (defun start-perceptual-simulation (state)
   "POST /api/perceptual-simulation/start. Returns :not-configured when nothing
-   has been committed, as C++ and Scala refuse."
+   has been committed; otherwise marks the run live and returns the new
+   auto-play generation the route's loop is bound to (RealityEngine_CI#489)."
   (if (reality-state-sim-configured-p state)
-      (progn (setf (reality-state-sim-running-p state) t) t)
+      (progn
+        (setf (reality-state-sim-running-p state) t)
+        (setf (reality-state-sim-autoplay-generation state)
+              (1+ (or (reality-state-sim-autoplay-generation state) 0))))
       :not-configured))
+
+(defun autoplay-tick (state generation)
+  "One auto-play step, on the actor. Returns the delay in ms before the next
+   tick, or NIL when the loop should exit: a newer start took over, the run
+   was stopped, reset or recommitted, or the walk is done."
+  (when (and (eql generation (reality-state-sim-autoplay-generation state))
+             (reality-state-sim-running-p state))
+    (let ((step (step-perceptual-simulation state)))
+      (and (not (member step '(:done :not-configured)))
+           (reality-state-sim-running-p state)
+           (max 1 (or (reality-state-sim-delay state) 100))))))
+
+(defun start-perceptual-autoplay (actor generation)
+  "Step the committed sequence every stepDelayMs while the run is live, as Scala
+   did alone and the settled contract now requires of every runtime
+   (RealityEngine_CI#489). Each step goes through the actor, so it is
+   serialised with every route; the sleep happens off the actor."
+  (bt:make-thread
+   (lambda ()
+     (loop
+       (let ((delay (handler-case (actor-ask actor (lambda (state) (autoplay-tick state generation)))
+                      (error () nil))))
+         (unless delay (return))
+         (sleep (/ delay 1000.0)))))
+   :name "perceptual-simulation-autoplay"))
 
 (defun step-perceptual-simulation (state)
   "POST /api/perceptual-simulation/step. Returns the step record, :done once the
@@ -2221,7 +2259,7 @@ on this surface."
       (t
        (let* ((vector (aref sequence current))
               (offset (region-offset (reality-state-sim-region state))))
-         ;; space.update_region(offset, vector): write the configured vector at
+         ;; space.update_region(offset, event): write the configured Reality Event at
          ;; the region and leave every other cell as the last step left it.
          (ensure-space-length state (+ offset (length vector)))
          (let ((space (reality-state-perceptual-space state)))
@@ -2234,6 +2272,13 @@ on this surface."
                                                :include-machine-results t
                                                :include-perceptual-space t)))
            (setf (reality-state-sim-current-step state) (1+ current))
+           ;; A live run ends on the step that finishes the walk, not on the
+           ;; call after, so isRunning reads false as soon as the last Reality Event
+           ;; is applied, as Scala's runtime does (RealityEngine_CI#489).
+           (when (and (reality-state-sim-running-p state)
+                      (or (>= (1+ current) (length sequence))
+                          (and max-steps (>= (1+ current) max-steps))))
+             (setf (reality-state-sim-running-p state) nil))
            step))))))
 
 (defun reality-routes (actor)
@@ -3065,7 +3110,8 @@ on this surface."
                                                             ;; which is unbound on the actor thread.
                                                             (let ((step (actor-ask actor #'step-perceptual-simulation)))
                                                               (case step
-                                                                (:not-configured (error-response "Simulation not configured" 500))
+                                                                ;; A caller precondition, so 400 (RealityEngine_CI#489).
+                                                                (:not-configured (error-response "Simulation not configured" 400))
                                                                 (:done (json-response (obj "done" t "success" t)))
                                                                 (t (json-response (obj "success" t "step" step)))))))
      (make-route "POST" "/api/perceptual-simulation/reset" (lambda (_ body query)
@@ -3073,9 +3119,12 @@ on this surface."
                                                              (state-json (lambda (state) (reset-reality-state state) (obj "success" t)))))
      (make-route "POST" "/api/perceptual-simulation/start" (lambda (_ body query)
                                                              (declare (ignore _ body query))
-                                                             (if (eq (actor-ask actor #'start-perceptual-simulation) :not-configured)
-                                                                 (error-response "Simulation not configured" 500)
-                                                                 (json-response (obj "success" t)))))
+                                                             (let ((generation (actor-ask actor #'start-perceptual-simulation)))
+                                                               (if (eq generation :not-configured)
+                                                                   (error-response "Simulation not configured" 400)
+                                                                   (progn
+                                                                     (start-perceptual-autoplay actor generation)
+                                                                     (json-response (obj "success" t)))))))
      (make-route "POST" "/api/perceptual-simulation/stop" (lambda (_ body query)
                                                             (declare (ignore _ body query))
                                                             (state-json (lambda (state)
@@ -3096,11 +3145,10 @@ on this surface."
                                                                        (state-json (lambda (state)
                                                                                      (when (jbool body "reset" nil)
                                                                                        (setf (reality-state-sim-buffer state) nil))
-                                                                                     ;; "vectors", as the OpenAPI SimulationConfigureChunk
-                                                                                     ;; schema, C++ and Scala read it. This read "events",
-                                                                                     ;; which no other runtime accepts (RealityEngine_LSP#141).
-                                                                                     (dolist (v (jarray-list (or (jget body "vectors") (arr))))
-                                                                                       (push (numbers-from-json v) (reality-state-sim-buffer state)))
+                                                                                     ;; The input sequence's Reality Events, under `events`
+                                                                                     ;; (RealityEngine_CI#489).
+                                                                                     (dolist (e (jarray-list (or (jget body "events") (arr))))
+                                                                                       (push (numbers-from-json e) (reality-state-sim-buffer state)))
                                                                                      (let ((cfg (or (and (jobject-p (jget body "config")) (jget body "config")) body)))
                                                                                        (when (jobject-p (jget cfg "inputRegion"))
                                                                                          (setf (reality-state-sim-buffered-region state)
@@ -3111,12 +3159,12 @@ on this surface."
                                                                                        (when (jnumber cfg "maxSteps" nil)
                                                                                          (setf (reality-state-sim-buffered-max-steps state)
                                                                                                (truncate (jnumber cfg "maxSteps" 0)))))
-                                                                                     (obj "success" t "bufferedVectors" (length (reality-state-sim-buffer state)))))))
+                                                                                     (obj "success" t "bufferedEvents" (length (reality-state-sim-buffer state)))))))
      (make-route "POST" "/api/perceptual-simulation/configure/commit" (lambda (_ body query)
                                                                         (declare (ignore _ body query))
-                                                                        (state-json (lambda (state)
-                                                                                      (commit-perceptual-simulation state)
-                                                                                      (obj "success" t)))))
+                                                                        (if (eq (actor-ask actor #'commit-perceptual-simulation) :no-config)
+                                                                            (error-response "No config buffered. Send a chunk with config first." 400)
+                                                                            (json-response (obj "success" t)))))
      ;; ── Sampler ───────────────────────────────────────────────────────────────
      (make-route "POST" "/api/sampler/start" (lambda (_ body query)
                                                (declare (ignore _ query))

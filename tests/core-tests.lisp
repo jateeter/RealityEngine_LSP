@@ -1577,7 +1577,8 @@ ever have seen."
       (reality-engine-lsp::step-perceptual-simulation state)
       (assert-equal '(0.0d0 1.0d0) (cells) "step 1 writes sequence[1]")
       (assert-equal 2 (reality-engine-lsp::reality-state-sim-current-step state) "two steps taken")
-      (assert-equal t (reality-engine-lsp::start-perceptual-simulation state) "a configured simulation starts")
+      (assert-true (integerp (reality-engine-lsp::start-perceptual-simulation state))
+                   "a configured simulation starts, returning its auto-play generation")
       (assert-equal :done (reality-engine-lsp::step-perceptual-simulation state)
                     "a step past the end of the sequence is done")
       (assert-true (not (reality-engine-lsp::reality-state-sim-running-p state))
@@ -1585,10 +1586,39 @@ ever have seen."
       (assert-equal 2 (reality-engine-lsp::reality-state-sim-current-step state)
                     "a done step takes no step"))
     ;; Reset rewinds the run and keeps the configuration, as C++ reset keeps
-    ;; `configured`; maxSteps bounds the walk below the sequence length.
+    ;; `configured`.
     (reality-engine-lsp::reset-reality-state state)
     (assert-true (reality-engine-lsp::reality-state-sim-configured-p state) "reset keeps the configuration")
+    ;; Commit consumes the buffered region; a commit with none is refused
+    ;; rather than configured on cell 0 (RealityEngine_CI#489).
+    (setf (reality-engine-lsp::reality-state-sim-buffer state) (list (list 0 1) (list 1 0)))
+    (assert-equal :no-config (reality-engine-lsp::commit-perceptual-simulation state)
+                  "a commit with no inputRegion buffered is refused")
+    ;; Auto-play: each tick steps and reports the delay to the next one; the
+    ;; tick whose step finishes the walk ends the run and exits the loop.
+    (setf (reality-engine-lsp::reality-state-sim-buffered-region state)
+          (reality-engine-lsp::make-region :offset 3 :length 2)
+          (reality-engine-lsp::reality-state-sim-buffered-delay state) 25)
+    (reality-engine-lsp::commit-perceptual-simulation state)
+    (let ((generation (reality-engine-lsp::start-perceptual-simulation state)))
+      (assert-true (reality-engine-lsp::reality-state-sim-running-p state) "start marks the run live")
+      (assert-equal 25 (reality-engine-lsp::autoplay-tick state generation)
+                    "a tick steps and returns the committed stepDelayMs")
+      (assert-equal nil (reality-engine-lsp::autoplay-tick state generation)
+                    "the tick that finishes the walk exits the loop")
+      (assert-true (not (reality-engine-lsp::reality-state-sim-running-p state))
+                   "and the run is over as soon as the last vector is applied")
+      (assert-equal 2 (reality-engine-lsp::reality-state-sim-current-step state) "both vectors applied"))
+    ;; A newer start supersedes an older loop.
+    (reality-engine-lsp::reset-reality-state state)
+    (let ((stale (reality-engine-lsp::start-perceptual-simulation state)))
+      (reality-engine-lsp::start-perceptual-simulation state)
+      (assert-equal nil (reality-engine-lsp::autoplay-tick state stale)
+                    "a loop from an earlier start exits rather than stepping"))
+    ;; maxSteps bounds the walk below the sequence length.
     (setf (reality-engine-lsp::reality-state-sim-buffer state) (list (list 0 1) (list 1 0))
+          (reality-engine-lsp::reality-state-sim-buffered-region state)
+          (reality-engine-lsp::make-region :offset 3 :length 2)
           (reality-engine-lsp::reality-state-sim-buffered-max-steps state) 1)
     (reality-engine-lsp::commit-perceptual-simulation state)
     (assert-true (reality-engine-lsp::jobject-p (reality-engine-lsp::step-perceptual-simulation state))
