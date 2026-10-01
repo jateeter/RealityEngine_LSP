@@ -36,7 +36,7 @@
   ;; route (RealityEngine_CI#453).
   sim-current-step sim-running-p
   ;; The committed simulation (RealityEngine_LSP#141): the input sequence a
-  ;; /perceptual-simulation/step walks, the region each vector is written to,
+  ;; /perceptual-simulation/step walks, the region each Reality Event is written to,
   ;; and its bounds. Configuration rather than run state, so
   ;; reset-reality-state leaves it alone, as C++ PerceptualSpaceRuntime::reset
   ;; leaves `configured`.
@@ -2259,7 +2259,7 @@ on this surface."
       (t
        (let* ((vector (aref sequence current))
               (offset (region-offset (reality-state-sim-region state))))
-         ;; space.update_region(offset, vector): write the configured vector at
+         ;; space.update_region(offset, event): write the configured Reality Event at
          ;; the region and leave every other cell as the last step left it.
          (ensure-space-length state (+ offset (length vector)))
          (let ((space (reality-state-perceptual-space state)))
@@ -2273,7 +2273,7 @@ on this surface."
                                                :include-perceptual-space t)))
            (setf (reality-state-sim-current-step state) (1+ current))
            ;; A live run ends on the step that finishes the walk, not on the
-           ;; call after, so isRunning reads false as soon as the last vector
+           ;; call after, so isRunning reads false as soon as the last Reality Event
            ;; is applied, as Scala's runtime does (RealityEngine_CI#489).
            (when (and (reality-state-sim-running-p state)
                       (or (>= (1+ current) (length sequence))
@@ -3145,11 +3145,10 @@ on this surface."
                                                                        (state-json (lambda (state)
                                                                                      (when (jbool body "reset" nil)
                                                                                        (setf (reality-state-sim-buffer state) nil))
-                                                                                     ;; "vectors", as the OpenAPI SimulationConfigureChunk
-                                                                                     ;; schema, C++ and Scala read it. This read "events",
-                                                                                     ;; which no other runtime accepts (RealityEngine_LSP#141).
-                                                                                     (dolist (v (jarray-list (or (jget body "vectors") (arr))))
-                                                                                       (push (numbers-from-json v) (reality-state-sim-buffer state)))
+                                                                                     ;; The input sequence's Reality Events, under `events`
+                                                                                     ;; (RealityEngine_CI#489).
+                                                                                     (dolist (e (jarray-list (or (jget body "events") (arr))))
+                                                                                       (push (numbers-from-json e) (reality-state-sim-buffer state)))
                                                                                      (let ((cfg (or (and (jobject-p (jget body "config")) (jget body "config")) body)))
                                                                                        (when (jobject-p (jget cfg "inputRegion"))
                                                                                          (setf (reality-state-sim-buffered-region state)
@@ -3160,7 +3159,7 @@ on this surface."
                                                                                        (when (jnumber cfg "maxSteps" nil)
                                                                                          (setf (reality-state-sim-buffered-max-steps state)
                                                                                                (truncate (jnumber cfg "maxSteps" 0)))))
-                                                                                     (obj "success" t "bufferedVectors" (length (reality-state-sim-buffer state)))))))
+                                                                                     (obj "success" t "bufferedEvents" (length (reality-state-sim-buffer state)))))))
      (make-route "POST" "/api/perceptual-simulation/configure/commit" (lambda (_ body query)
                                                                         (declare (ignore _ body query))
                                                                         (if (eq (actor-ask actor #'commit-perceptual-simulation) :no-config)
