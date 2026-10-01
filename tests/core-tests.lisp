@@ -1550,6 +1550,52 @@ ever have seen."
       (assert-true (eq reality-engine-lsp::+json-false+ (reality-engine-lsp::jget inner "isRunning"))
                    "reset stops the simulation")))
 
+  ;; A configured simulation walks its committed sequence, as C++
+  ;; PerceptualSpaceRuntime and the Scala runtime do (RealityEngine_LSP#141).
+  ;; Commit used to discard the buffer and step processed the current space, so
+  ;; currentStep counted steps that were a different operation here.
+  (let ((state (cascade-state)))
+    (assert-equal :not-configured (reality-engine-lsp::step-perceptual-simulation state)
+                  "an unconfigured simulation refuses to step")
+    (assert-equal :not-configured (reality-engine-lsp::start-perceptual-simulation state)
+                  "an unconfigured simulation refuses to start")
+    (assert-true (not (reality-engine-lsp::reality-state-sim-running-p state))
+                 "a refused start leaves the simulation stopped")
+    ;; The chunk route pushes, so the buffer holds the vectors newest first.
+    (setf (reality-engine-lsp::reality-state-sim-buffer state) (list (list 0 1) (list 1 0))
+          (reality-engine-lsp::reality-state-sim-buffered-region state)
+          (reality-engine-lsp::make-region :offset 3 :length 2))
+    (reality-engine-lsp::commit-perceptual-simulation state)
+    (assert-true (reality-engine-lsp::reality-state-sim-configured-p state) "commit configures")
+    (assert-equal nil (reality-engine-lsp::reality-state-sim-buffer state) "commit empties the buffer")
+    (flet ((cells ()
+             (let ((space (reality-engine-lsp::reality-state-perceptual-space state)))
+               (list (aref space 3) (aref space 4)))))
+      (let ((step (reality-engine-lsp::step-perceptual-simulation state)))
+        (assert-equal 0 (reality-engine-lsp::jget step "stepNumber") "the first step is step 0")
+        (assert-equal '(1.0d0 0.0d0) (cells) "step 0 writes sequence[0] to the configured region"))
+      (reality-engine-lsp::step-perceptual-simulation state)
+      (assert-equal '(0.0d0 1.0d0) (cells) "step 1 writes sequence[1]")
+      (assert-equal 2 (reality-engine-lsp::reality-state-sim-current-step state) "two steps taken")
+      (assert-equal t (reality-engine-lsp::start-perceptual-simulation state) "a configured simulation starts")
+      (assert-equal :done (reality-engine-lsp::step-perceptual-simulation state)
+                    "a step past the end of the sequence is done")
+      (assert-true (not (reality-engine-lsp::reality-state-sim-running-p state))
+                   "running out of sequence stops the simulation")
+      (assert-equal 2 (reality-engine-lsp::reality-state-sim-current-step state)
+                    "a done step takes no step"))
+    ;; Reset rewinds the run and keeps the configuration, as C++ reset keeps
+    ;; `configured`; maxSteps bounds the walk below the sequence length.
+    (reality-engine-lsp::reset-reality-state state)
+    (assert-true (reality-engine-lsp::reality-state-sim-configured-p state) "reset keeps the configuration")
+    (setf (reality-engine-lsp::reality-state-sim-buffer state) (list (list 0 1) (list 1 0))
+          (reality-engine-lsp::reality-state-sim-buffered-max-steps state) 1)
+    (reality-engine-lsp::commit-perceptual-simulation state)
+    (assert-true (reality-engine-lsp::jobject-p (reality-engine-lsp::step-perceptual-simulation state))
+                 "the first step within maxSteps runs")
+    (assert-equal :done (reality-engine-lsp::step-perceptual-simulation state)
+                  "maxSteps ends the walk before the sequence does"))
+
   ;; /api/metrics Prometheus text-format emission — verifies cross-runtime
   ;; parity with AI/CPP.  Every metric line must carry runtime="lsp" and the
   ;; canonical metric names (ces_*, re_runtime_*) must all be present.
