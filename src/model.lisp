@@ -534,7 +534,11 @@ another."
 Omits sequences, vectors, and perceptualMapping to keep the response small."
   (obj "id"       (machine-id machine)
        "name"     (machine-name machine)
-       "metadata" (or (machine-metadata machine) (obj))))
+       "metadata" (or (machine-metadata machine) (obj))
+       ;; The PE folds a source on this machine's output cells with it
+       ;; (ARBITER_CONTRACT.md section 4.4b), so its catalog must carry it.
+       "outputMergeTransformation" (output-merge-name
+                                    (machine-output-merge-transformation machine))))
 
 (defun machine-json (machine &key full)
   (let* ((sequences (machine-sequence-list machine))

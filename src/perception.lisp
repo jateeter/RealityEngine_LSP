@@ -22,7 +22,25 @@
   ;; (id -> (contended . suppressed)).
   (last-contention nil)
   (contention-transition 0)
-  (contention-counters (make-hash-table :test #'equal)))
+  (contention-counters (make-hash-table :test #'equal))
+  ;; The OSRE cells of the last push: cell -> the declared
+  ;; outputMergeTransformation of the machine whose output wrote it (section
+  ;; 4.4b). A source on one is folded with the OSRE value by that operator.
+  (osre-fold (make-hash-table)))
+
+(defun fold-unit-interval (transformation s o)
+  "A machine's declared fold operator over [0..1], applied to source value S and
+OSRE value O (ARBITER_CONTRACT.md section 4.4b). The multi-valued form, chain top
+1: the PE meets LLM-provided values in [0..1], which a Boolean gate's
+first-order form would collapse. Unknown names fold as the default, `or'."
+  (let ((s (coerce s 'double-float)) (o (coerce o 'double-float)))
+    (cond ((member transformation '("and" "meet" "discrete-median") :test #'string=) (min s o))
+          ((string= transformation "strong-disjunction") (min 1.0d0 (+ s o)))
+          ((string= transformation "strong-conjunction") (max 0.0d0 (- (+ s o) 1.0d0)))
+          ((string= transformation "xor") (max (min s (- 1.0d0 o)) (min (- 1.0d0 s) o)))
+          ((string= transformation "nor") (- 1.0d0 (max s o)))
+          ((string= transformation "nand") (- 1.0d0 (min s o)))
+          (t (max s o)))))
 
 (defvar *perception-transition* 0
   "The engine's global step, readable where a source's activity changes.
@@ -187,6 +205,8 @@ and the auto interval to 1000ms as a side effect of rebuilding the struct."
   (setf (perception-engine-last-contention engine) nil
         (perception-engine-contention-transition engine) 0)
   (clrhash (perception-engine-contention-counters engine))
+  ;; No push since the reset, so no OSRE term to fold with.
+  (clrhash (perception-engine-osre-fold engine))
   (let ((pv (perception-engine-persistent-vector engine)))
     (when pv (fill pv 0.0d0)))
   (let ((sources (perception-engine-sources engine))
@@ -667,7 +687,10 @@ our dimension — grow to match rather than truncating to it."
   (let* ((dimension (perception-engine-dimension engine))
          (pv (perception-engine-persistent-vector engine))
          (assembled (make-array dimension :element-type 'double-float
-                                          :initial-element 0.0d0)))
+                                          :initial-element 0.0d0))
+         ;; Which cells a source wrote this instant: only those are folded
+         ;; with the OSRE term; a cell only the OSRE holds keeps its value.
+         (source-wrote (make-array dimension :element-type 'bit :initial-element 0)))
     (when pv
       (loop for i from 0 below (min dimension (length pv))
             do (setf (aref assembled i) (elt pv i))))
@@ -719,8 +742,16 @@ our dimension — grow to match rather than truncating to it."
            (loop for value in payload
                  for i from offset
                  repeat length
-                 when (< i dimension)
-                   do (setf (aref assembled i) (clamp-cell value)))))))
+                 when (and (>= i 0) (< i dimension))
+                   do (setf (aref assembled i) (clamp-cell value)
+                            (sbit source-wrote i) 1))))))
+    ;; A source on an OSRE cell is folded with the OSRE value by the writing
+    ;; machine's operator rather than replacing it (section 4.4b).
+    (maphash (lambda (cell transformation)
+               (when (and (>= cell 0) (< cell dimension) (= 1 (sbit source-wrote cell)) pv (< cell (length pv)))
+                 (setf (aref assembled cell)
+                       (clamp-cell (fold-unit-interval transformation (aref assembled cell) (elt pv cell))))))
+             (perception-engine-osre-fold engine))
     (coerce assembled 'list)))
 
 (defun perception-state-json (engine)

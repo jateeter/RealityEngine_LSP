@@ -2318,6 +2318,30 @@ therefore answer true for a key that is not there."
                   (jarray-list (jget step "activeRegions")))))))))
   step)
 
+(defun osre-fold-cells (state step)
+  "Every cell of every mergeBatch output region in STEP, mapped to the writing
+machine's declared outputMergeTransformation (default \"or\"). Where several
+machines' outputs cover one cell, the first by machine NAME decides: ids are
+minted per runtime, so id order would differ between runtimes
+(ARBITER_CONTRACT.md section 4.4b)."
+  (let ((by-cell (make-hash-table))
+        (cells (make-hash-table)))
+    (dolist (op (jarray-list (or (jget step "mergeBatch") (arr))))
+      (let* ((machine-id (jstring op "machineId" ""))
+             (region (jget op "region"))
+             (cached (and (plusp (length machine-id)) (get-cached-machine state machine-id)))
+             (name (or (and cached (jstring cached "name" nil)) (jstring op "machineName" machine-id)))
+             (transformation (or (and cached (jstring cached "outputMergeTransformation" nil)) "or")))
+        (when (and (plusp (length machine-id)) (jobject-p region))
+          (let ((offset (truncate (or (jget region "offset") -1)))
+                (len (truncate (or (jget region "length") 0))))
+            (loop for c from (max 0 offset) below (+ offset len)
+                  for prior = (gethash c by-cell)
+                  when (or (null prior) (string< name (car prior)))
+                    do (setf (gethash c by-cell) (cons name transformation)))))))
+    (maphash (lambda (c entry) (setf (gethash c cells) (cdr entry))) by-cell)
+    cells))
+
 (defun push-perception (state include-machine-results &key compact only)
   (let* ((engine (perception-state-engine state))
          ;; The push is the transition: record what this assembly resolved. A
@@ -2350,6 +2374,9 @@ therefore answer true for a key that is not there."
                (ts        (now-ms)))
           (when (>= (length next-ps) (perception-engine-dimension engine))
             (update-from-perceptual-space engine next-ps))
+          ;; The OSRE cells this push produced, read before the reply is
+          ;; narrowed (section 4.4b).
+          (setf (perception-engine-osre-fold engine) (osre-fold-cells state step))
           ;; Advance playback once per push, after the vector was assembled and
           ;; sent. This also increments global-step. Cursors used to advance
           ;; inside assembly, which made `/api/state` advance them too — see

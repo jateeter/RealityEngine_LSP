@@ -1270,6 +1270,45 @@ Before this the last name won."
                     "reset clears the counters")))
   t)
 
+(defun osre-fold-operator-tests ()
+  "A source on an OSRE cell is folded with the OSRE value by the writing machine's
+declared operator over [0..1] (ARBITER_CONTRACT.md section 4.4b)."
+  (flet ((near (a b) (< (abs (- a b)) 1d-12))
+         (f (op s o) (reality-engine-lsp::fold-unit-interval op s o)))
+    (assert-true (near (f "or" 0.3d0 0.6d0) 0.6d0) "or is max")
+    (assert-true (near (f "join" 0.3d0 0.6d0) 0.6d0) "join is max")
+    (assert-true (near (f "and" 0.3d0 0.6d0) 0.3d0) "and is min")
+    (assert-true (near (f "meet" 0.3d0 0.6d0) 0.3d0) "meet is min")
+    (assert-true (near (f "discrete-median" 0.3d0 0.6d0) 0.3d0) "lower median of two")
+    (assert-true (near (f "strong-disjunction" 0.7d0 0.6d0) 1.0d0) "Lukasiewicz sum saturates")
+    (assert-true (near (f "strong-conjunction" 0.7d0 0.6d0) 0.3d0) "Lukasiewicz product")
+    (assert-true (near (f "strong-conjunction" 0.2d0 0.3d0) 0.0d0) "Lukasiewicz product floors at 0")
+    (assert-true (near (f "xor" 0.25d0 1.0d0) 0.75d0) "fuzzy xor")
+    (assert-true (near (f "nor" 0.25d0 0.5d0) 0.5d0) "fuzzy nor")
+    (assert-true (near (f "nand" 0.25d0 0.5d0) 0.75d0) "fuzzy nand")
+    (assert-true (near (f "not-a-name" 0.25d0 0.5d0) 0.5d0) "unknown folds as or")
+    (let ((engine (reality-engine-lsp::make-perception-engine-state 64))
+          (ps (make-list 64 :initial-element 0.0d0)))
+      (setf (nth 50 ps) 0.6d0 (nth 51 ps) 0.6d0 (nth 52 ps) 0.6d0)
+      (reality-engine-lsp::update-from-perceptual-space engine ps)
+      (reality-engine-lsp::ensure-source-id
+       engine (reality-engine-lsp::make-source
+               :id "seed-osre" :kind "test" :name "OSRE lane seed" :active-p t
+               :region (reality-engine-lsp::make-region :offset 50 :length 2)
+               :inputs (list (list 0.3d0 0.3d0)) :loop-p t))
+      (assert-true (near (nth 50 (reality-engine-lsp::assemble-perception-vector engine)) 0.3d0)
+                   "without an OSRE term the source's value stands")
+      (let ((fold (reality-engine-lsp::perception-engine-osre-fold engine)))
+        (setf (gethash 50 fold) "or" (gethash 51 fold) "and" (gethash 52 fold) "or"))
+      (let ((v (reality-engine-lsp::assemble-perception-vector engine)))
+        (assert-true (near (nth 50 v) 0.6d0) "or folds to max(0.3, 0.6)")
+        (assert-true (near (nth 51 v) 0.3d0) "and folds to min(0.3, 0.6)")
+        (assert-true (near (nth 52 v) 0.6d0) "an OSRE-only cell is unchanged"))
+      (reality-engine-lsp::reset-perception-engine engine)
+      (assert-true (near (nth 50 (reality-engine-lsp::assemble-perception-vector engine)) 0.3d0)
+                   "reset clears the fold")))
+  t)
+
 (defun run-tests ()
   (let* ((machine-json (reality-engine-lsp::obj
                        "id" "machine-test"
@@ -3010,6 +3049,7 @@ Before this the last name won."
   (fold-placement-tests)
   (live-inputs-win-over-seed-tests)
   (stt-incumbent-source-tests)
+  (osre-fold-operator-tests)
 
   ;; The cesgen oracle set — see tests/oracle-parity-tests.lisp. Runs last:
   ;; it walks the whole corpus and is by far the slowest check here.
