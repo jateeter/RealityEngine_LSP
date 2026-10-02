@@ -305,7 +305,7 @@
                                                     (when (jstring args "name" nil)
                                                       (setf (source-name src) (jstring args "name")))
                                                     (unless (eq (jget args "active" :missing) :missing)
-                                                      (setf (source-active-p src) (jbool args "active" t)))
+                                                      (set-source-active src (jbool args "active" t)))
                                                     (source-json src)))))))
                  (if result
                      (progn (broadcast (obj "type" "state-update"))

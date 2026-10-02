@@ -2320,7 +2320,10 @@ therefore answer true for a key that is not there."
 
 (defun push-perception (state include-machine-results &key compact only)
   (let* ((engine (perception-state-engine state))
-         (vector (assemble-perception-vector engine))
+         ;; The push is the transition: record what this assembly resolved. A
+         ;; read of /api/state assembles too, and must not count (section 4.4b).
+         (vector (prog1 (assemble-perception-vector engine)
+                   (record-source-contention engine)))
          ;; Always ask the Reality Engine for the perceptual space and the
          ;; machine results. The PE needs both to compute the next input
          ;; vector, so what the caller wants *reported* must not decide what
@@ -2704,6 +2707,15 @@ therefore answer true for a key that is not there."
                                                                 (actor-ask actor #'bootstrap-test-sources-from-machines))
                                                                200
                                                                "application/json; charset=utf-8")))
+   ;; STT contention (ARBITER_CONTRACT.md section 4.4b): contended cells of the
+   ;; last push assembly and cumulative per-source counters.
+   (make-route "GET" "/api/sources/contention" (lambda (_ body query)
+                                                 (declare (ignore _ body query))
+                                                 (json-response
+                                                  (actor-ask actor
+                                                             (lambda (state)
+                                                               (source-contention-json
+                                                                (perception-state-engine state)))))))
    (make-route "DELETE" "/api/sources/:id" (lambda (params body query)
                                             (declare (ignore body query))
                                             (json-response
