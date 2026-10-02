@@ -406,6 +406,19 @@ under byte comparison."
                   ((string> na nb) nil)
                   (t (and (string< (or (source-id a) "") (or (source-id b) "")) t)))))))
 
+(defun sources-in-composition-order (engine)
+  "Sources in the order assembly writes them: the seed tier first, live after.
+
+Interned test sources are ISRESeed(n), the base every live input folds over —
+the direction of the OSRE->ISRE fold — so where a machine's seed and a live
+source share a lane the live source wins, always (owner decision, 2026-10-02,
+RealityEngine_CPP#146).  Within each tier the canonical (name, id) order of
+SOURCES-IN-CANONICAL-ORDER is kept, so the runtimes still compose identically.
+Listing endpoints keep using SOURCES-IN-CANONICAL-ORDER; only assembly changes."
+  (let ((ordered (sources-in-canonical-order engine)))
+    (append (remove-if-not (lambda (s) (string= (or (source-kind s) "") "test")) ordered)
+            (remove-if (lambda (s) (string= (or (source-kind s) "") "test")) ordered))))
+
 (defun advance-perception-engine (engine)
   "Advance playback by one step: global step, and each active test source's cursor.
 
@@ -511,7 +524,9 @@ our dimension — grow to match rather than truncating to it."
     ;; SOURCES-IN-CANONICAL-ORDER sorts by (name, id) — the same order already
     ;; used for the listing endpoints, and derived from corpus-declared names
     ;; rather than runtime-minted ids.
-    (dolist (source (sources-in-canonical-order engine))
+    ;; SOURCES-IN-COMPOSITION-ORDER puts the seed tier first so live inputs win
+    ;; shared lanes (RealityEngine_CPP#146).
+    (dolist (source (sources-in-composition-order engine))
      (let ()
        (multiple-value-bind (payload offset length) (sample-source source dimension)
          (when payload

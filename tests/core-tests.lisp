@@ -1145,6 +1145,37 @@ ever have seen."
                   "outputAlphabetTop survives machine-json -> machine-from-json"))
   t)
 
+(defun live-inputs-win-over-seed-tests ()
+  "Live inputs always win over the seed on a shared lane (owner decision,
+2026-10-02, RealityEngine_CPP#146).  The seed source is named to sort AFTER the
+sensor, which alone made it win before the composition tier existed."
+  (let* ((engine (reality-engine-lsp::make-perception-engine-state 8))
+         (now (reality-engine-lsp::now-ms))
+         (seed (reality-engine-lsp::make-source
+                :id "t-vitals" :kind "test" :name "Zz Vitals Monitor / 2 sequences"
+                :active-p t
+                :region (reality-engine-lsp::make-region :offset 0 :length 2)
+                :inputs (list (list 1.0d0 1.0d0)) :loop-p nil))
+         (seed-only (reality-engine-lsp::make-source
+                     :id "t-other" :kind "test" :name "Zz Other Monitor"
+                     :active-p t
+                     :region (reality-engine-lsp::make-region :offset 4 :length 2)
+                     :inputs (list (list 1.0d0 1.0d0)) :loop-p nil))
+         (live (reality-engine-lsp::make-source
+                :id "s-bp" :kind "sensor" :name "HealthKit Blood Pressure"
+                :active-p t
+                :region (reality-engine-lsp::make-region :offset 0 :length 2)
+                :sensor-id "healthkit.blood-pressure"
+                :last-value (list 0.72d0 0.48d0)
+                :last-updated (- now 1000) :ttl-ms 300000)))
+    (reality-engine-lsp::ensure-source-id engine seed)
+    (reality-engine-lsp::ensure-source-id engine seed-only)
+    (reality-engine-lsp::ensure-source-id engine live)
+    (let ((vec (reality-engine-lsp::assemble-perception-vector engine)))
+      (assert-equal 0.72d0 (nth 0 vec) "the live reading wins cell 0 over the seed")
+      (assert-equal 0.48d0 (nth 1 vec) "the live reading wins cell 1 over the seed")
+      (assert-equal 1.0d0 (nth 4 vec) "a seed-only lane keeps the seed"))))
+
 (defun run-tests ()
   (let* ((machine-json (reality-engine-lsp::obj
                        "id" "machine-test"
@@ -2883,6 +2914,7 @@ ever have seen."
 
   (output-merge-tests)
   (fold-placement-tests)
+  (live-inputs-win-over-seed-tests)
 
   ;; The cesgen oracle set — see tests/oracle-parity-tests.lisp. Runs last:
   ;; it walks the whole corpus and is by far the slowest check here.
