@@ -1176,6 +1176,100 @@ sensor, which alone made it win before the composition tier existed."
       (assert-equal 0.48d0 (nth 1 vec) "the live reading wins cell 1 over the seed")
       (assert-equal 1.0d0 (nth 4 vec) "a seed-only lane keeps the seed"))))
 
+(defun stt-incumbent-source-tests ()
+  "Two sources on one cell: the incumbent writer keeps it (ARBITER_CONTRACT.md
+section 4.4b, owner decision 2026-10-02).  Within a tier the source activated
+earliest wins; equal instants fall back to canonical (name, id), first winning.
+Before this the last name won."
+  (flet ((seed (id name offset length value)
+           (reality-engine-lsp::make-source
+            :id id :kind "test" :name name :active-p t
+            :region (reality-engine-lsp::make-region :offset offset :length length)
+            :inputs (list (make-list length :initial-element value)) :loop-p t))
+         (sensor (id sensor-id offset)
+           (reality-engine-lsp::make-source
+            :id id :kind "sensor" :name id :active-p t
+            :region (reality-engine-lsp::make-region :offset offset :length 1)
+            :sensor-id sensor-id :ttl-ms 300000))
+         (cell (cells n) (find n cells :key #'first))
+         (sid (source) (reality-engine-lsp::source-id source))
+         (src (engine id) (gethash id (reality-engine-lsp::perception-engine-sources engine))))
+    ;; Same instant (boot): canonical (name, id), first wins -- not last.
+    (let ((engine (reality-engine-lsp::make-perception-engine-state 64)))
+      (reality-engine-lsp::ensure-source-id engine (seed "seed-b" "Beta seed" 10 2 0.25d0))
+      (reality-engine-lsp::ensure-source-id engine (seed "seed-a" "Alpha seed" 10 2 0.75d0))
+      (assert-equal 0.75d0 (nth 10 (reality-engine-lsp::assemble-perception-vector engine))
+                    "equal instants: the first in (name, id) keeps the cell")
+      (let* ((cells (reality-engine-lsp::source-contention engine))
+             (c (cell cells 10)))
+        (assert-equal 2 (length cells) "both shared cells are contended")
+        (assert-equal "incumbent" (second c) "same-tier contention resolves by incumbency")
+        (assert-equal "seed-a" (sid (third c)) "the incumbent is recorded as the winner")
+        (assert-equal '("seed-b") (mapcar #'sid (fourth c)) "the newcomer is recorded as suppressed")))
+    ;; A newcomer loses, however its name sorts; giving the cell up forfeits it.
+    (let ((engine (reality-engine-lsp::make-perception-engine-state 64)))
+      (reality-engine-lsp::ensure-source-id engine (seed "seed-m" "Middle seed" 20 1 0.5d0))
+      (reality-engine-lsp::advance-perception-engine engine)
+      (reality-engine-lsp::ensure-source-id engine (seed "seed-z" "Aardvark seed" 20 1 1.0d0))
+      (assert-equal 0 (reality-engine-lsp::source-activated-at (src engine "seed-m")) "boot instant")
+      (assert-equal 1 (reality-engine-lsp::source-activated-at (src engine "seed-z")) "registered at transition 1")
+      (assert-equal 0.5d0 (nth 20 (reality-engine-lsp::assemble-perception-vector engine))
+                    "a newcomer loses whatever its name")
+      (reality-engine-lsp::patch-source-activity (src engine "seed-m") nil)
+      (reality-engine-lsp::advance-perception-engine engine)
+      (reality-engine-lsp::patch-source-activity (src engine "seed-m") t)
+      (assert-equal 2 (reality-engine-lsp::source-activated-at (src engine "seed-m"))
+                    "coming back is a new activation")
+      (assert-equal 1.0d0 (nth 20 (reality-engine-lsp::assemble-perception-vector engine))
+                    "the former incumbent is now the newcomer")
+      (reality-engine-lsp::patch-source-activity (src engine "seed-z") t)
+      (assert-equal 1 (reality-engine-lsp::source-activated-at (src engine "seed-z"))
+                    "a patch of a source that stays active keeps its claim"))
+    ;; Live over seed is the tier; live vs live is incumbency.
+    (let ((engine (reality-engine-lsp::make-perception-engine-state 64)))
+      (reality-engine-lsp::ensure-source-id engine (seed "seed-hk" "Zz HealthKit seed" 30 1 1.0d0))
+      (reality-engine-lsp::advance-perception-engine engine)
+      (reality-engine-lsp::ensure-source-id engine (sensor "live-early" "hk.early" 30))
+      (reality-engine-lsp::record-sensor-value (src engine "live-early") (list 0.25d0))
+      (reality-engine-lsp::advance-perception-engine engine)
+      (reality-engine-lsp::ensure-source-id engine (sensor "live-late" "hk.late" 30))
+      (reality-engine-lsp::record-sensor-value (src engine "live-late") (list 0.75d0))
+      (assert-equal 1 (reality-engine-lsp::source-activated-at (src engine "live-early")) "earned at 1")
+      (assert-equal 2 (reality-engine-lsp::source-activated-at (src engine "live-late")) "earned at 2")
+      (assert-equal 0.25d0 (nth 30 (reality-engine-lsp::assemble-perception-vector engine))
+                    "between live sources the incumbent wins")
+      (let ((c (cell (reality-engine-lsp::source-contention engine) 30)))
+        (assert-equal "incumbent" (second c) "live vs live is incumbency")
+        (assert-equal "live-early" (sid (third c)) "the earlier live source wins")
+        (assert-equal 2 (length (fourth c)) "the later live source and the seed are suppressed"))
+      (reality-engine-lsp::patch-source-activity (src engine "live-late") nil)
+      (let ((c (cell (reality-engine-lsp::source-contention engine) 30)))
+        (assert-equal "live-over-seed" (second c) "only the seed contending is the tier deciding")))
+    ;; Counting is the push's job; reset clears and re-stamps to instant 0.
+    (let ((engine (reality-engine-lsp::make-perception-engine-state 64)))
+      (reality-engine-lsp::ensure-source-id engine (seed "seed-a" "Alpha seed" 40 1 1.0d0))
+      (reality-engine-lsp::advance-perception-engine engine)
+      (reality-engine-lsp::ensure-source-id engine (seed "seed-b" "Beta seed" 40 1 0.5d0))
+      (reality-engine-lsp::source-contention engine)
+      (assert-equal 0 (length (reality-engine-lsp::jget (reality-engine-lsp::source-contention-json engine) "counters"))
+                    "computing contention does not count it")
+      (reality-engine-lsp::record-source-contention engine)
+      (reality-engine-lsp::record-source-contention engine)
+      (let* ((j (reality-engine-lsp::source-contention-json engine))
+             (counters (coerce (reality-engine-lsp::jget j "counters") 'list)))
+        (assert-equal 1 (length (reality-engine-lsp::jget j "cells")) "one contended cell recorded")
+        (assert-equal '("seed-a" "seed-b") (mapcar (lambda (c) (reality-engine-lsp::jget c "id")) counters)
+                      "counters in (name, id) order")
+        (assert-equal '(2 0) (list (reality-engine-lsp::jget (first counters) "contended")
+                                   (reality-engine-lsp::jget (first counters) "suppressed"))
+                      "the incumbent contended twice, lost nothing")
+        (assert-equal 2 (reality-engine-lsp::jget (second counters) "suppressed") "the newcomer lost twice"))
+      (reality-engine-lsp::reset-perception-engine engine)
+      (assert-equal 0 (reality-engine-lsp::source-activated-at (src engine "seed-b")) "reset re-stamps to 0")
+      (assert-equal 0 (length (reality-engine-lsp::jget (reality-engine-lsp::source-contention-json engine) "counters"))
+                    "reset clears the counters")))
+  t)
+
 (defun run-tests ()
   (let* ((machine-json (reality-engine-lsp::obj
                        "id" "machine-test"
@@ -2915,6 +3009,7 @@ sensor, which alone made it win before the composition tier existed."
   (output-merge-tests)
   (fold-placement-tests)
   (live-inputs-win-over-seed-tests)
+  (stt-incumbent-source-tests)
 
   ;; The cesgen oracle set — see tests/oracle-parity-tests.lisp. Runs last:
   ;; it walks the whole corpus and is by far the slowest check here.

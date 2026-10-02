@@ -7,11 +7,43 @@
   ;; Provenance — which integration feeds this source ("mqtt", "openclaw",
   ;; "ollama", "healthkit", "carekit", "localai", "signal").  NIL for
   ;; manually created sources; omitted from JSON when unset.
-  origin)
+  origin
+  ;; Activation instant: the global step at which the source last became active
+  ;; (ARBITER_CONTRACT.md section 4.4b). Within a composition tier the source
+  ;; activated earliest keeps a contended cell. Not serialised on the listing;
+  ;; reported by GET /api/sources/contention.
+  (activated-at 0))
 
 (defstruct perception-engine
   dimension sources match-algorithm last-push auto-running-p auto-interval-ms
-  persistent-vector global-step)
+  persistent-vector global-step
+  ;; STT contention (section 4.4b): the contended cells of the last push
+  ;; assembly, the transition it was recorded at, and per-source counters
+  ;; (id -> (contended . suppressed)).
+  (last-contention nil)
+  (contention-transition 0)
+  (contention-counters (make-hash-table :test #'equal)))
+
+(defvar *perception-transition* 0
+  "The engine's global step, readable where a source's activity changes.
+
+Sources become active in paths that are handed a source but not the engine --
+RECORD-SENSOR-VALUE above all -- and the activation instant is the global step
+at that moment (section 4.4b). A perception service runs exactly one engine,
+and this is kept equal to its global step by ADVANCE-PERCEPTION-ENGINE and
+RESET-PERCEPTION-ENGINE, the only two places the step changes.")
+
+(defun note-activation (source was-active)
+  "Stamp SOURCE's activation instant when it has just gone from inactive to active."
+  (when (and (not was-active) (source-active-p source))
+    (setf (source-activated-at source) *perception-transition*))
+  source)
+
+(defun set-source-active (source active)
+  "Set SOURCE's stored flag directly, stamping an activation."
+  (let ((was (source-active-p source)))
+    (setf (source-active-p source) active)
+    (note-activation source was)))
 
 (defun make-perceptual-buffer (dimension)
   "Adjustable double-float buffer of DIMENSION zeros.
@@ -26,6 +58,8 @@ per source, each element written by walking the list from the head."
                                 :adjustable t))
 
 (defun make-perception-engine-state (dimension)
+  ;; A new engine is a boot: its transition counter starts at 0.
+  (setf *perception-transition* 0)
   (make-perception-engine :dimension dimension
                           :sources (make-hash-table :test #'equal)
                           :match-algorithm "gte"
@@ -96,9 +130,12 @@ correctly deactivated, and without this a later reading would leave it
 inactive forever: SAMPLE-SOURCE gates on the flag, so the source would
 contribute zeros while holding a fresh value.  That would be a worse defect
 than the reporting one this replaces."
-  (setf (source-last-value source) values
-        (source-last-updated source) now)
-  (setf (source-active-p source) (source-validated-active-p source now))
+  (let ((was (source-active-p source)))
+    (setf (source-last-value source) values
+          (source-last-updated source) now)
+    (setf (source-active-p source) (source-validated-active-p source now))
+    ;; Earning activity is an activation (section 4.4b).
+    (note-activation source was))
   source)
 
 (defun reset-perception-engine (engine)
@@ -143,7 +180,13 @@ Those are configuration rather than run state, and C++ and Scala do not clear
 them either — the previous implementation reset the match algorithm to \"gte\"
 and the auto interval to 1000ms as a side effect of rebuilding the struct."
   (setf (perception-engine-global-step engine) 0)
+  (setf *perception-transition* 0)
   (setf (perception-engine-last-push engine) nil)
+  ;; A reset is a boot for the run: contention records and counters start
+  ;; over, and every source is re-stamped to instant 0 below (section 4.4b).
+  (setf (perception-engine-last-contention engine) nil
+        (perception-engine-contention-transition engine) 0)
+  (clrhash (perception-engine-contention-counters engine))
   (let ((pv (perception-engine-persistent-vector engine)))
     (when pv (fill pv 0.0d0)))
   (let ((sources (perception-engine-sources engine))
@@ -169,7 +212,8 @@ and the auto interval to 1000ms as a side effect of rebuilding the struct."
                  (when (string= (source-kind source) "test")
                    (setf (source-cursor source) 0))
                  (setf (source-active-p source)
-                       (source-validated-active-p source now)))
+                       (source-validated-active-p source now))
+                 (setf (source-activated-at source) 0))
                sources)))
   engine)
 
@@ -365,10 +409,12 @@ test source came straight back as T, and the reset controls could not be set
 over the API (regression reset-contract, 'Arbitration Reader', lsp-1 only).
 A pause is honoured for every kind; reset still re-validates it, because a
 pause is run state (RealityEngine_CI#163 point 3)."
-  (setf (source-active-p source) requested)
-  (derive-sensor-activity source)
-  (unless requested
-    (setf (source-active-p source) nil))
+  (let ((was (source-active-p source)))
+    (setf (source-active-p source) requested)
+    (derive-sensor-activity source)
+    (unless requested
+      (setf (source-active-p source) nil))
+    (note-activation source was))
   source)
 
 (defun ensure-source-id (engine source)
@@ -388,8 +434,20 @@ pause is run state (RealityEngine_CI#163 point 3)."
                (+ (region-offset region) (region-length region))))))
   ;; Registration is where the invariant is enforced: every construction path
   ;; funnels through here.
-  (derive-sensor-activity source)
-  (setf (gethash (source-id source) (perception-engine-sources engine)) source)
+  (let* ((table (perception-engine-sources engine))
+         (prev (gethash (source-id source) table))
+         (prev-active (and prev (source-active-p prev)))
+         (prev-instant (and prev (source-activated-at prev))))
+    (derive-sensor-activity source)
+    ;; Activation instant (section 4.4b): a source that was already active and
+    ;; stays active keeps its claim; any other registration is a new activation.
+    (setf (source-activated-at source)
+          (if (and prev-active (source-active-p source))
+              prev-instant
+              *perception-transition*))
+    (unless prev
+      (remhash (source-id source) (perception-engine-contention-counters engine)))
+    (setf (gethash (source-id source) table) source))
   source)
 
 (defun sources-in-canonical-order (engine)
@@ -406,18 +464,118 @@ under byte comparison."
                   ((string> na nb) nil)
                   (t (and (string< (or (source-id a) "") (or (source-id b) "")) t)))))))
 
+(defun source-live-p (source)
+  (not (string= (or (source-kind source) "") "test")))
+
+(defun incumbent-last-p (a b)
+  "Composition order within a tier: newest activation first, then descending
+(name, id), so the incumbent is the last writer."
+  (let ((ia (or (source-activated-at a) 0)) (ib (or (source-activated-at b) 0)))
+    (if (/= ia ib)
+        (> ia ib)
+        (let ((na (or (source-name a) "")) (nb (or (source-name b) "")))
+          (cond ((string> na nb) t)
+                ((string< na nb) nil)
+                (t (and (string> (or (source-id a) "") (or (source-id b) "")) t)))))))
+
 (defun sources-in-composition-order (engine)
   "Sources in the order assembly writes them: the seed tier first, live after.
 
 Interned test sources are ISRESeed(n), the base every live input folds over —
 the direction of the OSRE->ISRE fold — so where a machine's seed and a live
 source share a lane the live source wins, always (owner decision, 2026-10-02,
-RealityEngine_CPP#146).  Within each tier the canonical (name, id) order of
-SOURCES-IN-CANONICAL-ORDER is kept, so the runtimes still compose identically.
+RealityEngine_CPP#146).
+
+Within a tier the incumbent writer keeps the cell (ARBITER_CONTRACT.md section
+4.4b, owner decision 2026-10-02): two sources on one cell in one transition
+violates the single transition time constraint, and the source activated
+earliest wins; equal instants -- every seed interned at boot -- fall back to
+canonical (name, id), first winning. Assembly is last-writer-wins, so each tier
+is written newest first in descending (name, id) and the incumbent lands last.
 Listing endpoints keep using SOURCES-IN-CANONICAL-ORDER; only assembly changes."
-  (let ((ordered (sources-in-canonical-order engine)))
-    (append (remove-if-not (lambda (s) (string= (or (source-kind s) "") "test")) ordered)
-            (remove-if (lambda (s) (string= (or (source-kind s) "") "test")) ordered))))
+  (let ((all (object-values (perception-engine-sources engine))))
+    (append (sort (remove-if #'source-live-p all) #'incumbent-last-p)
+            (sort (remove-if-not #'source-live-p all) #'incumbent-last-p))))
+
+(defun source-canonical< (a b)
+  (let ((na (or (source-name a) "")) (nb (or (source-name b) "")))
+    (cond ((string< na nb) t)
+          ((string> na nb) nil)
+          (t (and (string< (or (source-id a) "") (or (source-id b) "")) t)))))
+
+(defun source-contention (engine)
+  "Cells written by more than one source, resolved as assembly resolves them.
+
+A pure read: it neither records nor counts.  Returns a list, ascending by cell,
+of (CELL RESOLUTION WINNER SUPPRESSED) with SUPPRESSED in canonical order."
+  (let ((dimension (perception-engine-dimension engine))
+        (writers (make-hash-table)))
+    (dolist (source (sources-in-composition-order engine))
+      (multiple-value-bind (payload offset length) (sample-source source dimension)
+        (when payload
+          ;; The cells assembly writes: one per payload value, up to LENGTH.
+          (loop for cell from offset
+                repeat (min length (length payload))
+                when (and (>= cell 0) (< cell dimension))
+                  do (push source (gethash cell writers))))))
+    (let ((cells '()))
+      (maphash (lambda (cell ws)
+                 ;; WS was pushed, so its head is the last writer: the winner.
+                 (when (cdr ws)
+                   (let* ((winner (car ws))
+                          (lost (sort (copy-list (cdr ws)) #'source-canonical<))
+                          (same-tier (some (lambda (l) (eq (source-live-p l) (source-live-p winner))) lost)))
+                     (push (list cell (if same-tier "incumbent" "live-over-seed") winner lost) cells))))
+               writers)
+      (sort cells #'< :key #'first))))
+
+(defun record-source-contention (engine)
+  "Record the contention of the assembly a push sends, and count it.  Push path only."
+  (let ((cells (source-contention engine))
+        (contended (make-hash-table :test #'equal))
+        (lost (make-hash-table :test #'equal))
+        (counters (perception-engine-contention-counters engine)))
+    (setf (perception-engine-last-contention engine) cells
+          (perception-engine-contention-transition engine) (perception-engine-global-step engine))
+    (dolist (c cells)
+      (setf (gethash (source-id (third c)) contended) t)
+      (dolist (l (fourth c))
+        (setf (gethash (source-id l) contended) t
+              (gethash (source-id l) lost) t)))
+    (maphash (lambda (id _)
+               (declare (ignore _))
+               (let ((counter (or (gethash id counters) (cons 0 0))))
+                 (incf (car counter))
+                 (when (gethash id lost) (incf (cdr counter)))
+                 (setf (gethash id counters) counter)))
+             contended)
+    cells))
+
+(defun source-ref-json (source)
+  (obj "id" (or (source-id source) "")
+       "name" (or (source-name source) "")
+       "kind" (or (source-kind source) "")
+       "activatedAt" (or (source-activated-at source) 0)))
+
+(defun source-contention-json (engine)
+  "GET /api/sources/contention."
+  (let ((counters (perception-engine-contention-counters engine)))
+    (obj "transition" (perception-engine-contention-transition engine)
+         "cells" (vectorize
+                  (mapcar (lambda (c)
+                            (obj "cell" (first c)
+                                 "resolution" (second c)
+                                 "winner" (source-ref-json (third c))
+                                 "suppressed" (vectorize (mapcar #'source-ref-json (fourth c)))))
+                          (perception-engine-last-contention engine)))
+         "counters" (vectorize
+                     (loop for source in (sources-in-canonical-order engine)
+                           for counter = (gethash (source-id source) counters)
+                           when counter
+                             collect (obj "id" (source-id source)
+                                          "name" (or (source-name source) "")
+                                          "contended" (car counter)
+                                          "suppressed" (cdr counter)))))))
 
 (defun advance-perception-engine (engine)
   "Advance playback by one step: global step, and each active test source's cursor.
@@ -433,6 +591,7 @@ walked a machine's interned sequence at a different rate from C++ and Scala and
 its trajectory diverged from theirs. Observation must not mutate the thing
 observed (RealityEngine_CI corpus parity sweep, 2026-08-19)."
   (incf (perception-engine-global-step engine))
+  (setf *perception-transition* (perception-engine-global-step engine))
   (let ((sources (perception-engine-sources engine)))
     (when sources
       (maphash
