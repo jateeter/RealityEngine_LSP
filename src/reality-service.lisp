@@ -63,11 +63,14 @@
   (arbitration-retention-p nil)
   (arbitration-window +arbitration-window-default+)
   (arbitration-steps (make-hash-table :test #'eql))
-  ;; This engine's identity in its Lamport clock, which is engine UUID + step
-  ;; count. Fixed for the life of the process; a reset restarts the step count
-  ;; only. Set at boot by make-reality-state-from-config, never at load time,
-  ;; so a saved image does not carry one engine's UUID into every launch.
+  ;; The Lamport clock (RealityEngine_CI#296): this engine's UUID and a
+  ;; counter that ticks once per committed step and is NEVER reset, so
+  ;; (engine, lamport) names one step uniquely for the life of the engine. The
+  ;; step count beside it is reset; the clock is not. The UUID is set at boot
+  ;; by make-reality-state-from-config, never at load time, so a saved image
+  ;; does not carry one engine's UUID into every launch.
   engine-uuid
+  (lamport 0)
   ;; The step completion point (RealityEngine_CI#375): signalled when a step's
   ;; (ISRE, OSRE) pair is committed, waited on by GET /api/engine/steps/:n/pair.
   (step-signal (make-step-signal)))
@@ -121,10 +124,13 @@
     (bt2:with-lock-held ((step-signal-lock signal))
       (step-signal-completed signal))))
 
-;; ── Lamport clock: engine UUID + step count ──────────────────────────────────
-;; (RealityEngine_CI#296, the K-line notes on #518.) A declared ENGINE_UUID is
-;; kept, as every declared id is; otherwise the engine mints a version-7 UUID at
-;; boot. Wall-clock time never orders anything across engines; this does.
+;; ── Lamport clock: engine UUID + a counter that never resets ────────────────
+;; (RealityEngine_CI#296, the K-line notes on #518.) The clock reads
+;; {engine, lamport, step}: `lamport` ticks once per committed step and keeps
+;; ticking through every reset, so (engine, lamport) is unique for the life of
+;; the engine; `step` is the step count, which a reset restarts. A declared
+;; ENGINE_UUID is kept, as every declared id is; otherwise the engine mints a
+;; version-7 UUID at boot. Wall-clock time never orders anything; this does.
 
 (defun canonical-uuid-p (string)
   (and (stringp string)
@@ -148,8 +154,12 @@
   (or (reality-state-engine-uuid state)
       (setf (reality-state-engine-uuid state) (make-uuid))))
 
-(defun lamport-tick-json (state step-number)
-  (obj "engine" (state-engine-uuid state) "step" step-number))
+(defun tick-lamport (state)
+  "Advance the Lamport clock for a committed step and return the new value."
+  (incf (reality-state-lamport state)))
+
+(defun lamport-tick-json (state lamport step-number)
+  (obj "engine" (state-engine-uuid state) "lamport" lamport "step" step-number))
 
 ;; ── Arbitration retention keyed by step (RealityEngine_CI#296) ───────────────
 ;; Every function here runs on the actor thread, which is what serialises the
@@ -160,17 +170,18 @@
   (let ((steps (reality-state-arbitration-steps state))
         (floor (1+ (- latest (reality-state-arbitration-window state))))
         (dead nil))
-    (maphash (lambda (step records)
-               (declare (ignore records))
+    (maphash (lambda (step entry)
+               (declare (ignore entry))
                (when (< step floor) (push step dead)))
              steps)
     (dolist (step dead) (remhash step steps))))
 
-(defun retain-arbitration (state step-number records)
-  "Keep STEP-NUMBER's records when retention is on and the window is non-empty."
+(defun retain-arbitration (state step-number lamport records)
+  "Keep STEP-NUMBER's records, stamped with the LAMPORT tick it committed at,
+when retention is on and the window is non-empty."
   (when (and (reality-state-arbitration-retention-p state)
              (plusp (reality-state-arbitration-window state)))
-    (setf (gethash step-number (reality-state-arbitration-steps state)) records)
+    (setf (gethash step-number (reality-state-arbitration-steps state)) (cons lamport records))
     (prune-arbitration-steps state step-number)))
 
 (defun compose-key (producer-machine-id producer-sequence-id)
@@ -1929,7 +1940,8 @@ always treated presence as activation; this runtime is the one that differed."
       (record-trajectory state isre osre)
       ;; Retained before the completion point is signalled, so an observer woken
       ;; for step n finds n's arbitration records already there (#296).
-      (retain-arbitration state (jnumber isre "stepNumber" 0) (reality-state-arbitration state))
+      (retain-arbitration state (jnumber isre "stepNumber" 0) (tick-lamport state)
+                          (reality-state-arbitration state))
       ;; The pair is committed: the step's completion point (#375).
       (signal-step-completed state (jnumber isre "stepNumber" 0))
       (record-history state step)
@@ -2159,14 +2171,16 @@ the most recent step."
          "count" (length records)
          "records" (arbitration-records-json records))))
 
-(defun arbitration-step-json (state step-number records)
-  "One retained step: its records, canonically ordered, under its Lamport tick."
-  (obj "clock" (lamport-tick-json state step-number)
-       "registryEntries" (arbitration-registry-size)
-       "registrySource" (or *arbitration-source* :null)
-       "shards" (arbiter-shards)
-       "count" (length records)
-       "records" (arbitration-records-json records :canonical t)))
+(defun arbitration-step-json (state step-number entry)
+  "One retained step: its records, canonically ordered, under its clock.
+ENTRY is (lamport . records) as retain-arbitration stored it."
+  (destructuring-bind (lamport . records) entry
+    (obj "clock" (lamport-tick-json state lamport step-number)
+         "registryEntries" (arbitration-registry-size)
+         "registrySource" (or *arbitration-source* :null)
+         "shards" (arbiter-shards)
+         "count" (length records)
+         "records" (arbitration-records-json records :canonical t))))
 
 (defun arbitration-window-json (state)
   "GET /api/arbitration with retention on: the retained steps in the window
@@ -2177,9 +2191,9 @@ fewer exist; [] at window 0."
          (steps (reality-state-arbitration-steps state)))
     (vectorize
      (loop for step from (max 0 (1+ (- latest window))) to latest
-           for (records found) = (multiple-value-list (gethash step steps))
+           for (entry found) = (multiple-value-list (gethash step steps))
            when found
-             collect (arbitration-step-json state step records)))))
+             collect (arbitration-step-json state step entry)))))
 
 (defun arbitration-step-read (state step-number)
   "GET /api/arbitration?step=N. A refusal comes back as (:refused message status)
@@ -2191,16 +2205,17 @@ for the route to answer, since error-response cannot run on the actor thread."
         ((> step-number (latest-committed-step state))
          (list :refused (format nil "step ~d has not resolved" step-number) 404))
         (t
-         (multiple-value-bind (records found)
+         (multiple-value-bind (entry found)
              (gethash step-number (reality-state-arbitration-steps state))
            (if found
-               (arbitration-step-json state step-number records)
+               (arbitration-step-json state step-number entry)
                (list :refused (format nil "step ~d is no longer retained" step-number) 410))))))
 
 (defun engine-clock-json (state)
-  "GET /api/engine/clock — this engine's Lamport clock: its UUID and the newest
-committed step (-1 before the first step since boot or reset)."
-  (lamport-tick-json state (latest-committed-step state)))
+  "GET /api/engine/clock — this engine's clock: its UUID, the Lamport value of
+the newest committed step (0 before the first since boot; never reset) and that
+step's number (-1 before the first step since boot or reset)."
+  (lamport-tick-json state (reality-state-lamport state) (latest-committed-step state)))
 
 (defun machine-graph-json (state)
   (let (nodes edges)
