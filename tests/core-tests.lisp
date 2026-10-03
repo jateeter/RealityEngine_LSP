@@ -3045,6 +3045,38 @@ declared operator over [0..1] (ARBITER_CONTRACT.md section 4.4b)."
     (assert-true (null (reality-engine-lsp::localai-operation-for-id state "GET" "/"))
                  "\"/\" is not a wildcard"))
 
+  ;; Step completion (RealityEngine_CI#375). Composition joins through lparallel:
+  ;; the join returns only when every composer has completed, slow ones
+  ;; included, and in composer order, not completion order.
+  (let* ((start (get-internal-real-time))
+         (results (reality-engine-lsp::pmap-machines
+                   (lambda (delay) (sleep delay) delay)
+                   (vector 0.30 0.0 0.15 0.0)))
+         (elapsed (/ (- (get-internal-real-time) start) internal-time-units-per-second)))
+    (assert-true (equal results '(0.30 0.0 0.15 0.0))
+                 "the composer join returns every result, in composer order")
+    (assert-true (>= elapsed 0.29)
+                 "the composer join does not return before the slowest composer completes"))
+  ;; The completion point: a waiter blocks on the step signal's condition
+  ;; variable and is woken by the commit, within its window; no step, no pair.
+  (let ((state (reality-engine-lsp::make-reality-state)))
+    (assert-true (null (reality-engine-lsp::await-step-completed state 0 100))
+                 "with no step committed, the wait ends at its window")
+    (let* ((woken nil)
+           (waiter (bt2:make-thread
+                    (lambda () (setf woken (reality-engine-lsp::await-step-completed state 0 5000))))))
+      (sleep 0.1)
+      (reality-engine-lsp::signal-step-completed state 0)
+      (bt2:join-thread waiter)
+      (assert-true woken "a commit wakes a waiter for that step"))
+    (assert-true (reality-engine-lsp::await-step-completed state 0 0)
+                 "a committed step answers without waiting")
+    (assert-true (null (reality-engine-lsp::await-step-completed state 1 100))
+                 "a later step still waits")
+    (reality-engine-lsp::reset-step-signal state)
+    (assert-true (null (reality-engine-lsp::await-step-completed state 0 50))
+                 "after a reset, step numbering and the completion point restart"))
+
   ;; Minted ids are time-ordered UUIDs (RealityEngine_CI#518, #281): version 7,
   ;; distinct, and strictly increasing in creation order, so two machines on one
   ;; region sort the same way on every engine.

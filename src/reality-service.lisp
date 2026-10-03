@@ -47,7 +47,53 @@
   ;; Arbitration records for the most recent step (ARBITER_CONTRACT.md 6).
   ;; A resolution nobody can observe is indistinguishable from no resolution,
   ;; and a suppressed contribution has to stay attributable.
-  arbitration)
+  arbitration
+  ;; The step completion point (RealityEngine_CI#375): signalled when a step's
+  ;; (ISRE, OSRE) pair is committed, waited on by GET /api/engine/steps/:n/pair.
+  (step-signal (make-step-signal)))
+
+;; Step completion, published through bordeaux-threads synchronisation
+;; (RealityEngine_CI#375). OSRE(n) resolves atomically once every composer has
+;; joined; the pair is committed in the actor, and COMPLETED then names the
+;; newest step whose pair exists. A reader waits on CV, under LOCK, for COMPLETED
+;; to reach its step, within a window — on its own thread, never the actor's,
+;; which must stay free to run the step being waited for. Steps are numbered
+;; from 0 on every runtime, so -1 means no step has completed.
+(defstruct (step-signal (:constructor make-step-signal))
+  (lock (bt2:make-lock :name "step-signal"))
+  (cv (bt2:make-condition-variable :name "step-signal"))
+  (completed -1))
+
+(defconstant +step-pair-default-timeout-ms+ 5000)
+(defconstant +step-pair-max-timeout-ms+ 60000)
+
+(defun signal-step-completed (state step-number)
+  "Publish that STEP-NUMBER's (ISRE, OSRE) pair is committed; wake every waiter."
+  (let ((signal (reality-state-step-signal state)))
+    (bt2:with-lock-held ((step-signal-lock signal))
+      (setf (step-signal-completed signal) step-number)
+      (bt2:condition-broadcast (step-signal-cv signal)))))
+
+(defun reset-step-signal (state)
+  (let ((signal (reality-state-step-signal state)))
+    (bt2:with-lock-held ((step-signal-lock signal))
+      (setf (step-signal-completed signal) -1)
+      (bt2:condition-broadcast (step-signal-cv signal)))))
+
+(defun await-step-completed (state step-number timeout-ms)
+  "Block until STEP-NUMBER's pair is committed or TIMEOUT-MS elapses. True if reached."
+  (let* ((signal (reality-state-step-signal state))
+         (deadline (+ (get-internal-real-time)
+                      (ceiling (* timeout-ms internal-time-units-per-second) 1000))))
+    (bt2:with-lock-held ((step-signal-lock signal))
+      (loop
+        (when (>= (step-signal-completed signal) step-number)
+          (return t))
+        (let ((remaining (- deadline (get-internal-real-time))))
+          (when (<= remaining 0)
+            (return nil))
+          (bt2:condition-wait (step-signal-cv signal) (step-signal-lock signal)
+                              :timeout (/ remaining internal-time-units-per-second)))))))
 
 (defun compose-key (producer-machine-id producer-sequence-id)
   (format nil "~a|~a" producer-machine-id producer-sequence-id))
@@ -442,6 +488,8 @@ same state — an engine with nothing loaded requires nothing."
          "latchedEventBitCount" (hash-table-count (reality-state-latched-event-bits state)))))
 
 (defun reset-reality-state (state)
+  ;; Step numbers restart, so the completion point does too (#375).
+  (reset-step-signal state)
   (maphash (lambda (_ machine)
              (declare (ignore _))
              (dolist (sequence (machine-sequence-list machine))
@@ -1387,6 +1435,32 @@ always treated presence as activation; this runtime is the one that differed."
             (coerce (or sequence-ids #()) 'list))
       (and machine-id (member machine-id selected-ids :test #'string=))))
 
+;; Composition: phase one of a step (RealityEngine_CI#375, SURFACE_SPEC.md
+;; "Trajectory histories"). Every mapped machine reads its input region of ISRE(n)
+;; and processes it, all at once, through lparallel (`pmap-machines`). The pmap is
+;; the synchronisation: it returns only when every composer has completed, so
+;; OSRE(n) cannot begin to resolve while any composition is in flight.
+;;
+;; Safe to run concurrently because, at this boundary, a machine touches only its
+;; own sequences, and ISRE(n) is only read here (`extract-region` copies). Shared
+;; effects — coverage, the semantic audit, folding into the merge batch — stay in
+;; the actor, in canonical order, after the join. Returns machine id -> (input .
+;; transition-result).
+(defun compose-machines (state override)
+  (let* ((space (reality-state-perceptual-space state))
+         (machines (remove-if-not #'machine-mapping
+                                  (object-values-sorted (reality-state-machines state))))
+         (results (pmap-machines
+                   (lambda (machine)
+                     (let ((input (extract-region space (mapping-input (machine-mapping machine)))))
+                       (cons input (process-machine-input machine input :override override))))
+                   machines))
+         (composed (make-hash-table :test #'equal)))
+    (loop for machine in machines
+          for result in results
+          do (setf (gethash (machine-id machine) composed) result))
+    composed))
+
 (defun process-perceptual-input (state input &key override include-machine-results include-perceptual-space
                                                   (include-active-regions (reality-state-include-active-regions-p state))
                                                   compact only-sequence-ids only-machine-names
@@ -1433,13 +1507,21 @@ always treated presence as activation; this runtime is the one that differed."
         ;; must not remove it from the event bus.
         (contributions nil)
         (active-regions nil))
+    ;; Composition, in parallel (RealityEngine_CI#375). Every machine composes
+    ;; its Reality Event from ISRE(n) at once, through lparallel; `pmap` is the
+    ;; join, so nothing below runs until every composer has completed. Only then
+    ;; are the results folded — in the actor, in canonical (sorted) order — and
+    ;; OSRE(n) resolved atomically. This loop used to compose machine after
+    ;; machine in the actor thread: the order was canonical but nothing ran in
+    ;; parallel, and the join the contract requires did not exist.
+    (let ((composed (compose-machines state override)))
     (dolist (machine (object-values-sorted (reality-state-machines state)))
       (let ((id (machine-id machine)))
        (when (machine-mapping machine)
          (let* ((mapping (machine-mapping machine))
-                (machine-input (extract-region (reality-state-perceptual-space state)
-                                               (mapping-input mapping)))
-                (result (process-machine-input machine machine-input :override override)))
+                (composition (gethash id composed))
+                (machine-input (car composition))
+                (result (cdr composition)))
            ;; Coverage tracking — once per machine per step, regardless of
            ;; whether the caller wanted machine-results in the response.
            (record-machine-coverage state machine (transition-result-json result))
@@ -1566,7 +1648,7 @@ always treated presence as activation; this runtime is the one that differed."
                  (push contribution contributions)
                  (when merged
                    (push (merge-operation-json machine contribution pending merged)
-                         merge-batch)))))))))
+                         merge-batch))))))))))
     (setf merge-batch (sorted-merge-operations merge-batch)
           ;; Sorted on the same key for the same reason: the bus dedups and
           ;; re-sorts its writes, so this cannot change the result, but a step
@@ -1759,6 +1841,8 @@ always treated presence as activation; this runtime is the one that differed."
       (setf (jget step "perceptualSpace") (perceptual-space-snapshot (reality-state-perceptual-space state))
             (jget step "perceptualSpaceIsDebugProjection") t)
       (record-trajectory state isre osre)
+      ;; The pair is committed: the step's completion point (#375).
+      (signal-step-completed state (jnumber isre "stepNumber" 0))
       (record-history state step)
       step)))
 
@@ -2648,6 +2732,38 @@ on this surface."
                                                                                   (reality-state-isre-history state)
                                                                                   (or (parse-integer (or (gethash "from" query) "0") :junk-allowed t) 0)
                                                                                   (parse-integer (or (gethash "limit" query) "0") :junk-allowed t)))))))
+     ;; The step completion point (RealityEngine_CI#375, SURFACE_SPEC.md
+     ;; "Step completion"): the (ISRE, OSRE) pair for step n, waiting up to
+     ;; timeoutMs for it. The wait is on this request's thread, on the step
+     ;; signal's condition variable — never in the actor, which must stay free
+     ;; to run the step being waited for — and the pair is then read from the
+     ;; actor, where it was committed in one action.
+     (make-route "GET" "/api/engine/steps/:n/pair"
+                 (lambda (params body query)
+                   (declare (ignore body))
+                   (let ((n (parse-integer (or (gethash "n" params) "") :junk-allowed t))
+                         (timeout-ms (let ((raw (and (hash-table-p* query) (gethash "timeoutMs" query))))
+                                       (if raw (parse-integer raw :junk-allowed t) +step-pair-default-timeout-ms+))))
+                     (cond
+                       ((or (null n) (< n 0))
+                        (error-response "step must be a non-negative integer" 400))
+                       ((or (null timeout-ms) (< timeout-ms 0) (> timeout-ms +step-pair-max-timeout-ms+))
+                        (error-response (format nil "timeoutMs must be an integer in [0, ~d]"
+                                                +step-pair-max-timeout-ms+)
+                                        400))
+                       ((not (await-step-completed (actor-state actor) n timeout-ms))
+                        (error-response (format nil "step ~d not resolved within ~d ms" n timeout-ms) 408))
+                       (t
+                        (let ((pair (actor-ask actor
+                                               (lambda (state)
+                                                 (flet ((entry (history)
+                                                          (find n history :key (lambda (e) (jnumber e "stepNumber" 0)))))
+                                                   (let ((isre (entry (reality-state-isre-history state)))
+                                                         (osre (entry (reality-state-osre-history state))))
+                                                     (and isre osre (obj "stepNumber" n "isre" isre "osre" osre))))))))
+                          (if pair
+                              (json-response pair)
+                              (error-response (format nil "step ~d is no longer retained" n) 410))))))))
      (make-route "GET" "/api/engine/active" (lambda (_ body query)
                                               (declare (ignore _ body query))
                                               (state-json (lambda (state) (obj "activeEvents" (active-vectors-json state))))))
