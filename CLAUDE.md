@@ -78,6 +78,13 @@ rebuild, three times per launch, the first time a runner comes up with a cold
 
 - Keep RE/PE routes and payloads aligned with C++ and Scala.
 - Treat JSON serialization, machine loading, and PE source state as parity-sensitive.
+- A step composes in parallel and resolves atomically (RealityEngine_CI#375):
+  `compose-machines` runs every machine's composition from ISRE(n) through
+  `lparallel` (`pmap-machines` is the join); folding, arbitration and the OSRE(n)
+  commit follow in the actor, in canonical order. The committed (ISRE, OSRE) pair
+  is published on a `bordeaux-threads` condition variable (`step-signal`), which
+  `GET /api/engine/steps/:n/pair?timeoutMs=` waits on from the request thread,
+  never the actor. Steps are numbered from 0.
 - Use the same ACP/OpenClaw environment defaults as the rest of the application.
 
 ## LSP Support
