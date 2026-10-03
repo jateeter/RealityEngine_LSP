@@ -30,8 +30,44 @@ needs that distinction."
   (multiple-value-bind (sec usec) (sb-ext:get-time-of-day)
     (+ (* sec 1000) (floor usec 1000))))
 
+;;; Minted identity is `<prefix>-<uuid>`: a random (version 4) UUID in canonical
+;;; lowercase form, on every runtime (RealityEngine_CI#518). Ids are unique across
+;;; the universe, not just within one engine, and a minted id is recognisable by
+;;; shape -- corpus ids are never UUIDs -- so a cross-engine comparison can tell
+;;; identity an engine minted from identity the corpus declared. This replaced
+;;; `<prefix>-<time36>-<random36>`, whose length differed from the other
+;;; runtimes' formats and made byte comparisons fail on identity alone.
+;;;
+;;; The random state is the generator's own, behind a lock, and reseeded from the
+;;; OS whenever the process id changes. `make build` saves an executable image,
+;;; and a state seeded while building would be saved into it: every start of the
+;;; image would then mint the same sequence, which is precisely the collision a
+;;; UUID exists to rule out.
+(defvar *uuid-lock* (bt:make-lock "uuid"))
+(defvar *uuid-random-state* nil)
+(defvar *uuid-pid* nil)
+
+(defun make-uuid ()
+  "A random (version 4) UUID string, canonical lowercase form."
+  (let ((bytes (make-array 16 :element-type '(unsigned-byte 8))))
+    (bt:with-lock-held (*uuid-lock*)
+      (let ((pid (sb-unix:unix-getpid)))
+        (unless (and *uuid-random-state* (eql pid *uuid-pid*))
+          (setf *uuid-random-state* (make-random-state t)
+                *uuid-pid* pid)))
+      (dotimes (i 16)
+        (setf (aref bytes i) (random 256 *uuid-random-state*))))
+    (setf (aref bytes 6) (logior #x40 (logand (aref bytes 6) #x0f))
+          (aref bytes 8) (logior #x80 (logand (aref bytes 8) #x3f)))
+    (flet ((hex (start end)
+             (with-output-to-string (out)
+               (loop for i from start below end
+                     do (format out "~(~2,'0x~)" (aref bytes i))))))
+      (format nil "~a-~a-~a-~a-~a"
+              (hex 0 4) (hex 4 6) (hex 6 8) (hex 8 10) (hex 10 16)))))
+
 (defun make-id (&optional (prefix "id"))
-  (format nil "~a-~36r-~36r" prefix (get-universal-time) (random most-positive-fixnum)))
+  (format nil "~a-~a" prefix (make-uuid)))
 
 (defun clamp01 (value)
   (max 0.0d0 (min 1.0d0 (coerce value 'double-float))))
