@@ -67,10 +67,18 @@
   ;; counter that ticks once per committed step and is NEVER reset, so
   ;; (engine, lamport) names one step uniquely for the life of the engine. The
   ;; step count beside it is reset; the clock is not. The UUID is set at boot
-  ;; by make-reality-state-from-config, never at load time, so a saved image
-  ;; does not carry one engine's UUID into every launch.
+  ;; by boot-engine-clock, never at load time, so a saved image does not carry
+  ;; one engine's UUID into every launch.
+  ;;
+  ;; A declared UUID outlives the process, so its counter must too: LAMPORT-FILE
+  ;; holds a reserved high-water mark and LAMPORT-RESERVED is the value it
+  ;; holds. No tick above the persisted mark is ever issued, and a boot starts
+  ;; from the mark, so a restart can never reissue a tick. NIL for a minted
+  ;; UUID, which is new on every boot and needs no memory.
   engine-uuid
   (lamport 0)
+  (lamport-reserved 0)
+  (lamport-file nil)
   ;; The step completion point (RealityEngine_CI#375): signalled when a step's
   ;; (ISRE, OSRE) pair is committed, waited on by GET /api/engine/steps/:n/pair.
   (step-signal (make-step-signal)))
@@ -142,12 +150,66 @@
                         (digit-char-p ch 16)))))
 
 (defun boot-engine-uuid ()
+  "This boot's engine UUID, and whether it was declared (ENGINE_UUID)."
   (let ((declared (env "ENGINE_UUID" nil)))
-    (cond ((canonical-uuid-p declared) (string-downcase declared))
+    (cond ((canonical-uuid-p declared) (values (string-downcase declared) t))
           (t (when (and declared (plusp (length declared)))
                (format *error-output*
                        "~&ENGINE_UUID ~s is not a canonical UUID; minting one~%" declared))
-             (make-uuid)))))
+             (values (make-uuid) nil)))))
+
+;; Ticks reserved per write. One write per this many steps; a restart skips at
+;; most this many values, which a Lamport clock permits -- it must increase,
+;; not be dense.
+(defconstant +lamport-reservation+ 1024)
+
+(defun lamport-file-for (uuid)
+  "Where a declared engine's clock is kept: ENGINE_CLOCK_DIR, by default
+~/.reality-engine/clock/, one <uuid>.lamport file per engine."
+  (merge-pathnames (format nil "~a.lamport" uuid)
+                   (uiop:ensure-directory-pathname
+                    (or (env "ENGINE_CLOCK_DIR" nil)
+                        (merge-pathnames ".reality-engine/clock/" (user-homedir-pathname))))))
+
+(defun read-lamport-reservation (file)
+  "The high-water mark persisted in FILE; 0 when the engine has never run."
+  (if (probe-file file)
+      (let ((text (string-trim '(#\Space #\Tab #\Newline #\Return)
+                               (uiop:read-file-string file))))
+        (or (and (plusp (length text)) (every #'digit-char-p text) (parse-integer text))
+            (error "Lamport clock file ~a does not hold a whole number: ~s" file text)))
+      0))
+
+(defun write-lamport-reservation (file value)
+  "Persist VALUE as FILE's high-water mark: written beside it, then renamed
+over it, so a crash leaves the old mark or the new one and never a torn one."
+  (ensure-directories-exist file)
+  (let ((tmp (make-pathname :type "lamport-tmp" :defaults file)))
+    (with-open-file (out tmp :direction :output :if-exists :supersede)
+      (format out "~d~%" value)
+      (finish-output out))
+    (uiop:rename-file-overwriting-target tmp file)))
+
+(defun start-lamport-clock (state file)
+  "Resume the clock persisted in FILE: start from its mark, reserve the next
+block before issuing any tick. A file that cannot be read or written is an
+error, not a fallback -- a declared engine that cannot keep its clock would
+reissue ticks after a restart, which is the one thing the clock must not do."
+  (let ((mark (read-lamport-reservation file)))
+    (setf (reality-state-lamport-file state) file
+          (reality-state-lamport state) mark
+          (reality-state-lamport-reserved state) (+ mark +lamport-reservation+))
+    (write-lamport-reservation file (reality-state-lamport-reserved state))
+    state))
+
+(defun boot-engine-clock (state)
+  "Give STATE its engine UUID and clock at boot. A declared UUID resumes its
+persisted clock; a minted one starts at 0, being a new engine."
+  (multiple-value-bind (uuid declared-p) (boot-engine-uuid)
+    (setf (reality-state-engine-uuid state) uuid)
+    (when declared-p
+      (start-lamport-clock state (lamport-file-for uuid)))
+    state))
 
 (defun state-engine-uuid (state)
   "This engine's UUID, minted on first use for a state built without one."
@@ -155,8 +217,16 @@
       (setf (reality-state-engine-uuid state) (make-uuid))))
 
 (defun tick-lamport (state)
-  "Advance the Lamport clock for a committed step and return the new value."
-  (incf (reality-state-lamport state)))
+  "Advance the Lamport clock for a committed step and return the new value.
+For a declared engine the next block is persisted before a tick past the
+persisted mark is issued, never after."
+  (let ((next (1+ (reality-state-lamport state)))
+        (file (reality-state-lamport-file state)))
+    (when (and file (> next (reality-state-lamport-reserved state)))
+      (let ((reserved (+ next +lamport-reservation+)))
+        (write-lamport-reservation file reserved)
+        (setf (reality-state-lamport-reserved state) reserved)))
+    (setf (reality-state-lamport state) next)))
 
 (defun lamport-tick-json (state lamport step-number)
   (obj "engine" (state-engine-uuid state) "lamport" lamport "step" step-number))
@@ -449,7 +519,6 @@ schema does not declare — isActive, state, wasJustMatched — which
            :qdrant-url (env "QDRANT_URL" "http://localhost:4333")
            :collection-name (env "QDRANT_REALITY_COLLECTION" "reality-events")
            :started-at (now-ms)
-           :engine-uuid (boot-engine-uuid)
            :event-bus-subscriptions (make-hash-table :test #'equal)
            :latched-event-bits (make-hash-table :test #'equal)
            :step-count 0
@@ -472,6 +541,9 @@ schema does not declare — isActive, state, wasJustMatched — which
            :sim-current-step 0
            :sim-running-p nil
            :sim-autoplay-generation 0)))
+    ;; Before the corpus loads: a declared engine that cannot keep its clock
+    ;; fails here rather than after minutes of loading.
+    (boot-engine-clock state)
     (dolist (machine (load-machines-from-directory machine-dir))
       (put-machine state machine))
     state))

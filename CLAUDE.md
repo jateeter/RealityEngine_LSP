@@ -95,6 +95,11 @@ rebuild, three times per launch, the first time a runner comes up with a cold
   life of the engine; `step` is the step count, which a reset restarts. The
   engine UUID is `ENGINE_UUID` when declared, otherwise a v7 UUID minted at
   boot (never at image-save time); `GET /api/engine/clock` reports the clock.
+  A declared engine's clock survives restarts: `ENGINE_CLOCK_DIR` (default
+  `~/.reality-engine/clock/`) holds `<uuid>.lamport`, a high-water mark
+  reserved 1024 ticks ahead and written (temp + rename) before any tick past
+  it is issued; a boot resumes from the mark. A clock file that cannot be
+  read or written refuses the boot.
   Off, the legacy object is unchanged except that a reset clears it.
 - Use the same ACP/OpenClaw environment defaults as the rest of the application.
 
