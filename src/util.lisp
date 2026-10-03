@@ -30,41 +30,58 @@ needs that distinction."
   (multiple-value-bind (sec usec) (sb-ext:get-time-of-day)
     (+ (* sec 1000) (floor usec 1000))))
 
-;;; Minted identity is `<prefix>-<uuid>`: a random (version 4) UUID in canonical
-;;; lowercase form, on every runtime (RealityEngine_CI#518). Ids are unique across
-;;; the universe, not just within one engine, and a minted id is recognisable by
-;;; shape -- corpus ids are never UUIDs -- so a cross-engine comparison can tell
-;;; identity an engine minted from identity the corpus declared. This replaced
-;;; `<prefix>-<time36>-<random36>`, whose length differed from the other
-;;; runtimes' formats and made byte comparisons fail on identity alone.
+;;; Minted identity is `<prefix>-<uuid>`, a time-ordered (version 7) UUID in
+;;; canonical lowercase form, on every runtime (RealityEngine_CI#518, #281). Ids
+;;; are unique across the universe, recognisable by shape -- corpus ids are never
+;;; UUIDs -- and sort in creation order: 48 bits of Unix milliseconds, a 12-bit
+;;; counter that increases within one millisecond, then 62 random bits.
+;;;
+;;; Creation order is load-bearing. SURFACE_SPEC breaks `activeRegions` ties on
+;;; machineId, so two machines on one region are ordered by their ids; random
+;;; (v4) ids ordered them differently on every engine and split universal vectors
+;;; on every event. Engines loading the same machines in the same order mint ids
+;;; that sort the same way, as the earlier time-prefixed format did.
 ;;;
 ;;; The random state is the generator's own, behind a lock, and reseeded from the
-;;; OS whenever the process id changes. `make build` saves an executable image,
-;;; and a state seeded while building would be saved into it: every start of the
-;;; image would then mint the same sequence, which is precisely the collision a
-;;; UUID exists to rule out.
+;;; OS whenever the process id changes: `make build` saves an executable image,
+;;; and a state seeded while building would otherwise be saved into it and replay
+;;; the same sequence on every start.
 (defvar *uuid-lock* (bt:make-lock "uuid"))
 (defvar *uuid-random-state* nil)
 (defvar *uuid-pid* nil)
+(defvar *uuid-last-ms* 0)
+(defvar *uuid-counter* 0)
 
 (defun make-uuid ()
-  "A random (version 4) UUID string, canonical lowercase form."
-  (let ((bytes (make-array 16 :element-type '(unsigned-byte 8))))
+  "A time-ordered (version 7) UUID string, canonical lowercase form."
+  (let (ms seq (rand (make-array 8 :element-type '(unsigned-byte 8))))
     (bt:with-lock-held (*uuid-lock*)
       (let ((pid (sb-unix:unix-getpid)))
         (unless (and *uuid-random-state* (eql pid *uuid-pid*))
           (setf *uuid-random-state* (make-random-state t)
-                *uuid-pid* pid)))
-      (dotimes (i 16)
-        (setf (aref bytes i) (random 256 *uuid-random-state*))))
-    (setf (aref bytes 6) (logior #x40 (logand (aref bytes 6) #x0f))
-          (aref bytes 8) (logior #x80 (logand (aref bytes 8) #x3f)))
-    (flet ((hex (start end)
-             (with-output-to-string (out)
-               (loop for i from start below end
-                     do (format out "~(~2,'0x~)" (aref bytes i))))))
-      (format nil "~a-~a-~a-~a-~a"
-              (hex 0 4) (hex 4 6) (hex 6 8) (hex 8 10) (hex 10 16)))))
+                *uuid-pid* pid
+                *uuid-last-ms* 0
+                *uuid-counter* 0)))
+      (setf ms (now-ms))
+      (cond ((<= ms *uuid-last-ms*)
+             (setf ms *uuid-last-ms*)
+             (when (> (incf *uuid-counter*) #xfff)
+               (incf ms)
+               (setf *uuid-counter* 0)))
+            (t (setf *uuid-counter* 0)))
+      (setf *uuid-last-ms* ms
+            seq *uuid-counter*)
+      (dotimes (i 8)
+        (setf (aref rand i) (random 256 *uuid-random-state*))))
+    (setf (aref rand 0) (logior #x80 (logand (aref rand 0) #x3f)))
+    (let ((hex (with-output-to-string (out)
+                 (loop for i from 0 below 8 do (format out "~(~2,'0x~)" (aref rand i))))))
+      (format nil "~(~8,'0x-~4,'0x-~4,'0x~)-~a-~a"
+              (ldb (byte 32 16) ms)
+              (ldb (byte 16 0) ms)
+              (logior #x7000 seq)
+              (subseq hex 0 4)
+              (subseq hex 4 16)))))
 
 (defun make-id (&optional (prefix "id"))
   (format nil "~a-~a" prefix (make-uuid)))
