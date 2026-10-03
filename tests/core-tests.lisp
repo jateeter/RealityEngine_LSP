@@ -3045,6 +3045,17 @@ declared operator over [0..1] (ARBITER_CONTRACT.md section 4.4b)."
     (assert-true (null (reality-engine-lsp::localai-operation-for-id state "GET" "/"))
                  "\"/\" is not a wildcard"))
 
+  ;; Minted ids are time-ordered UUIDs (RealityEngine_CI#518, #281): version 7,
+  ;; distinct, and strictly increasing in creation order, so two machines on one
+  ;; region sort the same way on every engine.
+  (let ((ids (loop repeat 2000 collect (subseq (reality-engine-lsp::make-id "machine") 8))))
+    (assert-true (every (lambda (u) (and (= (length u) 36) (char= (char u 14) #\7))) ids)
+                 "minted ids are canonical version-7 UUIDs")
+    (assert-true (= 2000 (length (remove-duplicates ids :test #'string=)))
+                 "minted ids are distinct")
+    (assert-true (loop for (a b) on ids while b always (string< a b))
+                 "minted ids increase in creation order"))
+
   (output-merge-tests)
   (fold-placement-tests)
   (live-inputs-win-over-seed-tests)
