@@ -52,7 +52,7 @@
 Folding a multi-valued machine's cells with a Boolean gate destroys them: the
 gate can only answer \"asserted or not\", so an ordinal severity ladder comes out
 as a flag (RealityEngine_CI#158). These five are closed over the chain, symmetric
-and deterministic, verified by exhaustion in the reference implementation at
+and deterministic, verified by exhaustion in the executable definition at
 RealityEngine_CI scripts/experiment-mv-transforms.py, which this fold is written
 against cell for cell.")
 

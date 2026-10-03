@@ -462,9 +462,9 @@ and PE records async dispatch envelopes without requiring live RE HTTP."
 ;;
 ;; The five multi-valued transformations are checked against the properties the
 ;; fold contract requires — closure, symmetry, determinism — by exhaustion over
-;; the chain rather than by assertion, the way the reference implementation at
+;; the chain rather than by assertion, the way the executable definition at
 ;; RealityEngine_CI scripts/experiment-mv-transforms.py checks itself. The full
-;; 6820-fold differential against that reference (5 transformations x chain
+;; 6820-fold differential against that definition (5 transformations x chain
 ;; {0..3} x n=1..5, zero differences, matching what C++ reported) needs Python
 ;; on the box and is run out of band; what is kept here stands alone.
 
