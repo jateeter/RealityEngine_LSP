@@ -13,6 +13,9 @@
                ;; hand-rolled from locks and condition variables
                ;; (RealityEngine_LSP#92, ARBITER_CONTRACT.md 7.4).
                #:lparallel
+               ;; lockf for the instance lock (RealityEngine_CI#296); an SBCL
+               ;; contrib, so nothing to fetch.
+               #:sb-posix
                #:cl-base64
                #:hunchentoot
                #:drakma

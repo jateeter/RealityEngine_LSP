@@ -1433,9 +1433,9 @@ declared operator over [0..1] (ARBITER_CONTRACT.md section 4.4b)."
              (field (o k) (reality-engine-lsp::jget o k)))
         (assert-equal -1 (field (clock) "step") "no step yet is step -1")
         (assert-equal 0 (field (clock) "lamport") "no step yet is lamport 0")
-        (assert-true (reality-engine-lsp::canonical-uuid-p (field (clock) "engine"))
+        (assert-true (reality-engine-lsp::canonical-uuid-p (field (clock) "instance"))
                      "the engine is a canonical UUID")
-        (let ((engine (field (clock) "engine")))
+        (let ((engine (field (clock) "instance")))
           (put state "arbitrationRetention" t)
           (put state "arbitrationWindow" 4)
           (commit state 0 nil)
@@ -1450,7 +1450,7 @@ declared operator over [0..1] (ARBITER_CONTRACT.md section 4.4b)."
             (assert-equal 0 (field tick "step") "the step count restarted at 0")
             (assert-equal 3 (field tick "lamport")
                           "the Lamport clock kept ticking: step 0 again, but a new tick")
-            (assert-equal engine (field tick "engine")
+            (assert-equal engine (field tick "instance")
                           "a reset never changes the engine"))))
       (assert-true (not (reality-engine-lsp::canonical-uuid-p "cpp-1"))
                    "an instance id is not an engine UUID"))
@@ -1487,7 +1487,30 @@ declared operator over [0..1] (ARBITER_CONTRACT.md section 4.4b)."
       (assert-error (lambda ()
                       (reality-engine-lsp::start-lamport-clock
                        (fresh) #p"/dev/null/cannot/0192f3a0.lamport"))
-                    "an unwritable clock refuses the boot")))
+                    "an unwritable clock refuses the boot"))
+    ;; Two live instances may not share a UUID: while another process holds the
+    ;; instance lock, a boot presenting the same UUID is refused.
+    (let* ((dir (uiop:ensure-directory-pathname
+                 (format nil "/tmp/re-lsp-lock-~d/" (random 1000000000 (make-random-state t)))))
+           (file (merge-pathnames "0192f3a0-0000-7000-8000-0000000002b7.lamport" dir))
+           (lock (namestring (make-pathname :type "lock" :defaults file)))
+           (holder nil))
+      (ensure-directories-exist file)
+      (unwind-protect
+           (progn
+             (setf holder (uiop:launch-program
+                           (list "python3" "-c"
+                                 "import fcntl,sys,time
+f=open(sys.argv[1],'a'); fcntl.lockf(f, fcntl.LOCK_EX|fcntl.LOCK_NB)
+print('locked', flush=True); time.sleep(60)"
+                                 lock)
+                           :output :stream))
+             (assert-equal "locked" (read-line (uiop:process-info-output holder))
+                           "the other instance holds the lock")
+             (assert-error (lambda () (reality-engine-lsp::start-lamport-clock (fresh) file))
+                           "a second live instance with the same UUID refuses to boot"))
+        (when holder (uiop:terminate-process holder) (uiop:wait-process holder))
+        (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
   t)
 
 (defun run-tests ()

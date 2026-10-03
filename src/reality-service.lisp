@@ -63,19 +63,20 @@
   (arbitration-retention-p nil)
   (arbitration-window +arbitration-window-default+)
   (arbitration-steps (make-hash-table :test #'eql))
-  ;; The Lamport clock (RealityEngine_CI#296): this engine's UUID and a
+  ;; The Lamport clock (RealityEngine_CI#296): this instance's UUID and a
   ;; counter that ticks once per committed step and is NEVER reset, so
-  ;; (engine, lamport) names one step uniquely for the life of the engine. The
-  ;; step count beside it is reset; the clock is not. The UUID is set at boot
-  ;; by boot-engine-clock, never at load time, so a saved image does not carry
-  ;; one engine's UUID into every launch.
+  ;; (instance, lamport) names one step uniquely. The step count beside it is
+  ;; reset; the clock is not. A UUID belongs to an instance -- cpp-1, lsp-2 --
+  ;; never to an engine type or image, so it is set at boot by
+  ;; boot-instance-clock and never at load time, where a saved image would
+  ;; carry one UUID into every instance launched from it.
   ;;
-  ;; A declared UUID outlives the process, so its counter must too: LAMPORT-FILE
-  ;; holds a reserved high-water mark and LAMPORT-RESERVED is the value it
-  ;; holds. No tick above the persisted mark is ever issued, and a boot starts
-  ;; from the mark, so a restart can never reissue a tick. NIL for a minted
-  ;; UUID, which is new on every boot and needs no memory.
-  engine-uuid
+  ;; An allocated UUID (INSTANCE_UUID) outlives the process, so its counter must
+  ;; too: LAMPORT-FILE holds a reserved high-water mark and LAMPORT-RESERVED is
+  ;; the value it holds. No tick above the persisted mark is ever issued, and a
+  ;; boot starts from the mark, so a restart can never reissue a tick. NIL for a
+  ;; minted UUID, which is a new instance on every boot and needs no memory.
+  instance-uuid
   (lamport 0)
   (lamport-reserved 0)
   (lamport-file nil)
@@ -132,13 +133,20 @@
     (bt2:with-lock-held ((step-signal-lock signal))
       (step-signal-completed signal))))
 
-;; ── Lamport clock: engine UUID + a counter that never resets ────────────────
+;; ── Lamport clock: instance UUID + a counter that never resets ──────────────
 ;; (RealityEngine_CI#296, the K-line notes on #518.) The clock reads
-;; {engine, lamport, step}: `lamport` ticks once per committed step and keeps
-;; ticking through every reset, so (engine, lamport) is unique for the life of
-;; the engine; `step` is the step count, which a reset restarts. A declared
-;; ENGINE_UUID is kept, as every declared id is; otherwise the engine mints a
-;; version-7 UUID at boot. Wall-clock time never orders anything; this does.
+;; {instance, lamport, step}: `lamport` ticks once per committed step and keeps
+;; ticking through every reset and, for an allocated instance, every restart,
+;; so (instance, lamport) is unique; `step` is the step count, which a reset
+;; restarts. Wall-clock time never orders anything; this does.
+;;
+;; UUIDs are instance allocations, not engine or image allocations, and no two
+;; instances of any engine type may share one. The instance registry allocates
+;; them (startUniverse.sh passes INSTANCE_UUID) and refuses a duplicate there;
+;; here the instance holds an exclusive lock for its whole life, so a second
+;; live process presenting the same UUID refuses to boot. An instance launched
+;; without an allocation mints its own version-7 UUID, which is unique by
+;; construction.
 
 (defun canonical-uuid-p (string)
   (and (stringp string)
@@ -149,13 +157,13 @@
                         (char= ch #\-)
                         (digit-char-p ch 16)))))
 
-(defun boot-engine-uuid ()
-  "This boot's engine UUID, and whether it was declared (ENGINE_UUID)."
-  (let ((declared (env "ENGINE_UUID" nil)))
-    (cond ((canonical-uuid-p declared) (values (string-downcase declared) t))
-          (t (when (and declared (plusp (length declared)))
+(defun boot-instance-uuid ()
+  "This instance's UUID, and whether it was allocated (INSTANCE_UUID)."
+  (let ((allocated (env "INSTANCE_UUID" nil)))
+    (cond ((canonical-uuid-p allocated) (values (string-downcase allocated) t))
+          (t (when (and allocated (plusp (length allocated)))
                (format *error-output*
-                       "~&ENGINE_UUID ~s is not a canonical UUID; minting one~%" declared))
+                       "~&INSTANCE_UUID ~s is not a canonical UUID; minting one~%" allocated))
              (values (make-uuid) nil)))))
 
 ;; Ticks reserved per write. One write per this many steps; a restart skips at
@@ -164,15 +172,39 @@
 (defconstant +lamport-reservation+ 1024)
 
 (defun lamport-file-for (uuid)
-  "Where a declared engine's clock is kept: ENGINE_CLOCK_DIR, by default
-~/.reality-engine/clock/, one <uuid>.lamport file per engine."
+  "Where an allocated instance's clock is kept: INSTANCE_CLOCK_DIR, by default
+~/.reality-engine/clock/, one <uuid>.lamport file per instance."
   (merge-pathnames (format nil "~a.lamport" uuid)
                    (uiop:ensure-directory-pathname
-                    (or (env "ENGINE_CLOCK_DIR" nil)
+                    (or (env "INSTANCE_CLOCK_DIR" nil)
                         (merge-pathnames ".reality-engine/clock/" (user-homedir-pathname))))))
 
+(defvar *instance-locks* (make-hash-table :test #'equal)
+  "Lock file namestring -> the open descriptor holding its lock. Held until the
+process exits, when the kernel releases it -- a crashed instance never leaves a
+stale lock behind.")
+
+(defun lock-instance (file)
+  "Take the exclusive lock beside FILE (<uuid>.lock) for the life of the
+process, or refuse: another live process holding it is a second instance
+presenting the same UUID. A separate file, because the clock file is replaced
+by rename and a lock on a replaced inode guards nothing."
+  (let* ((lock (make-pathname :type "lock" :defaults file))
+         (key (namestring lock)))
+    (unless (gethash key *instance-locks*)
+      (ensure-directories-exist lock)
+      (let ((fd (sb-posix:open key (logior sb-posix:o-rdwr sb-posix:o-creat) #o644)))
+        (handler-case (sb-posix:lockf fd sb-posix:f-tlock 0)
+          (sb-posix:syscall-error ()
+            (sb-posix:close fd)
+            (error "Instance ~a is already live: another process holds ~a. ~
+Two instances may not share a UUID (RealityEngine_CI#296)."
+                   (pathname-name file) key)))
+        (setf (gethash key *instance-locks*) fd)))
+    key))
+
 (defun read-lamport-reservation (file)
-  "The high-water mark persisted in FILE; 0 when the engine has never run."
+  "The high-water mark persisted in FILE; 0 when the instance has never run."
   (if (probe-file file)
       (let ((text (string-trim '(#\Space #\Tab #\Newline #\Return)
                                (uiop:read-file-string file))))
@@ -191,10 +223,11 @@ over it, so a crash leaves the old mark or the new one and never a torn one."
     (uiop:rename-file-overwriting-target tmp file)))
 
 (defun start-lamport-clock (state file)
-  "Resume the clock persisted in FILE: start from its mark, reserve the next
-block before issuing any tick. A file that cannot be read or written is an
-error, not a fallback -- a declared engine that cannot keep its clock would
-reissue ticks after a restart, which is the one thing the clock must not do."
+  "Lock the instance, then resume the clock persisted in FILE: start from its
+mark and reserve the next block before issuing any tick. A lock held elsewhere,
+or a file that cannot be read or written, is an error, not a fallback -- either
+way ticks could be issued twice, which is the one thing the clock must not do."
+  (lock-instance file)
   (let ((mark (read-lamport-reservation file)))
     (setf (reality-state-lamport-file state) file
           (reality-state-lamport state) mark
@@ -202,23 +235,23 @@ reissue ticks after a restart, which is the one thing the clock must not do."
     (write-lamport-reservation file (reality-state-lamport-reserved state))
     state))
 
-(defun boot-engine-clock (state)
-  "Give STATE its engine UUID and clock at boot. A declared UUID resumes its
-persisted clock; a minted one starts at 0, being a new engine."
-  (multiple-value-bind (uuid declared-p) (boot-engine-uuid)
-    (setf (reality-state-engine-uuid state) uuid)
-    (when declared-p
+(defun boot-instance-clock (state)
+  "Give STATE its instance UUID and clock at boot. An allocated UUID resumes its
+persisted clock; a minted one starts at 0, being a new instance."
+  (multiple-value-bind (uuid allocated-p) (boot-instance-uuid)
+    (setf (reality-state-instance-uuid state) uuid)
+    (when allocated-p
       (start-lamport-clock state (lamport-file-for uuid)))
     state))
 
-(defun state-engine-uuid (state)
-  "This engine's UUID, minted on first use for a state built without one."
-  (or (reality-state-engine-uuid state)
-      (setf (reality-state-engine-uuid state) (make-uuid))))
+(defun state-instance-uuid (state)
+  "This instance's UUID, minted on first use for a state built without one."
+  (or (reality-state-instance-uuid state)
+      (setf (reality-state-instance-uuid state) (make-uuid))))
 
 (defun tick-lamport (state)
   "Advance the Lamport clock for a committed step and return the new value.
-For a declared engine the next block is persisted before a tick past the
+For an allocated instance the next block is persisted before a tick past the
 persisted mark is issued, never after."
   (let ((next (1+ (reality-state-lamport state)))
         (file (reality-state-lamport-file state)))
@@ -229,7 +262,7 @@ persisted mark is issued, never after."
     (setf (reality-state-lamport state) next)))
 
 (defun lamport-tick-json (state lamport step-number)
-  (obj "engine" (state-engine-uuid state) "lamport" lamport "step" step-number))
+  (obj "instance" (state-instance-uuid state) "lamport" lamport "step" step-number))
 
 ;; ── Arbitration retention keyed by step (RealityEngine_CI#296) ───────────────
 ;; Every function here runs on the actor thread, which is what serialises the
@@ -541,9 +574,10 @@ schema does not declare — isActive, state, wasJustMatched — which
            :sim-current-step 0
            :sim-running-p nil
            :sim-autoplay-generation 0)))
-    ;; Before the corpus loads: a declared engine that cannot keep its clock
-    ;; fails here rather than after minutes of loading.
-    (boot-engine-clock state)
+    ;; Before the corpus loads: an allocated instance that cannot keep its
+    ;; clock, or whose UUID another live process holds, fails here rather than
+    ;; after minutes of loading.
+    (boot-instance-clock state)
     (dolist (machine (load-machines-from-directory machine-dir))
       (put-machine state machine))
     state))
@@ -655,7 +689,7 @@ same state — an engine with nothing loaded requires nothing."
   ;; Arbitration records belong to a step, and a reset ends every step there
   ;; was. GET /api/arbitration kept answering with the step before the reset
   ;; until the next one ran (RealityEngine_CI#296, baseline finding B). The
-  ;; retained steps go too; the engine UUID stays, so the Lamport clock
+  ;; retained steps go too; the instance UUID stays, so the Lamport clock
   ;; restarts its count under the same engine.
   (setf (reality-state-arbitration state) nil)
   (clrhash (reality-state-arbitration-steps state))
@@ -3511,7 +3545,7 @@ step's number (-1 before the first step since boot or reset)."
                                  (if (and (consp result) (eq (first result) :refused))
                                      (error-response (second result) (third result))
                                      (json-response result)))))))))
-     ;; The Lamport clock (#296): engine UUID + the newest committed step.
+     ;; The Lamport clock (#296): instance UUID, Lamport value, newest step.
      (make-route "GET" "/api/engine/clock" (lambda (_ body query)
                                              (declare (ignore _ body query))
                                              (state-json #'engine-clock-json)))
