@@ -85,6 +85,15 @@ rebuild, three times per launch, the first time a runner comes up with a cold
   is published on a `bordeaux-threads` condition variable (`step-signal`), which
   `GET /api/engine/steps/:n/pair?timeoutMs=` waits on from the request thread,
   never the actor. Steps are numbered from 0.
+- Arbitration retention (RealityEngine_CI#296): `arbitrationRetention` (default
+  `false`, the legacy escape) and `arbitrationWindow` (default 1, max 1024) on
+  `/api/engine/config`. On, each step's records are retained under its step
+  number in `arbitration-steps` before the completion point is signalled, and
+  `GET /api/arbitration` answers a list (`?step=N` reads one), each element
+  stamped with the Lamport tick `{engine, step}`. The engine UUID is
+  `ENGINE_UUID` when declared, otherwise a v7 UUID minted at boot (never at
+  image-save time); `GET /api/engine/clock` reports it with the newest step.
+  Off, the legacy object is unchanged except that a reset clears it.
 - Use the same ACP/OpenClaw environment defaults as the rest of the application.
 
 ## LSP Support
