@@ -1352,16 +1352,33 @@ declared operator over [0..1] (ARBITER_CONTRACT.md section 4.4b)."
                       :origin "acp.openclaw.target.assessment"
                       :region (reality-engine-lsp::make-region :offset 50 :length 3)
                       :inputs (list (list 1.0d0 1.0d0 1.0d0)) :loop-p t))
+             ;; A seed the cell does not name, on declared cell 53: it keeps T_M.
+             (setf (gethash 53 reality-engine-lsp::*arbitration-entries*)
+                   (reality-engine-lsp::make-arbitration-entry
+                    :cell 53 :rule "PRECEDENCE"
+                    :provider-ranks (reality-engine-lsp::obj "acp" 1 "machine" 3)))
+             (reality-engine-lsp::ensure-source-id
+              engine (reality-engine-lsp::make-source
+                      :id "seed" :kind "test" :name "unnamed seed" :active-p t
+                      :region (reality-engine-lsp::make-region :offset 53 :length 1)
+                      :inputs (list (list 1.0d0)) :loop-p t))
              (let ((fold (reality-engine-lsp::perception-engine-osre-fold engine)))
-               (dolist (c '(50 51 52)) (setf (gethash c fold) (cons "Peer" "or"))))
+               (dolist (c '(50 51 52 53)) (setf (gethash c fold) (cons "Peer" "or"))))
              (multiple-value-bind (v folds) (reality-engine-lsp::assemble-perception-vector engine)
                (assert-true (near (nth 50 v) 0.0d0)
                             "PRECEDENCE: the machine's 0 beats the agent's 1 (criterion 5a)")
                (assert-true (near (nth 51 v) 1.0d0) "an undeclared cell keeps T_M: max(1, 0.2)")
                (assert-true (near (nth 52 v) 1.0d0) "equal ranks fall back to T_M")
-               (assert-equal '(50 51 52) (mapcar (lambda (f) (reality-engine-lsp::jget f "cell")) folds)
+               (assert-true (near (nth 53 v) 1.0d0)
+                            "an unnamed provider keeps T_M on a declared cell: the seed's 1 stands")
+               (assert-equal '(50 51 52 53) (mapcar (lambda (f) (reality-engine-lsp::jget f "cell")) folds)
                              "every fold is recorded, ascending by cell")
-               (destructuring-bind (f50 f51 f52) folds
+               (assert-equal "provider-unranked" (reality-engine-lsp::jget (fourth folds) "review")
+                             "an unnamed provider on a declared cell is flagged for review")
+               (assert-equal "synthetic" (reality-engine-lsp::jget (reality-engine-lsp::jget (fourth folds) "source") "provider")
+                             "a seed is synthetic")
+               (destructuring-bind (f50 f51 f52 f53) folds
+                 (declare (ignore f53))
                  (assert-equal "declared-rule" (reality-engine-lsp::jget f50 "resolution") "declared rule")
                  (assert-equal "PRECEDENCE" (reality-engine-lsp::jget f50 "rule") "names the rule")
                  (assert-equal "osre" (reality-engine-lsp::jget f50 "kept") "the OSRE side was kept")
@@ -1377,12 +1394,12 @@ declared operator over [0..1] (ARBITER_CONTRACT.md section 4.4b)."
                (reality-engine-lsp::record-source-contention engine folds)
                (let* ((json (reality-engine-lsp::source-contention-json engine))
                       (counter (aref (reality-engine-lsp::jget json "counters") 0)))
-                 (assert-equal 3 (length (reality-engine-lsp::jget json "folds")) "folds are served")
+                 (assert-equal 4 (length (reality-engine-lsp::jget json "folds")) "folds are served")
                  (assert-equal 1 (reality-engine-lsp::jget counter "contended") "one contended transition")
                  (assert-equal 1 (reality-engine-lsp::jget counter "suppressed") "suppressed at cell 50")))
              (multiple-value-bind (v folds) (reality-engine-lsp::assemble-perception-vector engine)
                (declare (ignore v))
-               (assert-equal 3 (length folds) "a read assembles the folds again...")
+               (assert-equal 4 (length folds) "a read assembles the folds again...")
                (assert-equal 1 (reality-engine-lsp::jget
                                 (aref (reality-engine-lsp::jget (reality-engine-lsp::source-contention-json engine)
                                                                 "counters") 0)

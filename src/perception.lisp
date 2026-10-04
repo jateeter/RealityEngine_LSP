@@ -77,18 +77,27 @@ determinism class -- the arbiter's own ranking (%provider-rank)."
                        (jget (arbitration-entry-provider-ranks entry) provider))))
     (if (numberp declared) declared (determinism-rank (determinism-of provider)))))
 
+(defun provider-named-p (provider entry)
+  "Whether ENTRY's providerRanks names PROVIDER explicitly."
+  (let ((ranks (and entry (arbitration-entry-provider-ranks entry))))
+    (and ranks (not (eq (jget ranks provider :missing) :missing)))))
+
 (defun fold-source-osre (cell source s machine transformation o)
   "Fold source value S against OSRE value O on CELL (section 4.4b). Returns
-(values resolved record). A declared PRECEDENCE takes the higher-ranked
-provider's value whole -- a deterministic machine beats a generated source at
-any value (criterion 5a); every other case folds by the machine's operator."
+(values resolved record). A declared PRECEDENCE that NAMES the source's provider
+takes the higher-ranked provider's value whole -- a deterministic machine beats
+a named generated source at any value (criterion 5a). A provider the cell does
+not name keeps the machine's operator and is flagged for review (owner decision
+2026-10-04, CI#525): an unnamed provider is either ranked explicitly or placed
+in the unnamed-provider trustability ranking, never overridden by default."
   (let* ((s (coerce s 'double-float)) (o (coerce o 'double-float))
          (entry (arbitration-entry-for cell))
          (rule (and entry (arbitration-entry-rule entry)))
          (provider (source-provider source))
+         (named (provider-named-p provider entry))
          (osre-rank (and entry (fold-provider-rank "machine" entry)))
          (source-rank (and entry (fold-provider-rank provider entry)))
-         (by-rule (and (equal rule "PRECEDENCE") (/= osre-rank source-rank)))
+         (by-rule (and (equal rule "PRECEDENCE") named (/= osre-rank source-rank)))
          (resolved (cond (by-rule (if (> osre-rank source-rank) o s))
                          (t (fold-unit-interval transformation s o))))
          (kept (cond (by-rule (if (> osre-rank source-rank) "osre" "source"))
@@ -100,6 +109,7 @@ any value (criterion 5a); every other case folds by the machine's operator."
                      (obj "cell" cell "resolution" "declared-rule" "rule" rule)
                      (let ((r (obj "cell" cell "resolution" "osre-fold" "operator" transformation)))
                        (when rule (setf (jget r "declaredRule") rule))
+                       (when (and rule (not named)) (setf (jget r "review") "provider-unranked"))
                        r))))
     (setf (jget record "osre") (obj "machine" (or machine "") "provider" "machine" "value" o)
           (jget record "source") (obj "id" (or (source-id source) "") "name" (or (source-name source) "")
