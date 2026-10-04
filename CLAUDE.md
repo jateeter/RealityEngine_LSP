@@ -85,6 +85,24 @@ rebuild, three times per launch, the first time a runner comes up with a cold
   is published on a `bordeaux-threads` condition variable (`step-signal`), which
   `GET /api/engine/steps/:n/pair?timeoutMs=` waits on from the request thread,
   never the actor. Steps are numbered from 0.
+- Arbitration retention (RealityEngine_CI#296): `arbitrationRetention` (default
+  `false`, the legacy escape) and `arbitrationWindow` (default 1, max 1024) on
+  `/api/engine/config`. On, each step's records are retained under its step
+  number in `arbitration-steps` before the completion point is signalled, and
+  `GET /api/arbitration` answers a list (`?step=N` reads one), each element
+  stamped with its clock `{instance, lamport, step}`. `lamport` ticks once
+  per committed step and is never reset, so `(instance, lamport)` is unique;
+  `step` is the step count, which a reset restarts. A UUID belongs to an
+  **instance**, never an engine type or image: the instance registry allocates
+  it (`INSTANCE_UUID`), and without one the instance mints a v7 UUID at boot
+  (never at image-save time). An allocated instance's clock survives restarts:
+  `INSTANCE_CLOCK_DIR` (default `~/.reality-engine/clock/`) holds
+  `<uuid>.lamport`, a high-water mark reserved 1024 ticks ahead and written
+  (temp + rename) before any tick past it is issued, and `<uuid>.lock`, held
+  with `lockf` for the life of the process so a second live process with the
+  same UUID refuses to boot. An unreadable or unwritable clock refuses the boot
+  too. `GET /api/engine/clock` reports the clock. Off, the legacy object is
+  unchanged except that a reset clears it.
 - Use the same ACP/OpenClaw environment defaults as the rest of the application.
 
 ## LSP Support

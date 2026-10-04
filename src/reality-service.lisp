@@ -1,5 +1,11 @@
 (in-package #:reality-engine-lsp)
 
+;; GET /api/arbitration's window, SURFACE_SPEC.md "Arbitration retention". The
+;; default is declared there; the ceiling matches the trajectory capacity, the
+;; memory envelope every runtime already carries for per-step records.
+(defconstant +arbitration-window-default+ 1)
+(defconstant +arbitration-window-max+ 1024)
+
 (defstruct reality-state
   dimension machines machine-dir perceptual-space history history-limit include-machine-results-p include-active-regions-p
   ;; Audit trail for POST /api/engine/process — what GET /api/engine/history
@@ -48,6 +54,32 @@
   ;; A resolution nobody can observe is indistinguishable from no resolution,
   ;; and a suppressed contribution has to stay attributable.
   arbitration
+  ;; Arbitration retention keyed by step (RealityEngine_CI#296). Off by default:
+  ;; GET /api/arbitration then answers in its legacy shape and nothing is kept
+  ;; per step. On, each committed step's records are kept under its step number
+  ;; in ARBITRATION-STEPS, for the ARBITRATION-WINDOW steps ending at the latest.
+  ;; A hash keyed by step rather than a ring of the latest n, so the window's
+  ;; anchor can later move (K-line histories).
+  (arbitration-retention-p nil)
+  (arbitration-window +arbitration-window-default+)
+  (arbitration-steps (make-hash-table :test #'eql))
+  ;; The Lamport clock (RealityEngine_CI#296): this instance's UUID and a
+  ;; counter that ticks once per committed step and is NEVER reset, so
+  ;; (instance, lamport) names one step uniquely. The step count beside it is
+  ;; reset; the clock is not. A UUID belongs to an instance -- cpp-1, lsp-2 --
+  ;; never to an engine type or image, so it is set at boot by
+  ;; boot-instance-clock and never at load time, where a saved image would
+  ;; carry one UUID into every instance launched from it.
+  ;;
+  ;; An allocated UUID (INSTANCE_UUID) outlives the process, so its counter must
+  ;; too: LAMPORT-FILE holds a reserved high-water mark and LAMPORT-RESERVED is
+  ;; the value it holds. No tick above the persisted mark is ever issued, and a
+  ;; boot starts from the mark, so a restart can never reissue a tick. NIL for a
+  ;; minted UUID, which is a new instance on every boot and needs no memory.
+  instance-uuid
+  (lamport 0)
+  (lamport-reserved 0)
+  (lamport-file nil)
   ;; The step completion point (RealityEngine_CI#375): signalled when a step's
   ;; (ISRE, OSRE) pair is committed, waited on by GET /api/engine/steps/:n/pair.
   (step-signal (make-step-signal)))
@@ -94,6 +126,166 @@
             (return nil))
           (bt2:condition-wait (step-signal-cv signal) (step-signal-lock signal)
                               :timeout (/ remaining internal-time-units-per-second)))))))
+
+(defun latest-committed-step (state)
+  "The newest step whose (ISRE, OSRE) pair is committed; -1 before the first."
+  (let ((signal (reality-state-step-signal state)))
+    (bt2:with-lock-held ((step-signal-lock signal))
+      (step-signal-completed signal))))
+
+;; ── Lamport clock: instance UUID + a counter that never resets ──────────────
+;; (RealityEngine_CI#296, the K-line notes on #518.) The clock reads
+;; {instance, lamport, step}: `lamport` ticks once per committed step and keeps
+;; ticking through every reset and, for an allocated instance, every restart,
+;; so (instance, lamport) is unique; `step` is the step count, which a reset
+;; restarts. Wall-clock time never orders anything; this does.
+;;
+;; UUIDs are instance allocations, not engine or image allocations, and no two
+;; instances of any engine type may share one. The instance registry allocates
+;; them (startUniverse.sh passes INSTANCE_UUID) and refuses a duplicate there;
+;; here the instance holds an exclusive lock for its whole life, so a second
+;; live process presenting the same UUID refuses to boot. An instance launched
+;; without an allocation mints its own version-7 UUID, which is unique by
+;; construction.
+
+(defun canonical-uuid-p (string)
+  (and (stringp string)
+       (= (length string) 36)
+       (loop for ch across string
+             for i from 0
+             always (if (member i '(8 13 18 23))
+                        (char= ch #\-)
+                        (digit-char-p ch 16)))))
+
+(defun boot-instance-uuid ()
+  "This instance's UUID, and whether it was allocated (INSTANCE_UUID)."
+  (let ((allocated (env "INSTANCE_UUID" nil)))
+    (cond ((canonical-uuid-p allocated) (values (string-downcase allocated) t))
+          (t (when (and allocated (plusp (length allocated)))
+               (format *error-output*
+                       "~&INSTANCE_UUID ~s is not a canonical UUID; minting one~%" allocated))
+             (values (make-uuid) nil)))))
+
+;; Ticks reserved per write. One write per this many steps; a restart skips at
+;; most this many values, which a Lamport clock permits -- it must increase,
+;; not be dense.
+(defconstant +lamport-reservation+ 1024)
+
+(defun lamport-file-for (uuid)
+  "Where an allocated instance's clock is kept: INSTANCE_CLOCK_DIR, by default
+~/.reality-engine/clock/, one <uuid>.lamport file per instance."
+  (merge-pathnames (format nil "~a.lamport" uuid)
+                   (uiop:ensure-directory-pathname
+                    (or (env "INSTANCE_CLOCK_DIR" nil)
+                        (merge-pathnames ".reality-engine/clock/" (user-homedir-pathname))))))
+
+(defvar *instance-locks* (make-hash-table :test #'equal)
+  "Lock file namestring -> the open descriptor holding its lock. Held until the
+process exits, when the kernel releases it -- a crashed instance never leaves a
+stale lock behind.")
+
+(defun lock-instance (file)
+  "Take the exclusive lock beside FILE (<uuid>.lock) for the life of the
+process, or refuse: another live process holding it is a second instance
+presenting the same UUID. A separate file, because the clock file is replaced
+by rename and a lock on a replaced inode guards nothing."
+  (let* ((lock (make-pathname :type "lock" :defaults file))
+         (key (namestring lock)))
+    (unless (gethash key *instance-locks*)
+      (ensure-directories-exist lock)
+      (let ((fd (sb-posix:open key (logior sb-posix:o-rdwr sb-posix:o-creat) #o644)))
+        (handler-case (sb-posix:lockf fd sb-posix:f-tlock 0)
+          (sb-posix:syscall-error ()
+            (sb-posix:close fd)
+            (error "Instance ~a is already live: another process holds ~a. ~
+Two instances may not share a UUID (RealityEngine_CI#296)."
+                   (pathname-name file) key)))
+        (setf (gethash key *instance-locks*) fd)))
+    key))
+
+(defun read-lamport-reservation (file)
+  "The high-water mark persisted in FILE; 0 when the instance has never run."
+  (if (probe-file file)
+      (let ((text (string-trim '(#\Space #\Tab #\Newline #\Return)
+                               (uiop:read-file-string file))))
+        (or (and (plusp (length text)) (every #'digit-char-p text) (parse-integer text))
+            (error "Lamport clock file ~a does not hold a whole number: ~s" file text)))
+      0))
+
+(defun write-lamport-reservation (file value)
+  "Persist VALUE as FILE's high-water mark: written beside it, then renamed
+over it, so a crash leaves the old mark or the new one and never a torn one."
+  (ensure-directories-exist file)
+  (let ((tmp (make-pathname :type "lamport-tmp" :defaults file)))
+    (with-open-file (out tmp :direction :output :if-exists :supersede)
+      (format out "~d~%" value)
+      (finish-output out))
+    (uiop:rename-file-overwriting-target tmp file)))
+
+(defun start-lamport-clock (state file)
+  "Lock the instance, then resume the clock persisted in FILE: start from its
+mark and reserve the next block before issuing any tick. A lock held elsewhere,
+or a file that cannot be read or written, is an error, not a fallback -- either
+way ticks could be issued twice, which is the one thing the clock must not do."
+  (lock-instance file)
+  (let ((mark (read-lamport-reservation file)))
+    (setf (reality-state-lamport-file state) file
+          (reality-state-lamport state) mark
+          (reality-state-lamport-reserved state) (+ mark +lamport-reservation+))
+    (write-lamport-reservation file (reality-state-lamport-reserved state))
+    state))
+
+(defun boot-instance-clock (state)
+  "Give STATE its instance UUID and clock at boot. An allocated UUID resumes its
+persisted clock; a minted one starts at 0, being a new instance."
+  (multiple-value-bind (uuid allocated-p) (boot-instance-uuid)
+    (setf (reality-state-instance-uuid state) uuid)
+    (when allocated-p
+      (start-lamport-clock state (lamport-file-for uuid)))
+    state))
+
+(defun state-instance-uuid (state)
+  "This instance's UUID, minted on first use for a state built without one."
+  (or (reality-state-instance-uuid state)
+      (setf (reality-state-instance-uuid state) (make-uuid))))
+
+(defun tick-lamport (state)
+  "Advance the Lamport clock for a committed step and return the new value.
+For an allocated instance the next block is persisted before a tick past the
+persisted mark is issued, never after."
+  (let ((next (1+ (reality-state-lamport state)))
+        (file (reality-state-lamport-file state)))
+    (when (and file (> next (reality-state-lamport-reserved state)))
+      (let ((reserved (+ next +lamport-reservation+)))
+        (write-lamport-reservation file reserved)
+        (setf (reality-state-lamport-reserved state) reserved)))
+    (setf (reality-state-lamport state) next)))
+
+(defun lamport-tick-json (state lamport step-number)
+  (obj "instance" (state-instance-uuid state) "lamport" lamport "step" step-number))
+
+;; ── Arbitration retention keyed by step (RealityEngine_CI#296) ───────────────
+;; Every function here runs on the actor thread, which is what serialises the
+;; table: the commit, the reads and the control writes are all actor messages.
+
+(defun prune-arbitration-steps (state latest)
+  "Drop every retained step outside the window ending at LATEST."
+  (let ((steps (reality-state-arbitration-steps state))
+        (floor (1+ (- latest (reality-state-arbitration-window state))))
+        (dead nil))
+    (maphash (lambda (step entry)
+               (declare (ignore entry))
+               (when (< step floor) (push step dead)))
+             steps)
+    (dolist (step dead) (remhash step steps))))
+
+(defun retain-arbitration (state step-number lamport records)
+  "Keep STEP-NUMBER's records, stamped with the LAMPORT tick it committed at,
+when retention is on and the window is non-empty."
+  (when (and (reality-state-arbitration-retention-p state)
+             (plusp (reality-state-arbitration-window state)))
+    (setf (gethash step-number (reality-state-arbitration-steps state)) (cons lamport records))
+    (prune-arbitration-steps state step-number)))
 
 (defun compose-key (producer-machine-id producer-sequence-id)
   (format nil "~a|~a" producer-machine-id producer-sequence-id))
@@ -382,6 +574,10 @@ schema does not declare — isActive, state, wasJustMatched — which
            :sim-current-step 0
            :sim-running-p nil
            :sim-autoplay-generation 0)))
+    ;; Before the corpus loads: an allocated instance that cannot keep its
+    ;; clock, or whose UUID another live process holds, fails here rather than
+    ;; after minutes of loading.
+    (boot-instance-clock state)
     (dolist (machine (load-machines-from-directory machine-dir))
       (put-machine state machine))
     state))
@@ -490,6 +686,13 @@ same state — an engine with nothing loaded requires nothing."
 (defun reset-reality-state (state)
   ;; Step numbers restart, so the completion point does too (#375).
   (reset-step-signal state)
+  ;; Arbitration records belong to a step, and a reset ends every step there
+  ;; was. GET /api/arbitration kept answering with the step before the reset
+  ;; until the next one ran (RealityEngine_CI#296, baseline finding B). The
+  ;; retained steps go too; the instance UUID stays, so the Lamport clock
+  ;; restarts its count under the same engine.
+  (setf (reality-state-arbitration state) nil)
+  (clrhash (reality-state-arbitration-steps state))
   (maphash (lambda (_ machine)
              (declare (ignore _))
              (dolist (sequence (machine-sequence-list machine))
@@ -1841,6 +2044,10 @@ always treated presence as activation; this runtime is the one that differed."
       (setf (jget step "perceptualSpace") (perceptual-space-snapshot (reality-state-perceptual-space state))
             (jget step "perceptualSpaceIsDebugProjection") t)
       (record-trajectory state isre osre)
+      ;; Retained before the completion point is signalled, so an observer woken
+      ;; for step n finds n's arbitration records already there (#296).
+      (retain-arbitration state (jnumber isre "stepNumber" 0) (tick-lamport state)
+                          (reality-state-arbitration state))
       ;; The pair is committed: the step's completion point (#375).
       (signal-step-completed state (jnumber isre "stepNumber" 0))
       (record-history state step)
@@ -2027,27 +2234,94 @@ on this surface."
        "ragStatusCode" (or (contribution-rag-status-code c) :null)
        "value" (contribution-value c)))
 
+(defun contribution-canonical< (a b)
+  "Ascending (provider, originId, cesId, outputVectorId) — §4's MEAN order,
+led by provider so a record lists the same contributions in the same order on
+every runtime (RealityEngine_CI#296)."
+  (loop for key in (list #'contribution-provider #'contribution-origin-id
+                         #'contribution-ces-id #'contribution-output-vector-id)
+        for x = (or (funcall key a) "")
+        for y = (or (funcall key b) "")
+        do (cond ((string< x y) (return t))
+                 ((string< y x) (return nil)))
+        finally (return nil)))
+
+(defun arbitration-records-json (records &key canonical)
+  "RECORDS as GET /api/arbitration lists them. CANONICAL orders records by cell
+and each contribution list by contribution-canonical<, as the retention mode
+must; without it the legacy order is kept unchanged."
+  (flet ((contributions (list)
+           (apply #'arr (mapcar #'arbitration-contribution-json
+                                (if canonical
+                                    (sort (copy-list list) #'contribution-canonical<)
+                                    list)))))
+    (apply #'arr
+           (mapcar (lambda (r)
+                     (obj "instant" (arbitration-record-instant r)
+                          "cell" (arbitration-record-cell r)
+                          "rule" (arbitration-record-rule r)
+                          "resolved" (arbitration-record-resolved r)
+                          "contributors" (contributions (arbitration-record-contributors r))
+                          "suppressed" (contributions (arbitration-record-suppressed r))))
+                   (if canonical
+                       (sort (copy-list records) #'< :key #'arbitration-record-cell)
+                       records)))))
+
 (defun arbitration-json (state)
-  "GET /api/arbitration — records from the most recent step."
+  "GET /api/arbitration with retention off (the legacy shape) — records from
+the most recent step."
   (let ((records (reality-state-arbitration state)))
     (obj "registryEntries" (arbitration-registry-size)
          "registrySource" (or *arbitration-source* :null)
          "shards" (arbiter-shards)
          "count" (length records)
-         "records"
-         (apply #'arr
-                (mapcar (lambda (r)
-                          (obj "instant" (arbitration-record-instant r)
-                               "cell" (arbitration-record-cell r)
-                               "rule" (arbitration-record-rule r)
-                               "resolved" (arbitration-record-resolved r)
-                               "contributors"
-                               (apply #'arr (mapcar #'arbitration-contribution-json
-                                                    (arbitration-record-contributors r)))
-                               "suppressed"
-                               (apply #'arr (mapcar #'arbitration-contribution-json
-                                                    (arbitration-record-suppressed r)))))
-                        records)))))
+         "records" (arbitration-records-json records))))
+
+(defun arbitration-step-json (state step-number entry)
+  "One retained step: its records, canonically ordered, under its clock.
+ENTRY is (lamport . records) as retain-arbitration stored it."
+  (destructuring-bind (lamport . records) entry
+    (obj "clock" (lamport-tick-json state lamport step-number)
+         "registryEntries" (arbitration-registry-size)
+         "registrySource" (or *arbitration-source* :null)
+         "shards" (arbiter-shards)
+         "count" (length records)
+         "records" (arbitration-records-json records :canonical t))))
+
+(defun arbitration-window-json (state)
+  "GET /api/arbitration with retention on: the retained steps in the window
+ending at the latest committed step, oldest first. Fewer than the window when
+fewer exist; [] at window 0."
+  (let* ((latest (latest-committed-step state))
+         (window (reality-state-arbitration-window state))
+         (steps (reality-state-arbitration-steps state)))
+    (vectorize
+     (loop for step from (max 0 (1+ (- latest window))) to latest
+           for (entry found) = (multiple-value-list (gethash step steps))
+           when found
+             collect (arbitration-step-json state step entry)))))
+
+(defun arbitration-step-read (state step-number)
+  "GET /api/arbitration?step=N. A refusal comes back as (:refused message status)
+for the route to answer, since error-response cannot run on the actor thread."
+  (cond ((not (reality-state-arbitration-retention-p state))
+         (list :refused
+               "arbitration retention is off; GET /api/arbitration?step=N needs arbitrationRetention true"
+               409))
+        ((> step-number (latest-committed-step state))
+         (list :refused (format nil "step ~d has not resolved" step-number) 404))
+        (t
+         (multiple-value-bind (entry found)
+             (gethash step-number (reality-state-arbitration-steps state))
+           (if found
+               (arbitration-step-json state step-number entry)
+               (list :refused (format nil "step ~d is no longer retained" step-number) 410))))))
+
+(defun engine-clock-json (state)
+  "GET /api/engine/clock — this engine's clock: its UUID, the Lamport value of
+the newest committed step (0 before the first since boot; never reset) and that
+step's number (-1 before the first step since boot or reset)."
+  (lamport-tick-json state (reality-state-lamport state) (latest-committed-step state)))
 
 (defun machine-graph-json (state)
   (let (nodes edges)
@@ -2178,8 +2452,40 @@ on this surface."
                                 (current state))))
                    (lambda (state)
                      (funcall write state declared-default)
-                     (current state))))))
+                     (current state)))))
+         (set-arbitration-window (state window)
+           ;; Narrowing takes effect at once rather than at the next step, so
+           ;; the next read already answers for the new window.
+           (setf (reality-state-arbitration-window state) window)
+           (prune-arbitration-steps state (latest-committed-step state))
+           (control-json "arbitrationWindow" "engine" window +arbitration-window-default+)))
     (list
+     ;; Retention off is the legacy escape (#296): the legacy response, and
+     ;; nothing kept per step. Turning it off drops what was kept, so the escape
+     ;; restores the memory profile as well as the shape; turning it on starts
+     ;; with the next committed step.
+     (boolean-control "arbitrationRetention"
+                      #'reality-state-arbitration-retention-p
+                      (lambda (state v)
+                        (unless v (clrhash (reality-state-arbitration-steps state)))
+                        (setf (reality-state-arbitration-retention-p state) v))
+                      nil)
+     (list "arbitrationWindow" "engine"
+           (lambda (state)
+             (control-json "arbitrationWindow" "engine"
+                           (reality-state-arbitration-window state)
+                           +arbitration-window-default+))
+           (lambda (state body)
+             (let ((v (jget body "value" :missing)))
+               (if (or (eq v :missing) (not (realp v)) (/= v (truncate v))
+                       (minusp v) (> v +arbitration-window-max+))
+                   (list :refused
+                         (format nil "arbitrationWindow requires a whole-number `value` in [0, ~d]"
+                                 +arbitration-window-max+)
+                         400)
+                   (set-arbitration-window state (truncate v)))))
+           (lambda (state)
+             (set-arbitration-window state +arbitration-window-default+)))
      (list "historyLimit" "engine"
            (lambda (state)
              (control-json "historyLimit" "engine"
@@ -3215,9 +3521,34 @@ on this surface."
      ;; was discarded" is the operational fact the domain bus exists to surface.
      ;; Wire shape matches the Scala, C++ and TS runtimes exactly; byte
      ;; equivalence is this contract's acceptance test.
-     (make-route "GET" "/api/arbitration" (lambda (_ body query)
-                                            (declare (ignore _ body query))
-                                            (state-json #'arbitration-json)))
+     ;;
+     ;; Retention keyed by step (RealityEngine_CI#296): with arbitrationRetention
+     ;; off this is the legacy object above; on, it is the list of retained
+     ;; steps in the window, and `?step=N` addresses one of them.
+     (make-route "GET" "/api/arbitration"
+                 (lambda (_ body query)
+                   (declare (ignore _ body))
+                   (let ((raw (and (hash-table-p* query) (gethash "step" query))))
+                     (if (null raw)
+                         (state-json (lambda (state)
+                                       (if (reality-state-arbitration-retention-p state)
+                                           (arbitration-window-json state)
+                                           (arbitration-json state))))
+                         (let ((n (and (plusp (length raw))
+                                       (every #'digit-char-p raw)
+                                       (parse-integer raw))))
+                           (if (null n)
+                               (error-response "step must be a non-negative integer" 400)
+                               (let ((result (actor-ask actor
+                                                        (lambda (state)
+                                                          (arbitration-step-read state n)))))
+                                 (if (and (consp result) (eq (first result) :refused))
+                                     (error-response (second result) (third result))
+                                     (json-response result)))))))))
+     ;; The Lamport clock (#296): instance UUID, Lamport value, newest step.
+     (make-route "GET" "/api/engine/clock" (lambda (_ body query)
+                                             (declare (ignore _ body query))
+                                             (state-json #'engine-clock-json)))
      ;; ── Perceptual simulation ─────────────────────────────────────────────────
      (make-route "POST" "/api/perceptual-simulation/step" (lambda (_ body query)
                                                             (declare (ignore _ body query))
