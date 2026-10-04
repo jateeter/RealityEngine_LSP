@@ -2319,8 +2319,9 @@ therefore answer true for a key that is not there."
   step)
 
 (defun osre-fold-cells (state step)
-  "Every cell of every mergeBatch output region in STEP, mapped to the writing
-machine's declared outputMergeTransformation (default \"or\"). Where several
+  "Every cell of every mergeBatch output region in STEP, mapped to
+(machine-name . declared outputMergeTransformation) of the writing machine
+(default \"or\"); the name goes into the fold's record (CI#525). Where several
 machines' outputs cover one cell, the first by machine NAME decides: ids are
 minted per runtime, so id order would differ between runtimes
 (ARBITER_CONTRACT.md section 4.4b)."
@@ -2339,15 +2340,16 @@ minted per runtime, so id order would differ between runtimes
                   for prior = (gethash c by-cell)
                   when (or (null prior) (string< name (car prior)))
                     do (setf (gethash c by-cell) (cons name transformation)))))))
-    (maphash (lambda (c entry) (setf (gethash c cells) (cdr entry))) by-cell)
+    (maphash (lambda (c entry) (setf (gethash c cells) entry)) by-cell)
     cells))
 
 (defun push-perception (state include-machine-results &key compact only)
   (let* ((engine (perception-state-engine state))
          ;; The push is the transition: record what this assembly resolved. A
          ;; read of /api/state assembles too, and must not count (section 4.4b).
-         (vector (prog1 (assemble-perception-vector engine)
-                   (record-source-contention engine)))
+         (vector (multiple-value-bind (assembled folds) (assemble-perception-vector engine)
+                   (record-source-contention engine folds)
+                   assembled))
          ;; Always ask the Reality Engine for the perceptual space and the
          ;; machine results. The PE needs both to compute the next input
          ;; vector, so what the caller wants *reported* must not decide what
@@ -3107,6 +3109,9 @@ startup — the PE still serves HTTP signals as a pure REST engine."
                         (make-mcp-dispatchers actor)))))
 
 (defun start-perception-from-environment ()
+  ;; The fold applies a cell's declared arbitration rule (ARBITER_CONTRACT.md
+  ;; section 4.4b, CI#525), so the PE loads the same registry the RE does.
+  (load-arbitration-registry (env "MACHINES_DIR" "../RealityEngine_Machines/machines"))
   (start-perception-service :port (env-int "PERCEPTION_ENGINE_PORT" 5600)
                             :reality-url (or (env "REALITY_ENGINE_URL" nil)
                                              (format nil "http://localhost:~a" (env-int "REALITY_ENGINE_PORT" 5601)))
