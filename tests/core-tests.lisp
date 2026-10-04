@@ -1309,6 +1309,93 @@ declared operator over [0..1] (ARBITER_CONTRACT.md section 4.4b)."
                    "reset clears the fold")))
   t)
 
+;; The fold on a declared cell (ARBITER_CONTRACT.md section 4.4b, amended
+;; 2026-10-04, RealityEngine_CI#525): the arbitration registry's rule governs, so
+;; under PRECEDENCE {acp:1, machine:3} a machine at 0 beats an agent at 1 -- the
+;; one pair where T_M ('or' = max) would let the generated value win. Every fold
+;; is recorded and counted; undeclared cells keep T_M.
+(defun fold-declared-rule-tests ()
+  (flet ((near (a b) (< (abs (- a b)) 1d-12))
+         (src (origin kind) (reality-engine-lsp::make-source :id "x" :kind kind :origin origin)))
+    (assert-equal "acp" (reality-engine-lsp::source-provider (src "acp.openclaw.target.assessment" "sensor"))
+                  "the first origin segment names the provider")
+    (assert-equal "acp" (reality-engine-lsp::source-provider (src "openclaw" "sensor")) "openclaw is acp")
+    (assert-equal "localai" (reality-engine-lsp::source-provider (src "ollama" "sensor")) "ollama is localai")
+    (assert-equal "localai" (reality-engine-lsp::source-provider (src "localai.x-mcp-y" "sensor"))
+                  "the first segment, never a substring")
+    (assert-equal "mqtt" (reality-engine-lsp::source-provider (src "mqtt" "sensor")) "mqtt is itself")
+    (assert-equal "sensor" (reality-engine-lsp::source-provider (src nil "sensor")) "no origin: by kind")
+    (assert-equal "synthetic" (reality-engine-lsp::source-provider (src "signal" "test")) "signal: by kind")
+    (assert-true (eq :generated (reality-engine-lsp::determinism-of
+                                 (reality-engine-lsp::source-provider (src "somesurface.x" "sensor"))))
+                 "an unregistered surface ranks as generated"))
+  (let ((saved (alexandria:copy-hash-table reality-engine-lsp::*arbitration-entries*)))
+    (unwind-protect
+         (flet ((near (a b) (< (abs (- a b)) 1d-12)))
+           (clrhash reality-engine-lsp::*arbitration-entries*)
+           (setf (gethash 50 reality-engine-lsp::*arbitration-entries*)
+                 (reality-engine-lsp::make-arbitration-entry
+                  :cell 50 :rule "PRECEDENCE"
+                  :provider-ranks (reality-engine-lsp::obj "acp" 1 "machine" 3))
+                 (gethash 52 reality-engine-lsp::*arbitration-entries*)
+                 (reality-engine-lsp::make-arbitration-entry
+                  :cell 52 :rule "PRECEDENCE"
+                  :provider-ranks (reality-engine-lsp::obj "acp" 3 "machine" 3)))
+           (let ((engine (reality-engine-lsp::make-perception-engine-state 64))
+                 (ps (make-list 64 :initial-element 0.0d0)))
+             ;; OSRE: the machine wrote 0 at 50 and 52, and 0.2 at 51.
+             (setf (nth 51 ps) 0.2d0)
+             (reality-engine-lsp::update-from-perceptual-space engine ps)
+             (reality-engine-lsp::ensure-source-id
+              engine (reality-engine-lsp::make-source
+                      :id "agent" :kind "test" :name "agent assessment" :active-p t
+                      :origin "acp.openclaw.target.assessment"
+                      :region (reality-engine-lsp::make-region :offset 50 :length 3)
+                      :inputs (list (list 1.0d0 1.0d0 1.0d0)) :loop-p t))
+             (let ((fold (reality-engine-lsp::perception-engine-osre-fold engine)))
+               (dolist (c '(50 51 52)) (setf (gethash c fold) (cons "Peer" "or"))))
+             (multiple-value-bind (v folds) (reality-engine-lsp::assemble-perception-vector engine)
+               (assert-true (near (nth 50 v) 0.0d0)
+                            "PRECEDENCE: the machine's 0 beats the agent's 1 (criterion 5a)")
+               (assert-true (near (nth 51 v) 1.0d0) "an undeclared cell keeps T_M: max(1, 0.2)")
+               (assert-true (near (nth 52 v) 1.0d0) "equal ranks fall back to T_M")
+               (assert-equal '(50 51 52) (mapcar (lambda (f) (reality-engine-lsp::jget f "cell")) folds)
+                             "every fold is recorded, ascending by cell")
+               (destructuring-bind (f50 f51 f52) folds
+                 (assert-equal "declared-rule" (reality-engine-lsp::jget f50 "resolution") "declared rule")
+                 (assert-equal "PRECEDENCE" (reality-engine-lsp::jget f50 "rule") "names the rule")
+                 (assert-equal "osre" (reality-engine-lsp::jget f50 "kept") "the OSRE side was kept")
+                 (assert-equal "acp" (reality-engine-lsp::jget (reality-engine-lsp::jget f50 "source") "provider")
+                               "the suppressed side is attributable to acp")
+                 (assert-equal "Peer" (reality-engine-lsp::jget (reality-engine-lsp::jget f50 "osre") "machine")
+                               "the OSRE side names its machine")
+                 (assert-equal "osre-fold" (reality-engine-lsp::jget f51 "resolution") "undeclared: T_M")
+                 (assert-equal "or" (reality-engine-lsp::jget f51 "operator") "names the operator")
+                 (assert-equal "source" (reality-engine-lsp::jget f51 "kept") "max took the source")
+                 (assert-equal "PRECEDENCE" (reality-engine-lsp::jget f52 "declaredRule")
+                               "a declared rule the fold could not apply is named"))
+               (reality-engine-lsp::record-source-contention engine folds)
+               (let* ((json (reality-engine-lsp::source-contention-json engine))
+                      (counter (aref (reality-engine-lsp::jget json "counters") 0)))
+                 (assert-equal 3 (length (reality-engine-lsp::jget json "folds")) "folds are served")
+                 (assert-equal 1 (reality-engine-lsp::jget counter "contended") "one contended transition")
+                 (assert-equal 1 (reality-engine-lsp::jget counter "suppressed") "suppressed at cell 50")))
+             (multiple-value-bind (v folds) (reality-engine-lsp::assemble-perception-vector engine)
+               (declare (ignore v))
+               (assert-equal 3 (length folds) "a read assembles the folds again...")
+               (assert-equal 1 (reality-engine-lsp::jget
+                                (aref (reality-engine-lsp::jget (reality-engine-lsp::source-contention-json engine)
+                                                                "counters") 0)
+                                "contended")
+                             "...but only a push records and counts them"))
+             (reality-engine-lsp::reset-perception-engine engine)
+             (assert-equal 0 (length (reality-engine-lsp::jget (reality-engine-lsp::source-contention-json engine)
+                                                              "folds"))
+                           "reset clears the folds")))
+      (clrhash reality-engine-lsp::*arbitration-entries*)
+      (maphash (lambda (k v) (setf (gethash k reality-engine-lsp::*arbitration-entries*) v)) saved)))
+  t)
+
 ;; Arbitration retention keyed by step, under the Lamport clock
 ;; (RealityEngine_CI#296). Each of n = 0, 1, 2 proves something the others
 ;; cannot: 0 is an empty list, not "latest only"; 1 is a list of one, not the
@@ -3298,6 +3385,7 @@ print('locked', flush=True); time.sleep(60)"
   (live-inputs-win-over-seed-tests)
   (stt-incumbent-source-tests)
   (osre-fold-operator-tests)
+  (fold-declared-rule-tests)
 
   ;; The cesgen oracle set — see tests/oracle-parity-tests.lisp. Runs last:
   ;; it walks the whole corpus and is by far the slowest check here.

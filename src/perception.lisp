@@ -21,11 +21,15 @@
   ;; assembly, the transition it was recorded at, and per-source counters
   ;; (id -> (contended . suppressed)).
   (last-contention nil)
+  ;; Source-vs-OSRE folds of the last push assembly (section 4.4b, CI#525).
+  (last-folds nil)
   (contention-transition 0)
   (contention-counters (make-hash-table :test #'equal))
-  ;; The OSRE cells of the last push: cell -> the declared
-  ;; outputMergeTransformation of the machine whose output wrote it (section
-  ;; 4.4b). A source on one is folded with the OSRE value by that operator.
+  ;; The OSRE cells of the last push: cell -> (machine-name . declared
+  ;; outputMergeTransformation) of the machine whose output wrote it (section
+  ;; 4.4b). A source on one is folded with the OSRE value: by the cell's
+  ;; declared arbitration rule where the registry declares one, else by that
+  ;; operator. A bare operator string (no machine name) is accepted too.
   (osre-fold (make-hash-table)))
 
 (defun fold-unit-interval (transformation s o)
@@ -41,6 +45,68 @@ first-order form would collapse. Unknown names fold as the default, `or'."
           ((string= transformation "nor") (- 1.0d0 (max s o)))
           ((string= transformation "nand") (- 1.0d0 (min s o)))
           (t (max s o)))))
+
+;;; ── The provider of a source (ARBITER_CONTRACT.md section 4.4b, CI#525) ────────
+
+;; Surface names an integration writes as its origin, mapped to the provider
+;; they are: an OpenClaw completion is ACP, an Ollama or localAIStack value is
+;; localAI.
+(defparameter +origin-provider-aliases+
+  '(("openclaw" . "acp") ("ollama" . "localai") ("localaistack" . "localai")))
+
+(defun source-provider (source)
+  "The contract provider of SOURCE (ARBITER_CONTRACT.md section 4.4b, CI#525).
+The first `.' segment of its origin, lowercased and mapped through the surface
+aliases (openclaw -> acp, ollama/localaistack -> localai); an empty origin or
+the generic `signal' falls back to kind -- test and simulated -> synthetic,
+anything else -> sensor. A provider no registry names ranks as generated
+(DETERMINISM-OF), so an unknown surface can never outrank a reading. The first
+segment, never a substring: a substring match lets `localai.x-mcp-y' classify
+as mcp."
+  (let* ((origin (string-downcase (or (source-origin source) "")))
+         (head (subseq origin 0 (or (position #\. origin) (length origin))))
+         (alias (cdr (assoc head +origin-provider-aliases+ :test #'string=))))
+    (cond ((or (string= head "") (string= head "signal"))
+           (if (member (source-kind source) '("test" "simulated") :test #'equal) "synthetic" "sensor"))
+          (t (or alias head)))))
+
+(defun fold-provider-rank (provider entry)
+  "PROVIDER's rank under ENTRY: its declared providerRanks value, else its
+determinism class -- the arbiter's own ranking (%provider-rank)."
+  (let ((declared (and entry (arbitration-entry-provider-ranks entry)
+                       (jget (arbitration-entry-provider-ranks entry) provider))))
+    (if (numberp declared) declared (determinism-rank (determinism-of provider)))))
+
+(defun fold-source-osre (cell source s machine transformation o)
+  "Fold source value S against OSRE value O on CELL (section 4.4b). Returns
+(values resolved record). A declared PRECEDENCE takes the higher-ranked
+provider's value whole -- a deterministic machine beats a generated source at
+any value (criterion 5a); every other case folds by the machine's operator."
+  (let* ((s (coerce s 'double-float)) (o (coerce o 'double-float))
+         (entry (arbitration-entry-for cell))
+         (rule (and entry (arbitration-entry-rule entry)))
+         (provider (source-provider source))
+         (osre-rank (and entry (fold-provider-rank "machine" entry)))
+         (source-rank (and entry (fold-provider-rank provider entry)))
+         (by-rule (and (equal rule "PRECEDENCE") (/= osre-rank source-rank)))
+         (resolved (cond (by-rule (if (> osre-rank source-rank) o s))
+                         (t (fold-unit-interval transformation s o))))
+         (kept (cond (by-rule (if (> osre-rank source-rank) "osre" "source"))
+                     ((and (= resolved o) (= resolved s)) "both")
+                     ((= resolved o) "osre")
+                     ((= resolved s) "source")
+                     (t "combined")))
+         (record (if by-rule
+                     (obj "cell" cell "resolution" "declared-rule" "rule" rule)
+                     (let ((r (obj "cell" cell "resolution" "osre-fold" "operator" transformation)))
+                       (when rule (setf (jget r "declaredRule") rule))
+                       r))))
+    (setf (jget record "osre") (obj "machine" (or machine "") "provider" "machine" "value" o)
+          (jget record "source") (obj "id" (or (source-id source) "") "name" (or (source-name source) "")
+                                      "kind" (or (source-kind source) "") "provider" provider "value" s)
+          (jget record "resolved") resolved
+          (jget record "kept") kept)
+    (values resolved record)))
 
 (defvar *perception-transition* 0
   "The engine's global step, readable where a source's activity changes.
@@ -203,6 +269,7 @@ and the auto interval to 1000ms as a side effect of rebuilding the struct."
   ;; A reset is a boot for the run: contention records and counters start
   ;; over, and every source is re-stamped to instant 0 below (section 4.4b).
   (setf (perception-engine-last-contention engine) nil
+        (perception-engine-last-folds engine) nil
         (perception-engine-contention-transition engine) 0)
   (clrhash (perception-engine-contention-counters engine))
   ;; No push since the reset, so no OSRE term to fold with.
@@ -549,14 +616,23 @@ of (CELL RESOLUTION WINNER SUPPRESSED) with SUPPRESSED in canonical order."
                writers)
       (sort cells #'< :key #'first))))
 
-(defun record-source-contention (engine)
-  "Record the contention of the assembly a push sends, and count it.  Push path only."
+(defun record-source-contention (engine &optional folds)
+  "Record the contention of the assembly a push sends, and count it: the
+source-vs-source cells, and FOLDS, the Source-vs-OSRE folds that assembly
+returned (section 4.4b, CI#525). Push path only."
   (let ((cells (source-contention engine))
         (contended (make-hash-table :test #'equal))
         (lost (make-hash-table :test #'equal))
         (counters (perception-engine-contention-counters engine)))
     (setf (perception-engine-last-contention engine) cells
+          (perception-engine-last-folds engine) folds
           (perception-engine-contention-transition engine) (perception-engine-global-step engine))
+    ;; A fold counts toward its source's `contended', and toward `suppressed'
+    ;; when the OSRE side was kept.
+    (dolist (f folds)
+      (let ((id (jget (jget f "source") "id")))
+        (setf (gethash id contended) t)
+        (when (equal (jget f "kept") "osre") (setf (gethash id lost) t))))
     (dolist (c cells)
       (setf (gethash (source-id (third c)) contended) t)
       (dolist (l (fourth c))
@@ -588,6 +664,7 @@ of (CELL RESOLUTION WINNER SUPPRESSED) with SUPPRESSED in canonical order."
                                  "winner" (source-ref-json (third c))
                                  "suppressed" (vectorize (mapcar #'source-ref-json (fourth c)))))
                           (perception-engine-last-contention engine)))
+         "folds" (vectorize (perception-engine-last-folds engine))
          "counters" (vectorize
                      (loop for source in (sources-in-canonical-order engine)
                            for counter = (gethash (source-id source) counters)
@@ -690,7 +767,11 @@ our dimension — grow to match rather than truncating to it."
                                           :initial-element 0.0d0))
          ;; Which cells a source wrote this instant: only those are folded
          ;; with the OSRE term; a cell only the OSRE holds keeps its value.
-         (source-wrote (make-array dimension :element-type 'bit :initial-element 0)))
+         (source-wrote (make-array dimension :element-type 'bit :initial-element 0))
+         ;; The source each cell's value came from -- the last writer, which the
+         ;; composition order makes the source contention resolved to.
+         (writer (make-array dimension :initial-element nil))
+         (folds '()))
     (when pv
       (loop for i from 0 below (min dimension (length pv))
             do (setf (aref assembled i) (elt pv i))))
@@ -744,15 +825,24 @@ our dimension — grow to match rather than truncating to it."
                  repeat length
                  when (and (>= i 0) (< i dimension))
                    do (setf (aref assembled i) (clamp-cell value)
-                            (sbit source-wrote i) 1))))))
-    ;; A source on an OSRE cell is folded with the OSRE value by the writing
-    ;; machine's operator rather than replacing it (section 4.4b).
-    (maphash (lambda (cell transformation)
+                            (sbit source-wrote i) 1
+                            (svref writer i) source))))))
+    ;; A source on an OSRE cell is folded with the OSRE value rather than
+    ;; replacing it: by the cell's declared arbitration rule where the registry
+    ;; declares one, else by the writing machine's operator (section 4.4b,
+    ;; CI#525). Every fold is returned as a record; only a push records it.
+    (maphash (lambda (cell entry)
                (when (and (>= cell 0) (< cell dimension) (= 1 (sbit source-wrote cell)) pv (< cell (length pv)))
-                 (setf (aref assembled cell)
-                       (clamp-cell (fold-unit-interval transformation (aref assembled cell) (elt pv cell))))))
+                 (multiple-value-bind (resolved record)
+                     (fold-source-osre cell (svref writer cell) (aref assembled cell)
+                                       (if (consp entry) (car entry) "")
+                                       (if (consp entry) (cdr entry) entry)
+                                       (elt pv cell))
+                   (setf (aref assembled cell) (clamp-cell resolved))
+                   (push record folds))))
              (perception-engine-osre-fold engine))
-    (coerce assembled 'list)))
+    (values (coerce assembled 'list)
+            (sort folds #'< :key (lambda (r) (jget r "cell"))))))
 
 (defun perception-state-json (engine)
   (obj "perceptionDimension" (perception-engine-dimension engine)
