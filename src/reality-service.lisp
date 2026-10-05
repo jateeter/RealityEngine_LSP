@@ -63,6 +63,17 @@
   (arbitration-retention-p nil)
   (arbitration-window +arbitration-window-default+)
   (arbitration-steps (make-hash-table :test #'eql))
+  ;; Step phase timing (SURFACE_SPEC.md, "phaseDetail"): the five universal step
+  ;; phases, each the span between two declared boundaries (B0 step start, B1
+  ;; ISRE captured, B2 every composer joined, B3 OSRE resolved, B4 pair
+  ;; committed, B5 completion published), accumulated in seconds over the steps
+  ;; measured while PHASE-DETAIL-P is on. STEP-PHASE-ACTIVE-P is decided at B0 so
+  ;; a toggle mid-step cannot split one step's phases.
+  (phase-detail-p nil)
+  (step-phase-seconds (make-array 5 :element-type 'double-float :initial-element 0d0))
+  (step-detail-steps 0)
+  (step-phase-active-p nil)
+  (step-phase-mark 0)
   ;; The Lamport clock (RealityEngine_CI#296): this instance's UUID and a
   ;; counter that ticks once per committed step and is NEVER reset, so
   ;; (instance, lamport) names one step uniquely. The step count beside it is
@@ -601,6 +612,26 @@ schema does not declare — isActive, state, wasJustMatched — which
 
 ;; Dense vector -> sparse trajectory entry. A cell absent from `nonZero` is
 ;; zero; `length` keeps the dense width so the reconstruction is exact.
+(defun begin-step-phases (state)
+  "B0: the step starts. Measured only while phaseDetail is on."
+  (setf (reality-state-step-phase-active-p state) (reality-state-phase-detail-p state))
+  (when (reality-state-step-phase-active-p state)
+    (setf (reality-state-step-phase-mark state) (get-internal-real-time))))
+
+(defun tick-step-phase (state phase)
+  "Close universal step phase PHASE (0-4) at the boundary just crossed."
+  (when (reality-state-step-phase-active-p state)
+    (let ((now (get-internal-real-time)))
+      (incf (aref (reality-state-step-phase-seconds state) phase)
+            (/ (coerce (- now (reality-state-step-phase-mark state)) 'double-float)
+               internal-time-units-per-second))
+      (setf (reality-state-step-phase-mark state) now))))
+
+(defun end-step-phases (state)
+  (when (reality-state-step-phase-active-p state)
+    (incf (reality-state-step-detail-steps state))
+    (setf (reality-state-step-phase-active-p state) nil)))
+
 (defun sparse-trajectory (step-number dense)
   ;; MAP NIL rather than DOLIST: DENSE is the perceptual space, now a vector.
   (let ((cells nil)
@@ -1097,6 +1128,21 @@ runtime=runtime-tag so a single scrape target identifies the source runtime."
                        "Seconds since the coverage registry was instantiated." "gauge")
             (emit "ces_registry_uptime_seconds" base
                   (format nil "~,3f" (/ uptime-ms 1000.0))))
+
+          ;; Step phase timing (SURFACE_SPEC.md, "phaseDetail"): the five
+          ;; universal phases, absent while the gate is off; the gauge always.
+          (when (reality-state-phase-detail-p state)
+            (emit-help "re_step_phase_seconds_total"
+                       "Wall-clock seconds per step phase, summed over measured steps." "counter")
+            (loop for name in '("step.isre_capture" "step.compose" "step.resolve" "step.commit" "step.publish")
+                  for k from 0
+                  do (emit "re_step_phase_seconds_total" (append base (list (cons "phase" name)))
+                           (format nil "~,9f" (aref (reality-state-step-phase-seconds state) k))))
+            (emit-help "re_step_phase_detail_steps_total"
+                       "Steps the universal step phases were measured over." "counter")
+            (emit "re_step_phase_detail_steps_total" base (reality-state-step-detail-steps state)))
+          (emit-help "re_step_phase_detail" "Whether step phase timing (phaseDetail) is on." "gauge")
+          (emit "re_step_phase_detail" base (if (reality-state-phase-detail-p state) 1 0))
 
           ;; re_runtime_* gauges — same shape as AI/CPP for cross-runtime
           ;; vector-space + mapping monitoring.
@@ -1672,6 +1718,7 @@ always treated presence as activation; this runtime is the one that differed."
   ;; perceptualSpace unconditional in the push response. Kept in the lambda list
   ;; so existing callers (and RE_INCLUDE_PERCEPTUAL_SPACE) do not become errors.
   (declare (ignore include-perceptual-space))
+  (begin-step-phases state)                                 ; B0
   (ensure-space-length state (max (reality-state-dimension state) (length input)))
   ;; Seed the space from INPUT in place and zero the tail, rather than
   ;; rebuilding it with append + make-list, which allocated a fresh
@@ -1717,7 +1764,9 @@ always treated presence as activation; this runtime is the one that differed."
     ;; OSRE(n) resolved atomically. This loop used to compose machine after
     ;; machine in the actor thread: the order was canonical but nothing ran in
     ;; parallel, and the join the contract requires did not exist.
+    (tick-step-phase state 0)                               ; B1: ISRE captured
     (let ((composed (compose-machines state override)))
+    (tick-step-phase state 1)                               ; B2: every composer joined
     (dolist (machine (object-values-sorted (reality-state-machines state)))
       (let ((id (machine-id machine)))
        (when (machine-mapping machine)
@@ -1928,6 +1977,7 @@ always treated presence as activation; this runtime is the one that differed."
                           "nonZero" (vectorize (sort (nreverse cells) #'<
                                                      :key (lambda (c) (jnumber c "index" 0)))))))
         (setf (reality-state-arbitration state) records)))
+    (tick-step-phase state 2)                               ; B3: OSRE resolved
     (let* ((event-bus (apply-event-bus state contributions))
            (step-number (reality-state-step-count state))
            ;; No "success" inside the step. Every caller already wraps this as
@@ -2048,8 +2098,11 @@ always treated presence as activation; this runtime is the one that differed."
       ;; for step n finds n's arbitration records already there (#296).
       (retain-arbitration state (jnumber isre "stepNumber" 0) (tick-lamport state)
                           (reality-state-arbitration state))
+      (tick-step-phase state 3)                             ; B4: pair committed
       ;; The pair is committed: the step's completion point (#375).
       (signal-step-completed state (jnumber isre "stepNumber" 0))
+      (tick-step-phase state 4)                             ; B5: completion published
+      (end-step-phases state)
       (record-history state step)
       step)))
 
@@ -2503,6 +2556,11 @@ step's number (-1 before the first step since boot or reset)."
              (setf (reality-state-history-limit state) 250)
              (control-json "historyLimit" "engine"
                            (reality-state-history-limit state) 250)))
+     ;; Step phase timing on every runtime (SURFACE_SPEC.md, "phaseDetail").
+     (boolean-control "phaseDetail"
+                      #'reality-state-phase-detail-p
+                      (lambda (state v) (setf (reality-state-phase-detail-p state) v))
+                      nil)
      (boolean-control "includeActiveRegions"
                       #'reality-state-include-active-regions-p
                       (lambda (state v) (setf (reality-state-include-active-regions-p state) v))
