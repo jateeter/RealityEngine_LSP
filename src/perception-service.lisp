@@ -143,6 +143,36 @@ the whole set sorted by key, per the contract."
                                  (list (cons "rag" k)) (gethash k *semantic-escalations* 0)) out))
     (get-output-stream-string out)))
 
+;; MQTT bridge block, PE_METRICS_CONTRACT.md "MQTT bridge": the names, HELP
+;; text and order the TypeScript PE emits, so the Semantic Guardrails MQTT
+;; panels read every runtime (RealityEngine_LSP#162). A disabled bridge emits
+;; the two gauges at 0 and no counters, as there.
+(defun mqtt-metrics-text (bridge)
+  (with-output-to-string (out)
+    (flet ((line (name help kind value)
+             (write-string (metric-line name help kind nil value) out)))
+      (if (null bridge)
+          (progn
+            (line "mqtt_bridge_enabled" "MQTT bridge is configured (1) or disabled (0)." "gauge" 0)
+            (line "mqtt_bridge_connected" "MQTT bridge is currently connected to the broker (1/0)." "gauge" 0))
+          (let ((stats (mqtt-bridge-stats-snapshot bridge)))
+            (flet ((stat (key) (or (cdr (assoc key stats :test #'string=)) 0)))
+              (line "mqtt_bridge_enabled" "MQTT bridge is configured (1) or disabled (0)." "gauge" 1)
+              (line "mqtt_bridge_connected" "MQTT bridge is currently connected to the broker (1/0)." "gauge"
+                    (if (mqtt-bridge-connected-p bridge) 1 0))
+              (line "mqtt_messages_received_total" "Total MQTT PUBLISH messages received." "counter"
+                    (stat "messagesReceived"))
+              (line "mqtt_messages_mapped_total" "Total messages successfully mapped to a region." "counter"
+                    (stat "messagesMapped"))
+              (line "mqtt_messages_rejected_total" "Total messages rejected by mapping/normalize." "counter"
+                    (stat "messagesRejected"))
+              (line "mqtt_messages_unmatched_total" "Total messages whose topic matched no rule." "counter"
+                    (stat "messagesUnmatched"))
+              (line "mqtt_pushes_triggered_total" "Total perceive pushes triggered by MQTT ingest." "counter"
+                    (stat "pushesTriggered"))
+              (line "mqtt_mappings_loaded" "Number of mapping rules in the registry." "gauge"
+                    (length (mqtt-mapping-registry-rules (mqtt-bridge-registry bridge))))))))))
+
 (defstruct perception-state
   engine reality-url localai-url localai-machine-dir push-records started-at
   integrations-config-path integrations-loaded-p integrations-load-error integrations source-mappings
@@ -2476,6 +2506,7 @@ minted per runtime, so id order would differ between runtimes
                                        (actor-ask actor
                                                   (lambda (state)
                                                     (let ((engine (perception-state-engine state)))
+                                                     (concatenate 'string
                                                       (semantic-metrics-text
                                                        (hash-table-count (perception-engine-sources engine))
                                                        (or (perception-engine-global-step engine) 0)
@@ -2489,7 +2520,9 @@ minted per runtime, so id order would differ between runtimes
                                                        (let ((lp (perception-engine-last-push engine)))
                                                          (if (jobject-p lp)
                                                              (or (jnumber lp "timestamp" 0) 0)
-                                                             0)))))))))
+                                                             0)))
+                                                      (mqtt-metrics-text
+                                                       (perception-state-mqtt-bridge state)))))))))
    (make-route "GET" "/api/integrations/status" (lambda (_ body query)
                                                   (declare (ignore _ body query))
                                                   (json-response (actor-ask actor #'integrations-status-json))))
