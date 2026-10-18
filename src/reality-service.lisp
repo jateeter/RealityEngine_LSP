@@ -3207,7 +3207,15 @@ step's number (-1 before the first step since boot or reset)."
      (make-route "POST" "/api/machines" (lambda (_ body query)
                                           (declare (ignore _ query))
                                           (state-json (lambda (state)
-                                                        (let* ((machine (machine-from-json body))
+                                                        ;; A declared id is kept only when no resident machine holds
+                                                        ;; it (SURFACE_SPEC, "POST /api/machines keeps a declared id";
+                                                        ;; owner decision 2026-10-18). Reusing a held one made PUT-MACHINE
+                                                        ;; replace the resident machine with the versioned copy, which the
+                                                        ;; route promises never to do; a held id is minted instead.
+                                                        (let* ((root (if (jobject-p (jget body "machine")) (jget body "machine") body))
+                                                               (declared (jstring root "id" nil))
+                                                               (held (and declared (gethash declared (reality-state-machines state))))
+                                                               (machine (machine-from-json body (when held (make-id "machine"))))
                                                                (versioned (version-on-conflict state machine)))
                                                           (put-machine state machine)
                                                           (obj "success" t
