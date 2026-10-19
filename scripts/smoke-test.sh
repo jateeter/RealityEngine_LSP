@@ -125,6 +125,26 @@ SOURCE_BODY='{"name":"smoke","type":"test","active":true,"region":{"offset":0,"l
 SIGNAL_BODY='{"type":"test","payload":{}}'
 PUSH_BODY='{"sources":[]}'
 
+# An SSE stream must actually stream: the ": connected" comment, terminated by
+# a blank line, within two seconds. These checks used to count a pass for any
+# connection, so a stream that answered 200 and then sent nothing passed for as
+# long as it had been broken (the handlers wrote text to Hunchentoot's binary
+# stream and sent "nn" for "\n\n"; RealityEngine release install, 2026-10-18).
+sse_check() {
+  local base="$1" path="$2" body
+  # The trailing "x" keeps $(...) from stripping the blank line being checked.
+  body="$({ curl -sN --max-time 2 "${base}${path}" 2>/dev/null | head -c 64; } || true; printf x)"
+  body="${body%x}"
+  # SSE ends a line with LF or CRLF; either is a terminated comment.
+  if [[ "$body" == $': connected\n\n'* || "$body" == $': connected\r\n\r\n'* ]]; then
+    echo "  ✓ GET ${path} streams (: connected)"
+    PASS=$((PASS + 1))
+  else
+    echo "  ✗ GET ${path} sent no terminated ': connected' preamble (got $(printf '%q' "${body:0:40}"))"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 if [[ "$SKIP_RE" == "0" ]]; then
   echo ""
   echo "━━━ Reality Engine  $RE_URL ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -218,12 +238,8 @@ if [[ "$SKIP_RE" == "0" ]]; then
   check GET "$RE_URL" "/api/demo/data-center"
   check GET "$RE_URL" "/api/demo/kleene-star"
 
-  echo "── SSE stream (HEAD only — no full consume)"
-  curl -s --max-time 2 -o /dev/null -w "" "${RE_URL}/api/engine/stream" &
-  SSE_PID=$!
-  sleep 1
-  kill $SSE_PID 2>/dev/null || true
-  PASS=$((PASS + 1))
+  echo "── SSE stream"
+  sse_check "$RE_URL" "/api/engine/stream"
 fi
 
 if [[ "$SKIP_PE" == "0" ]]; then
@@ -288,12 +304,8 @@ if [[ "$SKIP_PE" == "0" ]]; then
   check GET "$PE_URL" "/api/mqtt/mappings"
   check PUT "$PE_URL" "/api/mqtt/mappings" '{"defaults":{},"mappings":[]}'
 
-  echo "── Streaming (connection check only)"
-  curl -s --max-time 2 -o /dev/null -w "" "${PE_URL}/api/events" &
-  SSE2_PID=$!
-  sleep 1
-  kill $SSE2_PID 2>/dev/null || true
-  PASS=$((PASS + 1))
+  echo "── SSE stream"
+  sse_check "$PE_URL" "/api/events"
 fi
 
 echo ""
