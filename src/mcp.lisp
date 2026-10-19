@@ -769,10 +769,11 @@
            (stream (progn
                      (setf (hunchentoot:content-type*) "text/event-stream; charset=utf-8")
                      (setf (hunchentoot:header-out "Cache-Control") "no-cache")
-                     (hunchentoot:send-headers))))
+                     ;; Text over Hunchentoot's binary stream (see sse-text-stream, ws.lisp).
+                     (flexi-streams:make-flexi-stream (hunchentoot:send-headers) :external-format :utf-8))))
       (handler-case
           (progn
-            (write-string ": connected\n\n" stream)
+            (format stream ": connected~%~%")
             (force-output stream)
             (loop
               (let ((ev (mcp-dequeue-notification session 15)))
@@ -780,7 +781,7 @@
                     (progn
                       (if ev
                           (format stream "data: ~a~%~%" (json-stringify ev))
-                          (write-string ": keepalive\n\n" stream))
+                          (format stream ": keepalive~%~%"))
                       (force-output stream))
                   (error () (return))))))
         (error () nil))

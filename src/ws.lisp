@@ -46,6 +46,17 @@ Returns nil on timeout (caller should send a keepalive comment)."
         (setf (sse-client-queue client) (rest (sse-client-queue client)))
         ev))))
 
+;;; hunchentoot:send-headers returns a BINARY stream. The SSE handlers wrote
+;;; text to it, which signals an error; the handlers' handler-case caught it and
+;;; ended the response, so every client saw 200 text/event-stream and then not
+;;; one byte: not the ": connected" preamble, no keepalive, no event (found by
+;;; the RealityEngine release install, 2026-10-18, on GET /api/engine/stream).
+;;; Write through a UTF-8 character stream over it instead. And terminate lines
+;;; with ~% from FORMAT: a Lisp string has no \n escape, so the old
+;;; ": connected\n\n" sent the letters "nn" and never ended an SSE comment.
+(defun sse-text-stream (binary-stream)
+  (flexi-streams:make-flexi-stream binary-stream :external-format :utf-8))
+
 (defun sse-events-handler ()
   "Hunchentoot handler for GET /api/events — SSE stream to the client.
 Each event is sent as 'data: <json>\\n\\n'.  Keepalive comments are sent
@@ -57,12 +68,12 @@ every 15 s so proxies do not close idle connections."
   (setf (hunchentoot:header-out "Cache-Control") "no-cache")
   (setf (hunchentoot:header-out "X-Accel-Buffering") "no")
   (setf (hunchentoot:header-out "Access-Control-Allow-Origin") "*")
-  (let* ((stream (hunchentoot:send-headers))
+  (let* ((stream (sse-text-stream (hunchentoot:send-headers)))
          (client (make-sse-client)))
     (register-sse-client client)
     (handler-case
         (progn
-          (write-string ": connected\n\n" stream)
+          (format stream ": connected~%~%")
           (force-output stream)
           (loop
             (let ((ev (client-dequeue client 15)))
@@ -70,7 +81,7 @@ every 15 s so proxies do not close idle connections."
                   (progn
                     (if ev
                         (format stream "data: ~a~%~%" (json-stringify ev))
-                        (write-string ": keepalive\n\n" stream))
+                        (format stream ": keepalive~%~%"))
                     (force-output stream))
                 (error () (return))))))
       (error () nil))
@@ -112,12 +123,12 @@ every 15 s so proxies do not close idle connections."
   (setf (hunchentoot:header-out "Cache-Control") "no-cache")
   (setf (hunchentoot:header-out "X-Accel-Buffering") "no")
   (setf (hunchentoot:header-out "Access-Control-Allow-Origin") "*")
-  (let* ((stream (hunchentoot:send-headers))
+  (let* ((stream (sse-text-stream (hunchentoot:send-headers)))
          (client (make-sse-client)))
     (re-register-sse-client client)
     (handler-case
         (progn
-          (write-string ": connected\n\n" stream)
+          (format stream ": connected~%~%")
           (force-output stream)
           (loop
             (let ((ev (client-dequeue client 15)))
@@ -125,7 +136,7 @@ every 15 s so proxies do not close idle connections."
                   (progn
                     (if ev
                         (format stream "data: ~a~%~%" (json-stringify ev))
-                        (write-string ": keepalive\n\n" stream))
+                        (format stream ": keepalive~%~%"))
                     (force-output stream))
                 (error () (return))))))
       (error () nil))

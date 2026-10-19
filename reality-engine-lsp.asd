@@ -18,6 +18,8 @@
                #:sb-posix
                #:cl-base64
                #:hunchentoot
+               ;; The SSE handlers' UTF-8 text stream over Hunchentoot's binary one.
+               #:flexi-streams
                #:drakma
                #:usocket
                #:yason)
