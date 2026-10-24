@@ -1478,6 +1478,28 @@ dispatch_triggers and TS Dispatcher.onStep: drop ops without governance
                                              "items" (obj "type" "number")))
              "required" (arr "values")))))
 
+(defun completion-contract-prompt (mapping)
+  "For a model Ollama will not constrain with `format`: the keys that
+COMPLETION-SCHEMA-FOR-MAPPING would require, as plain words plus an example
+shape, appended to the system prompt.  Built from the mapping's pointers in
+declaration order so the text is byte-identical in the C++, Scala and
+TypeScript PEs (RealityEngine_CI docs/OLLAMA_INTEGRATION.md, \"Structured
+output\"): the same model must see the same prompt from every engine."
+  (let* ((extract (and mapping (jget mapping "extract")))
+         (pointers (cond
+                     ((and (jobject-p extract) (jarray-present-p extract "pointers"))
+                      (jarray-list (jget extract "pointers")))
+                     ((and (jobject-p extract) (jstring extract "pointer" nil))
+                      (list (jstring extract "pointer")))
+                     (t nil)))
+         (keys (remove-duplicates (mapcar #'json-pointer-top-level-key pointers)
+                                  :test #'string= :from-end t))
+         (lead (format nil "~%~%Respond with ONLY one JSON object, with no prose and no markdown fences, that has exactly ")))
+    (if (null keys)
+        (concatenate 'string lead "this key, an array of numbers: values. For example: {\"values\": [0]}")
+        (format nil "~athese keys, each a number or boolean: ~{~a~^, ~}. For example: {~{\"~a\": 0~^, ~}}"
+                lead keys keys))))
+
 (defun openai-text-format-for-mapping (mapping)
   (obj "format" (obj "type" "json_schema"
                      "name" "reality_engine_completion"
@@ -2037,11 +2059,17 @@ PEs: all engines must send or omit `format` identically for a model
                (mapping-id (or (jstring body "sourceMappingId" nil)
                                (perception-state-ollama-completion-source-mapping-id state)))
                (mapping (and mapping-id (source-mapping-by-id state mapping-id)))
+               (supports-structured (ollama-model-supports-structured-output-p model))
+               (send-format (and mapping (jbool body "formatJson" supports-structured)))
                (payload (obj "model" model
                              "stream" +json-false+
                              "messages" (vectorize
                                          (list (obj "role" "system"
-                                                    "content" "Return concise JSON. If committing a PE completion, include numeric values.")
+                                                    "content" (concatenate
+                                                               'string
+                                                               "Return concise JSON. If committing a PE completion, include numeric values."
+                                                               ;; No `format` to constrain the reply: say what it must contain.
+                                                               (if send-format "" (completion-contract-prompt mapping))))
                                                (obj "role" "user"
                                                     "content" (dispatch-record-prompt record))))))
                (response nil)
@@ -2050,9 +2078,13 @@ PEs: all engines must send or omit `format` identically for a model
                (completion +json-null+))
           (when (and mapping-id (not mapping))
             (error "Unknown sourceMappingId \"~a\"" mapping-id))
-          (when (and mapping
-                     (jbool body "formatJson" (ollama-model-supports-structured-output-p model)))
+          (when send-format
             (setf (jget payload "format") (completion-schema-for-mapping mapping)))
+          ;; Reasoning adds nothing to filling in named fields and made replies
+          ;; slower and less reliable on the models that cannot take `format`
+          ;; (nemotron-3-nano: 8/8 valid at 0.4 s with thinking off, 6/8 at 2-8 s on).
+          (unless supports-structured
+            (setf (jget payload "think") +json-false+))
           (setf response (http-request-json (format nil "~a/api/chat" (perception-state-ollama-base-url state))
                                             :method :post
                                             :payload payload))
