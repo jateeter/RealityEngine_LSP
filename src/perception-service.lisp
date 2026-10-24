@@ -2015,6 +2015,17 @@ it is accepted as an alternative to the body bridgeToken/token fields."
 (defun dispatch-record-prompt (record)
   (json-stringify (or (jget record "envelope") record)))
 
+(defparameter *ollama-no-structured-output-models* '("nemotron-3-nano")
+  "Model families Ollama refuses `format` for (\"structured output is
+unavailable\").  The same list and rule are in the C++, Scala and TypeScript
+PEs: all engines must send or omit `format` identically for a model
+(RealityEngine_CI docs/OLLAMA_INTEGRATION.md, \"Structured output\").")
+
+(defun ollama-model-supports-structured-output-p (model)
+  (let* ((colon (position #\: model))
+         (family (if colon (subseq model 0 colon) model)))
+    (not (member family *ollama-no-structured-output-models* :test #'string=))))
+
 (defun dispatch-ollama (state body)
   (let* ((id (or (jstring body "dispatchId" nil) (jstring body "id" nil)))
          (record (and id (lookup-dispatch-record state id))))
@@ -2039,7 +2050,8 @@ it is accepted as an alternative to the body bridgeToken/token fields."
                (completion +json-null+))
           (when (and mapping-id (not mapping))
             (error "Unknown sourceMappingId \"~a\"" mapping-id))
-          (when mapping
+          (when (and mapping
+                     (jbool body "formatJson" (ollama-model-supports-structured-output-p model)))
             (setf (jget payload "format") (completion-schema-for-mapping mapping)))
           (setf response (http-request-json (format nil "~a/api/chat" (perception-state-ollama-base-url state))
                                             :method :post
