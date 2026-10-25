@@ -2507,6 +2507,90 @@ minted per runtime, so id order would differ between runtimes
       (error (condition)
         (obj "success" +json-false+ "error" (princ-to-string condition) "timestamp" (now-ms))))))
 
+;;; ── Auto-push (POST /api/auto/start, /api/auto/stop) ─────────────────────────
+;;;
+;;; While auto.running is true the PE pushes every intervalMs through the same
+;;; path as POST /api/push, as the C++ and Scala PEs do: wait one interval, push
+;;; with machine results, repeat (C++ start_auto → do_push(true, false)).
+;;;
+;;; Until RealityEngine_LSP#173 the routes only set the flag. GET /api/state
+;;; reported running: true and nothing ever pushed, so the Manager's Play
+;;; advanced cpp and scala and left lsp where it was.
+;;;
+;;; Each tick runs on the actor, serialised with every route exactly as a manual
+;;; push is; the sleep happens off it. The loop carries the generation it was
+;;; started under (perception-engine-auto-generation) and exits at the first
+;;; tick that sees another, so stop ends it and a second start replaces it
+;;; rather than adding a second loop. The RE's perceptual-simulation auto-play
+;;; uses the same shape (start-perceptual-autoplay).
+
+(defparameter *auto-push-function*
+  (lambda (state) (push-perception state t))
+  "One auto-push. A variable so the tests can count ticks without an RE.")
+
+(defun auto-push-interval (interval-ms)
+  "intervalMs as the loop uses it: a positive whole number of ms, else 1000,
+which is what C++ substitutes for a non-positive interval."
+  (let ((ms (and (realp interval-ms) (truncate interval-ms))))
+    (if (and ms (plusp ms)) ms 1000)))
+
+(defun begin-auto-push (state interval-ms)
+  "On the actor: mark auto-push running at INTERVAL-MS and return the new
+generation, which the caller's loop is bound to."
+  (let ((engine (perception-state-engine state)))
+    (setf (perception-engine-auto-running-p engine) t
+          (perception-engine-auto-interval-ms engine) (auto-push-interval interval-ms))
+    (incf (perception-engine-auto-generation engine))))
+
+(defun end-auto-push (state)
+  "On the actor: mark auto-push stopped; the running loop exits at its next tick."
+  (let ((engine (perception-state-engine state)))
+    (setf (perception-engine-auto-running-p engine) nil)
+    (incf (perception-engine-auto-generation engine))))
+
+(defun auto-push-tick (state generation)
+  "One tick, on the actor. Pushes and returns the ms to wait before the next
+tick, or NIL when the loop should exit: auto-push was stopped, or a newer start
+took over. A failed push does not end the loop; push-perception reports it in
+lastPush, and the next tick tries again, as C++ does."
+  (let ((engine (perception-state-engine state)))
+    (when (and (eql generation (perception-engine-auto-generation engine))
+               (perception-engine-auto-running-p engine))
+      (funcall *auto-push-function* state)
+      (perception-engine-auto-interval-ms engine))))
+
+(defun run-auto-push-loop (actor generation interval-ms)
+  "The timer thread for one start."
+  (bt:make-thread
+   (lambda ()
+     (let ((delay interval-ms))
+       (loop
+         (sleep (/ delay 1000.0))
+         ;; An actor that does not answer in time is not a stop: keep the
+         ;; cadence, and let the generation check on a later tick end the loop.
+         (let ((next (handler-case
+                         (actor-ask actor (lambda (state) (auto-push-tick state generation))
+                                    :timeout 120)
+                       (error () delay))))
+           (unless next (return))
+           (setf delay next)))))
+   :name "perception-auto-push"))
+
+(defun start-auto-push (actor interval-ms)
+  "POST /api/auto/start and the MCP perception_start_auto tool. Supersedes any
+running loop, starts one timer, and returns the interval it runs at."
+  (destructuring-bind (generation . interval)
+      (actor-ask actor (lambda (state)
+                         (cons (begin-auto-push state interval-ms)
+                               (perception-engine-auto-interval-ms (perception-state-engine state)))))
+    (run-auto-push-loop actor generation interval)
+    interval))
+
+(defun stop-auto-push (actor)
+  "POST /api/auto/stop and the MCP perception_stop_auto tool."
+  (actor-ask actor (lambda (state) (end-auto-push state)))
+  t)
+
 ;; Bundled yuma-agriculture demo mapping registry for GET /api/mqtt/example.
 ;; Mirrors RealityEngine_CPP/config/mqtt-mappings.yuma-agriculture.json.
 ;; Band normalization emits 1.0 (in nominal range) or 0.0 (out of range),
@@ -2732,20 +2816,12 @@ minted per runtime, so id order would differ between runtimes
                                       (error-response (format nil "Push record ~a not found" (gethash "id" params)) 404)))
    (make-route "POST" "/api/auto/start" (lambda (_ body query)
                                          (declare (ignore _ query))
-                                         (json-response
-                                          (actor-ask actor
-                                                     (lambda (state)
-                                                       (setf (perception-engine-auto-running-p (perception-state-engine state)) t
-                                                             (perception-engine-auto-interval-ms (perception-state-engine state))
-                                                             (truncate (or (jnumber body "intervalMs" 1000) 1000)))
-                                                       (obj "success" t "intervalMs" (perception-engine-auto-interval-ms (perception-state-engine state))))))))
+                                         (let ((interval (start-auto-push actor (jnumber body "intervalMs" 1000))))
+                                           (json-response (obj "success" t "intervalMs" interval)))))
    (make-route "POST" "/api/auto/stop" (lambda (_ body query)
                                         (declare (ignore _ body query))
-                                        (json-response
-                                         (actor-ask actor
-                                                    (lambda (state)
-                                                      (setf (perception-engine-auto-running-p (perception-state-engine state)) nil)
-                                                      (obj "success" t))))))
+                                        (stop-auto-push actor)
+                                        (json-response (obj "success" t))))
    (make-route "PATCH" "/api/config" (lambda (_ body query)
                                       (declare (ignore _ query))
                                       (json-response

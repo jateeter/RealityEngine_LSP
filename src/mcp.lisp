@@ -138,20 +138,17 @@
            (obj "type" "object"
                 "properties" (obj "interval_ms" (obj "type" "number" "default" 1000)))
            (lambda (args)
-             (let ((ms (or (jnumber args "interval_ms" nil) 1000)))
-               (actor-tell actor (lambda (s)
-                                   (setf (perception-engine-auto-running-p (perception-state-engine s)) t
-                                         (perception-engine-auto-interval-ms (perception-state-engine s))
-                                         (truncate ms))))
-               (mcp-text (json-stringify (obj "success" t "intervalMs" ms))))))
+             ;; The same start as POST /api/auto/start: setting the flag alone
+             ;; started nothing (RealityEngine_LSP#173).
+             (let ((interval (start-auto-push actor (jnumber args "interval_ms" 1000))))
+               (mcp-text (json-stringify (obj "success" t "intervalMs" interval))))))
 
      (tool "perception_stop_auto"
            "Stop automatic periodic pushing."
            (obj "type" "object" "properties" (obj))
            (lambda (args)
              (declare (ignore args))
-             (actor-tell actor (lambda (s)
-                                 (setf (perception-engine-auto-running-p (perception-state-engine s)) nil)))
+             (stop-auto-push actor)
              (mcp-text (json-stringify (obj "success" t)))))
 
      (tool "perception_reset"
