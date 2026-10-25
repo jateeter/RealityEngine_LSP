@@ -1617,6 +1617,69 @@ print('locked', flush=True); time.sleep(60)"
         (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
   t)
 
+(defun auto-push-tests ()
+  "POST /api/auto/start pushes on a timer until /api/auto/stop
+(RealityEngine_LSP#173). It used to set auto.running and push nothing."
+  (flet ((pe-state ()
+           (reality-engine-lsp::make-perception-state-from-config
+            :dimension 16 :reality-url "http://127.0.0.1:1"
+            :localai-url "http://127.0.0.1:1" :localai-machine-dir "/nonexistent")))
+    ;; The tick contract, on a state directly.
+    (let* ((state (pe-state))
+           (engine (reality-engine-lsp::perception-state-engine state))
+           (pushes 0)
+           (reality-engine-lsp::*auto-push-function* (lambda (s) (declare (ignore s)) (incf pushes))))
+      (assert-equal 1000 (reality-engine-lsp::auto-push-interval 0) "a non-positive interval runs at 1000ms")
+      (assert-equal 1000 (reality-engine-lsp::auto-push-interval nil) "no interval runs at 1000ms")
+      (assert-equal 250 (reality-engine-lsp::auto-push-interval 250.7) "an interval is whole ms")
+      (let ((generation (reality-engine-lsp::begin-auto-push state 40)))
+        (assert-true (reality-engine-lsp::perception-engine-auto-running-p engine) "start marks auto-push running")
+        (assert-equal 40 (reality-engine-lsp::auto-push-tick state generation)
+                      "a tick pushes and returns the interval to the next one")
+        (assert-equal 1 pushes "the tick pushed once")
+        (let ((newer (reality-engine-lsp::begin-auto-push state 40)))
+          (assert-equal nil (reality-engine-lsp::auto-push-tick state generation)
+                        "a loop from an earlier start exits rather than pushing")
+          (assert-equal 1 pushes "and pushed nothing")
+          (reality-engine-lsp::end-auto-push state)
+          (assert-equal nil (reality-engine-lsp::auto-push-tick state newer) "stop ends the current loop")
+          (assert-true (not (reality-engine-lsp::perception-engine-auto-running-p engine))
+                       "stop marks auto-push stopped"))))
+    ;; The timer itself: a real actor and thread, a stub push, wall-clock
+    ;; windows wide enough not to flake.
+    (let* ((state (pe-state))
+           (actor (reality-engine-lsp::state-actor "auto-push-test" state))
+           (pushes 0)
+           (lock (bt:make-lock))
+           (previous reality-engine-lsp::*auto-push-function*))
+      (flet ((count-now () (bt:with-lock-held (lock) pushes)))
+        (unwind-protect
+             (progn
+               ;; Global, not let-bound: the timer thread does not see a dynamic binding.
+               (setf reality-engine-lsp::*auto-push-function*
+                     (lambda (s) (declare (ignore s)) (bt:with-lock-held (lock) (incf pushes))))
+               (assert-equal 50 (reality-engine-lsp::start-auto-push actor 50) "start answers its interval")
+               (sleep 0.6)
+               (assert-true (>= (count-now) 4)
+                            (format nil "the timer pushes on its own (~a pushes in 600ms at 50ms)" (count-now)))
+               (reality-engine-lsp::stop-auto-push actor)
+               (sleep 0.15)
+               (let ((after-stop (count-now)))
+                 (sleep 0.4)
+                 (assert-equal after-stop (count-now) "nothing is pushed after stop"))
+               ;; Two starts, one loop: a second start replaces the first.
+               (reality-engine-lsp::start-auto-push actor 100)
+               (reality-engine-lsp::start-auto-push actor 100)
+               (let ((before (count-now)))
+                 (sleep 1.05)
+                 (let ((n (- (count-now) before)))
+                   (assert-true (<= 5 n 14)
+                                (format nil "two starts run one 100ms loop (~a pushes in 1.05s; two loops give ~~20)" n))))
+               (reality-engine-lsp::stop-auto-push actor))
+          (setf reality-engine-lsp::*auto-push-function* previous)
+          (reality-engine-lsp::stop-actor actor)))))
+  t)
+
 (defun run-tests ()
   (let* ((machine-json (reality-engine-lsp::obj
                        "id" "machine-test"
@@ -3403,6 +3466,7 @@ print('locked', flush=True); time.sleep(60)"
   (stt-incumbent-source-tests)
   (osre-fold-operator-tests)
   (fold-declared-rule-tests)
+  (auto-push-tests)
 
   ;; The cesgen oracle set — see tests/oracle-parity-tests.lisp. Runs last:
   ;; it walks the whole corpus and is by far the slowest check here.

@@ -30,7 +30,11 @@
   ;; 4.4b). A source on one is folded with the OSRE value: by the cell's
   ;; declared arbitration rule where the registry declares one, else by that
   ;; operator. A bare operator string (no machine name) is accepted too.
-  (osre-fold (make-hash-table)))
+  (osre-fold (make-hash-table))
+  ;; Bumped by every auto-push start and stop. A timer loop carries the
+  ;; generation it was started under and exits at the first tick that sees a
+  ;; different one, so a restart never leaves two loops pushing (#173).
+  (auto-generation 0))
 
 (defun fold-unit-interval (transformation s o)
   "A machine's declared fold operator over [0..1], applied to source value S and
