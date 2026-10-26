@@ -1680,7 +1680,35 @@ print('locked', flush=True); time.sleep(60)"
           (reality-engine-lsp::stop-actor actor)))))
   t)
 
+;; semantic_escalation_dispatches_total was exported but never incremented,
+;; so the Semantic Guardrails escalation panels could not see this runtime. The
+;; rule is Scala's and TypeScript's: emergency-dispatch and urgent-intervention
+;; count, by the determination's RAG status, "unstated" when it carries none.
+(defun test-escalation-dispatch-counter ()
+  (let ((table reality-engine-lsp::*semantic-escalations*))
+    (clrhash table)
+    (flet ((dispatch (action rag)
+             (reality-engine-lsp::dispatch-semantics
+              "Escalation Test"
+              (if rag
+                  (reality-engine-lsp::obj "actionCode" action "ragStatusCode" rag)
+                  (reality-engine-lsp::obj "actionCode" action))
+              (list "seq"))))
+      (dispatch "urgent-intervention" "RED")
+      (dispatch "emergency-dispatch" "RED")
+      (dispatch "emergency-dispatch" nil)
+      (dispatch "urgent-intervention" "")
+      (dispatch "urgent-intervention" "AMBER")
+      (dispatch "dispatch-agent" "RED")
+      (dispatch "create-work-order" nil))
+    (assert-equal 2 (gethash "RED" table 0) "RED escalations are counted")
+    (assert-equal 2 (gethash "unstated" table 0) "an absent or empty status counts as unstated")
+    (assert-equal 1 (gethash "AMBER" table 0) "an explicit non-RED escalation is counted under its status")
+    (assert-equal 3 (hash-table-count table) "non-escalation actions add no series")
+    (clrhash table)))
+
 (defun run-tests ()
+  (test-escalation-dispatch-counter)
   (let* ((machine-json (reality-engine-lsp::obj
                        "id" "machine-test"
                        "name" "Test"

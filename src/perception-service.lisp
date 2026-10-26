@@ -80,6 +80,14 @@ which were exported but never incremented."
          (action (and governance (jstring governance "actionCode" nil))))
     (incf *semantic-dispatch-total*)
     (when base (incf *semantic-dispatch-joined*))
+    ;; Escalation guardrail, as in Scala and TypeScript: re:EscalationDetermination
+    ;; requires RED. The axiom is open-world, so an unstated status is consistent
+    ;; and counted apart from an explicit non-RED, which is a violation. The table
+    ;; was exported but never written, so the Semantic Guardrails escalation
+    ;; panels could not see this runtime.
+    (when (member action '("emergency-dispatch" "urgent-intervention") :test #'equal)
+      (let ((rag (and governance (jstring governance "ragStatusCode" nil))))
+        (incf (gethash (if (and rag (> (length rag) 0)) rag "unstated") *semantic-escalations* 0))))
     (obj "machineIri" (if base (format nil "~a#machine" base) +json-null+)
          "sequenceIri" (if (and base seq) (format nil "~a#seq-~a" base (sanitize-iri-local seq)) +json-null+)
          "actionCode" (json-null-if-empty action))))
