@@ -152,12 +152,34 @@ export INTEGRATIONS_CONFIG
 export ACP_ENABLED ACP_PLATFORM ACP_SURFACE ACP_GATEWAY_URL OPENCLAW_GATEWAY_URL
 export ACP_SESSION_KEY OPENCLAW_ACP_SESSION ACP_TARGET_AGENT ACP_COMPLETION_SOURCE_MAPPING_ID
 
+# PE interns corpus test sources once at boot. Start it only after RE can
+# serve the loaded corpus, otherwise concurrent startup can permanently leave
+# PE with zero sources even after its separate machine catalog has warmed.
+wait_for_re() {
+  local re_pid attempt
+  re_pid="$(cat "run/reality-engine${_INST}.pid")"
+  for ((attempt = 0; attempt < 240; attempt++)); do
+    if ! kill -0 "$re_pid" 2>/dev/null; then
+      echo "LSP RE exited before becoming healthy; PE was not started." >&2
+      return 1
+    fi
+    if curl --fail --silent --max-time 1 "http://127.0.0.1:${REALITY_ENGINE_PORT}/api/health" >/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "LSP RE did not become healthy; stopping this instance before PE startup." >&2
+  bash "$ROOT_DIR/stop.sh" "--instance=$INSTANCE_ID" >/dev/null 2>&1 || true
+  return 1
+}
+
 if [ "$USE_BINARY" = "1" ]; then
   # The saved image parses SBCL runtime options (--dynamic-space-size) itself
   # and strips them from *posix-argv*, so `main` still sees just the mode.
   "$ENGINE_BIN" --dynamic-space-size "$SBCL_DYNAMIC_SPACE_SIZE" reality \
     > "logs/reality-engine${_INST}.log" 2>&1 &
   echo "$!" > "run/reality-engine${_INST}.pid"
+  wait_for_re
 
   "$ENGINE_BIN" --dynamic-space-size "$SBCL_DYNAMIC_SPACE_SIZE" perception \
     > "logs/perception-engine${_INST}.log" 2>&1 &
@@ -179,6 +201,7 @@ else
     --eval "(reality-engine-lsp:start-reality-from-environment)" \
     --eval "(loop (sleep 3600))" > "logs/reality-engine${_INST}.log" 2>&1 &
   echo "$!" > "run/reality-engine${_INST}.pid"
+  wait_for_re
 
   sbcl --dynamic-space-size "$SBCL_DYNAMIC_SPACE_SIZE" --noinform --disable-debugger --load "$QUICKLISP_SETUP" \
     --eval "(pushnew (truename \".\") ql:*local-project-directories*)" \

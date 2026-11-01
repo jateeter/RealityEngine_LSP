@@ -131,3 +131,5 @@ up, and the contract's wording governs wherever the two differ.
 | Use bash, not zsh | Shell work runs in `/opt/homebrew/bin/bash` (5.x), not zsh or macOS `/bin/bash` 3.2: any loop, unquoted variable, glob or `set --` goes through it with `set -euo pipefail`, and you check the command's exit status, not the pipeline tail. |
 
 Read the contract for the full text, the qualifier table, and the cleanup steps.
+
+LSP startup waits for RE health before launching PE in both binary and source modes, so boot source interning observes the loaded corpus.
