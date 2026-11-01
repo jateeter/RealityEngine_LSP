@@ -57,8 +57,9 @@ Do not restate it here. It defines what ingesting a machine interns, how
 and it governs this repository's implementation of all three.
 
 Implemented in `start-perception-service` (`perception-service.lisp`), which
-interns at boot through the actor. Fire-and-forget: the RE may still be coming
-up when the PE binds, and the catalog refresher retries (#68).
+interns at boot through the actor. The launcher waits for RE health before
+starting PE, so the one-time source interning sees the loaded corpus. The
+separate catalog refresher retries dispatch-catalog fetches (#68).
 
 ## PE source activity
 
