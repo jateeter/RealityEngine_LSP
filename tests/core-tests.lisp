@@ -1709,6 +1709,7 @@ print('locked', flush=True); time.sleep(60)"
 
 (defun run-tests ()
   (test-escalation-dispatch-counter)
+  (uiop:symbol-call '#:reality-engine-lsp.tests '#:test-lane-tls)
   (let* ((machine-json (reality-engine-lsp::obj
                        "id" "machine-test"
                        "name" "Test"

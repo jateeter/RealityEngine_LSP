@@ -55,6 +55,17 @@ make test
 make e2e-healthkit-spezi
 ```
 
+## Lane TLS
+
+With `RE_TLS_CERT` set (RealityEngine_CI#668, this repo's #186), the RE and PE
+serve TLS 1.3 with mTLS on their own ports, and call internal peers over `https`
+with the lane CA and their own certificate. With it unset, nothing changes.
+The contract, including which peers are internal and which PE routes are open
+to devices, is `RealityEngine_CI/docs/TRANSPORT_SECURITY.md`, and C++ and
+Scala implement the same choices. The code is `src/tls.lisp`, a Hunchentoot
+acceptor and a pooled Drakma stream over cl+ssl, with OpenSSL called directly
+for what cl+ssl does not expose. `tests/tls-tests.lisp` pins it.
+
 ## Startup
 
 `start.sh` selects a launch path via `LSP_LAUNCH_MODE=binary|source|auto`

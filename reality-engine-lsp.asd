@@ -21,6 +21,12 @@
                ;; The SSE handlers' UTF-8 text stream over Hunchentoot's binary one.
                #:flexi-streams
                #:drakma
+               ;; Lane TLS (src/tls.lisp, RealityEngine_CI#668): the contexts
+               ;; Hunchentoot and Drakma run over. Both already load them.
+               #:cl+ssl
+               #:cffi
+               #:puri
+               #:chunga
                #:usocket
                #:yason)
   :components ((:module "src"
@@ -34,6 +40,7 @@
                  (:file "loader")
                  (:file "perception")
                  (:file "http")
+                 (:file "tls")          ; lane TLS: serving and calling (CI#668)
                  (:file "ws")           ; SSE broadcast surface (GET /api/events)
                  (:file "arbiter")       ; output arbiter (ARBITER_CONTRACT.md)
                  (:file "reality-service")
@@ -52,7 +59,8 @@
   :depends-on (#:reality-engine-lsp)
   :components ((:module "tests"
                 :components ((:file "core-tests")
-                             (:file "oracle-parity-tests"))))
+                             (:file "oracle-parity-tests")
+                             (:file "tls-tests"))))
   :perform (asdf:test-op (op c)
              (declare (ignore op c))
              (uiop:symbol-call '#:reality-engine-lsp.tests '#:run-tests)))
