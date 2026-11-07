@@ -3259,6 +3259,15 @@ startup — the PE still serves HTTP signals as a pure REST engine."
     ;; so they intercept their paths before the catch-all handler claims them.
     (start-http-server port (perception-routes actor)
                        :name "perception-engine-lsp"
+                       ;; The HealthKit bridge on a phone reaches these with
+                       ;; server TLS and its bearer token, not a client
+                       ;; certificate (RealityEngine_CI docs/TRANSPORT_SECURITY.md;
+                       ;; localHealthkitBridge docs/INGEST_CONTRACT.md). Every
+                       ;; other route, resync included, requires one.
+                       :certificate-optional-routes
+                       '("/api/integrations/healthkit/ingest"
+                         "/api/integrations/healthkit/status"
+                         "/api/integrations/healthkit/scope")
                        :extra-dispatchers
                        (append
                         (list (hunchentoot:create-prefix-dispatcher

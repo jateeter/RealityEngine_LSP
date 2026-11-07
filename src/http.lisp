@@ -111,17 +111,36 @@ Must be called on the request thread — the hunchentoot context is dynamic."
         (cons route grouped-routes)
         route)))
 
-(defun start-http-server (port routes &key (name "reality-engine-lsp") extra-dispatchers)
+(defun start-http-server (port routes &key (name "reality-engine-lsp") extra-dispatchers
+                                          certificate-optional-routes)
+  "Serve ROUTES on PORT. With RE_TLS_CERT set (src/tls.lisp) that is TLS 1.3
+with mTLS and no plaintext listener; CERTIFICATE-OPTIONAL-ROUTES are the path
+patterns a device may reach without a client certificate."
   (declare (ignore name))
   (setf routes (flatten-routes routes))
-  (setf hunchentoot:*dispatch-table*
-        (append extra-dispatchers
-                (list (hunchentoot:create-prefix-dispatcher
-                       "/"
-                       (lambda () (dispatch-route routes))))))
-  (let ((acceptor (make-instance 'hunchentoot:easy-acceptor :port port)))
-    (hunchentoot:start acceptor)
-    acceptor))
+  (let* ((tls (tls-serving-p))
+         (optional (and tls certificate-optional-routes)))
+    (setf *tls-certificate-optional-routes* optional)
+    (setf hunchentoot:*dispatch-table*
+          (append (when optional (list #'tls-certificate-dispatcher))
+                  extra-dispatchers
+                  (list (hunchentoot:create-prefix-dispatcher
+                         "/"
+                         (lambda () (dispatch-route routes))))))
+    ;; A context that cannot be built signals here: the engine stops rather
+    ;; than start plaintext.
+    (let ((acceptor (if tls
+                        (make-instance 'tls-acceptor :port port
+                                                     :tls-context (make-server-tls-context (null optional)))
+                        (make-instance 'hunchentoot:easy-acceptor :port port))))
+      (hunchentoot:start acceptor)
+      (when tls
+        (format t "~&listening on ~a (TLS 1.3, client certificate ~a, groups ~a~a)~%"
+                port (if optional "required except device routes" "required") *tls-server-groups*
+                (if (string= *tls-server-groups* +tls-profile-groups-fallback+)
+                    " - this OpenSSL has no X25519MLKEM768" ""))
+        (finish-output))
+      acceptor)))
 
 (defun drakma-body-string (body)
   (if (stringp body)
@@ -172,18 +191,24 @@ Must be called on the request thread — the hunchentoot context is dynamic."
 (defun http-get-json (url)
   (with-bounded-http (url)
     (parse-json (drakma-body-string
-                 (drakma:http-request url :method :get :close t
-                                      :connection-timeout (http-connect-timeout))))))
+                 (if (tls-lane-url-p url)
+                     (tls-lane-request url (list :method :get))
+                     (drakma:http-request url :method :get :close t
+                                          :connection-timeout (http-connect-timeout)))))))
 
 (defun http-post-json (url payload)
   (with-bounded-http (url)
     (parse-json (drakma-body-string
-                 (drakma:http-request url
-                                      :method :post
-                                      :content (json-stringify payload)
-                                      :content-type "application/json"
-                                      :close t
-                                      :connection-timeout (http-connect-timeout))))))
+                 (if (tls-lane-url-p url)
+                     (tls-lane-request url (list :method :post
+                                                 :content (json-stringify payload)
+                                                 :content-type "application/json"))
+                     (drakma:http-request url
+                                          :method :post
+                                          :content (json-stringify payload)
+                                          :content-type "application/json"
+                                          :close t
+                                          :connection-timeout (http-connect-timeout)))))))
 
 (defun http-request-json (url &key (method :get) payload headers)
   (let ((args (list url :method method)))
@@ -194,6 +219,8 @@ Must be called on the request thread — the hunchentoot context is dynamic."
       (setf args (append args (list :additional-headers headers))))
     (with-bounded-http (url)
       (parse-json (drakma-body-string
-                   (apply #'drakma:http-request
-                          (append args (list :close t
-                                             :connection-timeout (http-connect-timeout)))))))))
+                   (if (tls-lane-url-p url)
+                       (tls-lane-request url (rest args))
+                       (apply #'drakma:http-request
+                              (append args (list :close t
+                                                 :connection-timeout (http-connect-timeout))))))))))
