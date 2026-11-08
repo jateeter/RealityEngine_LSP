@@ -152,6 +152,29 @@ export INTEGRATIONS_CONFIG
 export ACP_ENABLED ACP_PLATFORM ACP_SURFACE ACP_GATEWAY_URL OPENCLAW_GATEWAY_URL
 export ACP_SESSION_KEY OPENCLAW_ACP_SESSION ACP_TARGET_AGENT ACP_COMPLETION_SOURCE_MAPPING_ID
 
+# Lane TLS (RealityEngine_CI#668): with RE_TLS_CERT set the RE and PE serve TLS
+# 1.3 with mTLS, so this script's own probes and the PE's RE URL use https, the
+# lane CA and this instance's certificate (issued kind both, so it is a client
+# certificate too), through a curl that speaks TLS 1.3 (macOS /usr/bin/curl is
+# SecureTransport and cannot). With it unset, nothing changes.
+if [ -n "${RE_TLS_CERT:-}" ]; then
+  ENGINE_SCHEME=https
+  _lane_curl=curl
+  for _c in /opt/homebrew/opt/curl/bin/curl /usr/local/opt/curl/bin/curl; do
+    [ -x "$_c" ] && { _lane_curl="$_c"; break; }
+  done
+  ENGINE_CURL=("$_lane_curl" --tlsv1.3 --cacert "${RE_TLS_CA:?RE_TLS_CERT is set, so RE_TLS_CA must be too}" --cert "$RE_TLS_CERT" --key "${RE_TLS_KEY:?RE_TLS_CERT is set, so RE_TLS_KEY must be too}")
+else
+  ENGINE_SCHEME=http
+  ENGINE_CURL=(curl)
+fi
+
+# The PE reaches its RE over the lane's TLS when it is on (the Lisp default is
+# http://localhost:<port>); an explicit REALITY_ENGINE_URL wins.
+if [ "$ENGINE_SCHEME" = https ] && [ -z "${REALITY_ENGINE_URL:-}" ]; then
+  export REALITY_ENGINE_URL="https://localhost:${REALITY_ENGINE_PORT}"
+fi
+
 # PE interns corpus test sources once at boot. Start it only after RE can
 # serve the loaded corpus, otherwise concurrent startup can permanently leave
 # PE with zero sources even after its separate machine catalog has warmed.
@@ -163,7 +186,7 @@ wait_for_re() {
       echo "LSP RE exited before becoming healthy; PE was not started." >&2
       return 1
     fi
-    if curl --fail --silent --max-time 1 "http://127.0.0.1:${REALITY_ENGINE_PORT}/api/health" >/dev/null; then
+    if "${ENGINE_CURL[@]}" --fail --silent --max-time 1 "${ENGINE_SCHEME}://127.0.0.1:${REALITY_ENGINE_PORT}/api/health" >/dev/null; then
       return 0
     fi
     sleep 0.25
@@ -211,8 +234,8 @@ else
   echo "$!" > "run/perception-engine${_INST}.pid"
 fi
 
-echo "Reality Engine LSP     : http://localhost:${REALITY_ENGINE_PORT}${INSTANCE_ID:+ [instance: $INSTANCE_ID]}"
-echo "Perception Engine LSP  : http://localhost:${PERCEPTION_ENGINE_PORT}${INSTANCE_ID:+ [instance: $INSTANCE_ID]}"
+echo "Reality Engine LSP     : ${ENGINE_SCHEME}://localhost:${REALITY_ENGINE_PORT}${INSTANCE_ID:+ [instance: $INSTANCE_ID]}"
+echo "Perception Engine LSP  : ${ENGINE_SCHEME}://localhost:${PERCEPTION_ENGINE_PORT}${INSTANCE_ID:+ [instance: $INSTANCE_ID]}"
 if [ "$USE_BINARY" = "1" ]; then
   echo "Launch path            : binary (${ENGINE_BIN})"
 else
