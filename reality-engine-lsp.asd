@@ -38,6 +38,7 @@
                  (:file "actor")
                  (:file "model")
                  (:file "loader")
+                 (:file "clones")       ; cloneable machines, the clone space (CI#713)
                  (:file "perception")
                  (:file "http")
                  (:file "tls")          ; lane TLS: serving and calling (CI#668)
@@ -60,7 +61,8 @@
   :components ((:module "tests"
                 :components ((:file "core-tests")
                              (:file "oracle-parity-tests")
-                             (:file "tls-tests"))))
+                             (:file "tls-tests")
+                             (:file "clone-tests"))))
   :perform (asdf:test-op (op c)
              (declare (ignore op c))
              (uiop:symbol-call '#:reality-engine-lsp.tests '#:run-tests)))

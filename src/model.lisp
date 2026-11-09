@@ -39,7 +39,19 @@
                    ;; carries the event forward for this machine, which does not
                    ;; travel with the machine definition.
                    (transitions-inhibited nil)
-                   sequences)
+                   sequences
+                   ;; The corpus file this machine was loaded from, by file name,
+                   ;; or NIL for one registered from a request body.
+                   ;; Cloneability reads it (SURFACE_SPEC.md, "Cloneable
+                   ;; machines"): a document handoff names its source by file
+                   ;; stem and a bus edge its target by file name, and the id is
+                   ;; a normalised stem. Not serialised.
+                   (source-file nil)
+                   ;; Set on a clone only: the template, the assetID and the
+                   ;; dispatch envelope. Serialised only when set.
+                   (clone-of nil)
+                   (asset-id nil)
+                   (envelope-id nil))
 
 (defparameter +boolean-output-merge-transformations+
   '("or" "and" "xor" "nor" "nand")
@@ -540,7 +552,7 @@ Omits sequences, vectors, and perceptualMapping to keep the response small."
        "outputMergeTransformation" (output-merge-name
                                     (machine-output-merge-transformation machine))))
 
-(defun machine-json (machine &key full)
+(defun %machine-json (machine &key full)
   (let* ((sequences (machine-sequence-list machine))
          (sequence-ids (mapcar #'sequence-id sequences))
          (sequence-jsons (if full
@@ -576,6 +588,16 @@ Omits sequences, vectors, and perceptualMapping to keep the response small."
          "sequences" (vectorize sequence-jsons)
          "metadata" (or (machine-metadata machine) (obj))
          "perceptualMapping" (mapping-json (machine-mapping machine)))))
+
+(defun machine-json (machine &key full)
+  "The machine, plus cloneOf/assetId/envelopeId on a clone only, so no other
+machine grows a field on the compared /api/machines surfaces."
+  (let ((out (%machine-json machine :full full)))
+    (when (machine-clone-of machine)
+      (setf (jget out "cloneOf") (machine-clone-of machine)
+            (jget out "assetId") (machine-asset-id machine)
+            (jget out "envelopeId") (machine-envelope-id machine)))
+    out))
 
 (defun vector-provenance-chain (vector)
   (append (or (reality-event-predecessor-chain vector) nil)
