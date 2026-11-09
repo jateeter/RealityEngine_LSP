@@ -88,6 +88,12 @@
   ;; boot starts from the mark, so a restart can never reissue a tick. NIL for a
   ;; minted UUID, which is a new instance on every boot and needs no memory.
   instance-uuid
+  ;; Live clones and block generations (SURFACE_SPEC.md, "Cloneable machines").
+  ;; A restart loses them all, and every generation starts again at 0.
+  (clone-space (make-clone-space-state))
+  ;; The id this engine instance was launched as (INSTANCE_ID, e.g. lsp-1): the
+  ;; middle segment of every clone id. Without it nothing can be cloned.
+  (engine-instance (or (uiop:getenv "INSTANCE_ID") ""))
   (lamport 0)
   (lamport-reserved 0)
   (lamport-file nil)
@@ -2539,6 +2545,28 @@ step's number (-1 before the first step since boot or reset)."
                    (set-arbitration-window state (truncate v)))))
            (lambda (state)
              (set-arbitration-window state +arbitration-window-default+)))
+     ;; The bound on live clones of one template on this engine instance
+     ;; (SURFACE_SPEC.md, "The clone space"). Lowering it below the live count
+     ;; refuses new clones of that template until the count falls; it never
+     ;; recycles one.
+     (flet ((current (state)
+              (control-json "clone.maxActive" "engine"
+                            (clone-space-max-active (reality-state-clone-space state))
+                            +clone-max-active-default+)))
+       (list "clone.maxActive" "engine"
+             #'current
+             (lambda (state body)
+               (let ((v (jget body "value" :missing)))
+                 (if (or (eq v :missing) (not (realp v)) (/= v (truncate v))
+                         (minusp v) (> v +clone-blocks+))
+                     (list :refused
+                           (format nil "clone.maxActive requires a whole-number `value` in [0, ~d]" +clone-blocks+)
+                           400)
+                     (progn (setf (clone-space-max-active (reality-state-clone-space state)) (truncate v))
+                            (current state)))))
+             (lambda (state)
+               (setf (clone-space-max-active (reality-state-clone-space state)) +clone-max-active-default+)
+               (current state))))
      (list "historyLimit" "engine"
            (lambda (state)
              (control-json "historyLimit" "engine"
@@ -2728,6 +2756,73 @@ step's number (-1 before the first step since boot or reset)."
                           (and max-steps (>= (1+ current) max-steps))))
              (setf (reality-state-sim-running-p state) nil))
            step))))))
+
+;;; Clone and recycle, run on the actor thread. They answer (:respond STATUS
+;;; BODY), which RESPOND turns into the HTTP response on the request thread:
+;;; ERROR-RESPONSE reads HUNCHENTOOT:*REPLY*, which is unbound on the actor.
+(defun clone-refusal (status message &rest extra)
+  (let ((body (apply #'obj extra)))
+    (setf (jget body "error") message)
+    (list :respond status body)))
+
+(defun clone-refused ()
+  "A clone changes only through recycle: PUT, PATCH or DELETE on one would leave
+its block held by a machine that no longer exists."
+  (clone-refusal 409 "a clone changes only through POST /api/engine/recycle/machine/:cloneId"))
+
+(defun respond (result)
+  (destructuring-bind (tag status body) result
+    (declare (ignore tag))
+    (json-response body status)))
+
+(defun clone-machine-in-state (state machine-id asset envelope)
+  (let* ((machines (reality-state-machines state))
+         (space (reality-state-clone-space state))
+         (instance (reality-state-engine-instance state))
+         (template (gethash machine-id machines)))
+    (cond
+      ((null template) (clone-refusal 404 "Machine not found"))
+      ((machine-clone-of template) (clone-refusal 400 "a clone is not cloneable" "reason" "clone"))
+      (t
+       (multiple-value-bind (ok reason n folded) (assess-cloneable template (bus-target-files machines))
+         (declare (ignore n))
+         (let ((held (clone-space-find space #'clone-envelope-id envelope)))
+           (cond
+             ((not ok) (clone-refusal 400 "machine is not cloneable" "reason" reason))
+             ((zerop (length instance)) (clone-refusal 409 "engine launched without an INSTANCE_ID"))
+             ((and held (equal (clone-machine-id held) machine-id)) (list :respond 200 (clone-json held)))
+             (held (clone-refusal 409 (format nil "envelope ~a holds a clone of another machine" envelope)))
+             ((>= (clone-space-live-of space machine-id) (clone-space-max-active space))
+              (clone-refusal 409 "template is at clone.maxActive"))
+             (t
+              (let ((free (clone-space-lowest-free space)))
+                (if (null free)
+                    (clone-refusal 409 "the clone band has no free block")
+                    (let* ((mapping (machine-mapping template))
+                           (clone (make-clone :clone-id (format nil "~a.~a.~a" machine-id instance envelope)
+                                              :machine-id machine-id :engine-instance instance
+                                              :envelope-id envelope :asset-id asset
+                                              :block free :generation (clone-space-generation space free)
+                                              :input-length (region-length (mapping-input mapping))
+                                              :output-length (region-length (mapping-output mapping))
+                                              :fanout-length folded)))
+                      (put-machine state (make-clone-machine template clone))
+                      (clone-space-add space clone)
+                      (list :respond 201 (clone-json clone)))))))))))))
+
+(defun recycle-clone-in-state (state clone-id generation)
+  (let* ((space (reality-state-clone-space state))
+         (clone (clone-space-find space #'clone-clone-id clone-id)))
+    (cond
+      ((null clone) (clone-refusal 404 (format nil "No live clone ~a" clone-id)))
+      ((/= generation (clone-generation clone))
+       (clone-refusal 409 "generation is not the clone's" "generation" (clone-generation clone)))
+      (t
+       (unregister-compose-subscriptions state clone-id)
+       (remhash clone-id (reality-state-machines state))
+       (incf (reality-state-mapping-version state))
+       (let ((next (clone-space-recycle space clone-id)))
+         (list :respond 200 (obj "cloneId" clone-id "block" (clone-block-json clone) "generation" next)))))))
 
 (defun reality-routes (actor)
   (labels ((state-json (fn)
@@ -2983,6 +3078,43 @@ step's number (-1 before the first step since boot or reset)."
                                      (setf (reality-state-semantic-audit state) nil))
                                    (obj "success" t
                                         "auditCleared" (if clear-audit t :false)))))))
+     ;; ── Clone and recycle (SURFACE_SPEC.md, "Cloneable machines") ─────────
+     ;;
+     ;; One clone per dispatch envelope, at the template's initial state, in the
+     ;; lowest free 64-cell block of the clone band. The checks run in the
+     ;; specification's order, so the voting engines refuse a request alike.
+     (make-route "POST" "/api/engine/clone/machine/:machineId"
+                 (lambda (params body query)
+                   (declare (ignore body))
+                   (let ((machine-id (percent-decode (gethash "machineId" params)))
+                         (asset (gethash "asset" query))
+                         (envelope (gethash "envelope" query)))
+                     (if (or (null asset) (zerop (length asset)) (null envelope) (zerop (length envelope)))
+                         (error-response "asset and envelope are required" 400)
+                         (respond
+                          (actor-ask actor
+                                     (lambda (state)
+                                       (clone-machine-in-state state machine-id asset envelope))))))))
+     (make-route "POST" "/api/engine/recycle/machine/:cloneId"
+                 (lambda (params body query)
+                   (declare (ignore body))
+                   (let* ((clone-id (percent-decode (gethash "cloneId" params)))
+                          (raw (gethash "generation" query))
+                          (generation (and raw (plusp (length raw)) (<= (length raw) 18)
+                                           (every (lambda (c) (or (digit-char-p c) (char= c #\-))) raw)
+                                           (ignore-errors (parse-integer raw)))))
+                     (if (null generation)
+                         (error-response "generation is required, as an integer" 400)
+                         (respond
+                          (actor-ask actor
+                                     (lambda (state)
+                                       (recycle-clone-in-state state clone-id generation))))))))
+     (make-route "GET" "/api/engine/clones"
+                 (lambda (_ body query)
+                   (declare (ignore _ body query))
+                   (state-json (lambda (state)
+                                 (obj "clones" (vectorize (mapcar #'clone-json
+                                                                  (clone-space-live (reality-state-clone-space state)))))))))
      (make-route "POST" "/api/engine/process" (lambda (_ body query)
                                                 (declare (ignore _ query))
                                                 (state-json (lambda (state)
@@ -3189,6 +3321,15 @@ step's number (-1 before the first step since boot or reset)."
                                                                      (error-response (format nil "No semantics manifest entry for machine: ~a" name) 404))))
                                                            (error (e)
                                                              (error-response (format nil "semantics manifest unavailable: ~a" e) 404)))))
+     ;; Cloneable machines (SURFACE_SPEC.md, "Cloneable machines"). Registered
+     ;; ahead of /api/machines/:id: routes match in registration order, and
+     ;; "cloneable" would otherwise be read as a machine id. Assessed on every
+     ;; read against the machines registered now — the specification's
+     ;; reassessment after every POST, PUT and DELETE.
+     (make-route "GET" "/api/machines/cloneable" (lambda (_ body query)
+                                                   (declare (ignore _ body query))
+                                                   (state-json (lambda (state)
+                                                                 (cloneable-listing-json (reality-state-machines state))))))
      (make-route "GET" "/api/machines/:id" (lambda (params body query)
                                              (declare (ignore body query))
                                              ;; Same empty-LET defect as the other machines/:id
@@ -3223,16 +3364,26 @@ step's number (-1 before the first step since boot or reset)."
                                                                "machine" (machine-json machine :full t)))))))
      (make-route "PUT" "/api/machines/:id" (lambda (params body query)
                                              (declare (ignore query))
-                                             (state-json (lambda (state)
-                                                           (let ((machine (machine-from-json body (gethash "id" params))))
-                                                             (put-machine state machine)
-                                                             (obj "success" t "machine" (machine-json machine :full t)))))))
+                                             (respond (actor-ask actor
+                                                         (lambda (state)
+                                                           (let* ((id (gethash "id" params))
+                                                                  (old (gethash id (reality-state-machines state))))
+                                                             (if (and old (machine-clone-of old))
+                                                                 (clone-refused)
+                                                                 (let ((machine (machine-from-json body id)))
+                                                                   ;; A replaced corpus machine keeps its file.
+                                                                   (when old (setf (machine-source-file machine) (machine-source-file old)))
+                                                                   (put-machine state machine)
+                                                                   (list :respond 200 (obj "success" t "machine" (machine-json machine :full t)))))))))))
      (make-route "PATCH" "/api/machines/:id" (lambda (params body query)
                                                (declare (ignore query))
                                                (let ((result (actor-ask actor
                                                                         (lambda (state)
+                                                                         (block patch-machine
                                                                           (let ((machine (gethash (gethash "id" params)
                                                                                                   (reality-state-machines state))))
+                                                                            (when (and machine (machine-clone-of machine))
+                                                                              (return-from patch-machine (clone-refused)))
                                                                             (when machine
                                                                               (when (jstring body "name" nil)
                                                                                 (setf (machine-name machine) (jstring body "name" nil)))
@@ -3244,17 +3395,24 @@ step's number (-1 before the first step since boot or reset)."
                                                                                            (jget body "metadata"))
                                                                                   (setf (machine-metadata machine) existing)))
                                                                               (put-machine state machine)
-                                                                              (obj "success" t "machine" (machine-json machine :full t))))))))
-                                                 (if result (json-response result) (error-response "Machine not found" 404)))))
+                                                                              (obj "success" t "machine" (machine-json machine :full t)))))))))
+                                                 (cond ((and (consp result) (eq (first result) :respond)) (respond result))
+                                                       (result (json-response result))
+                                                       (t (error-response "Machine not found" 404))))))
      (make-route "DELETE" "/api/machines/:id" (lambda (params body query)
                                                (declare (ignore body query))
-                                               (state-json (lambda (state)
-                                                             (unregister-compose-subscriptions state (gethash "id" params))
-                                                             (let ((removed (remhash (gethash "id" params)
-                                                                                     (reality-state-machines state))))
-                                                               (when removed
-                                                                 (incf (reality-state-mapping-version state)))
-                                                               (obj "success" (json-bool removed)))))))
+                                               (respond (actor-ask actor
+                                                         (lambda (state)
+                                                           (let ((existing (gethash (gethash "id" params) (reality-state-machines state))))
+                                                             (if (and existing (machine-clone-of existing))
+                                                                 (clone-refused)
+                                                                 (progn
+                                                                   (unregister-compose-subscriptions state (gethash "id" params))
+                                                                   (let ((removed (remhash (gethash "id" params)
+                                                                                           (reality-state-machines state))))
+                                                                     (when removed
+                                                                       (incf (reality-state-mapping-version state)))
+                                                                     (list :respond 200 (obj "success" (json-bool removed))))))))))))
      (make-route "POST" "/api/machines/:id/process-universal" (lambda (params body query)
                                                                (declare (ignore query))
                                                                (let ((result (actor-ask actor

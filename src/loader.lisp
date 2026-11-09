@@ -294,7 +294,9 @@ from a request body with no machine in scope."
       (unless (eql major 1)
         (error "~a: incompatible machine JSON version: ~a (current: 1.0.0)"
                (file-namestring path) ver)))
-    (machine-from-json json (format nil "machine-~a" (canonical-machine-id-fragment (pathname-name path))))))
+    (let ((machine (machine-from-json json (format nil "machine-~a" (canonical-machine-id-fragment (pathname-name path))))))
+      (setf (machine-source-file machine) (file-namestring path))
+      machine)))
 
 (defun collect-json-files-recursive (dir)
   "Return all .json files under DIR sorted lexicographically."

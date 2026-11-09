@@ -1708,6 +1708,7 @@ print('locked', flush=True); time.sleep(60)"
     (clrhash table)))
 
 (defun run-tests ()
+  (uiop:symbol-call '#:reality-engine-lsp.tests '#:test-clone-space)
   (test-escalation-dispatch-counter)
   (uiop:symbol-call '#:reality-engine-lsp.tests '#:test-lane-tls)
   (let* ((machine-json (reality-engine-lsp::obj
