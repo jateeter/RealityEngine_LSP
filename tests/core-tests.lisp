@@ -1707,7 +1707,20 @@ print('locked', flush=True); time.sleep(60)"
     (assert-equal 3 (hash-table-count table) "non-escalation actions add no series")
     (clrhash table)))
 
+(defun test-engine-controls-sorted ()
+  ;; SURFACE_SPEC "/api/engine/config": the controls sorted by name, as C++
+  ;; serves them. Declaration order put phaseDetail before the include*
+  ;; controls, a parity difference by order alone.
+  (let ((names (mapcar #'first (reality-engine-lsp::engine-controls))))
+    (assert (equal names (sort (copy-list names) #'string<)) ()
+            "engine controls not sorted by name: ~a" names)
+    (assert (equal names '("arbitrationRetention" "arbitrationWindow" "clone.maxActive" "historyLimit"
+                           "includeActiveRegions" "includeMachineResults" "includePerceptualSpace"
+                           "phaseDetail" "transitionsInhibited"))
+            () "engine controls differ from C++'s list: ~a" names)))
+
 (defun run-tests ()
+  (test-engine-controls-sorted)
   (uiop:symbol-call '#:reality-engine-lsp.tests '#:test-clone-space)
   (test-escalation-dispatch-counter)
   (uiop:symbol-call '#:reality-engine-lsp.tests '#:test-lane-tls)

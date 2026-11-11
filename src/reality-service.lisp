@@ -2489,7 +2489,14 @@ step's number (-1 before the first step since boot or reset)."
 ;; with an empty error message. A control object is a hash table and a refusal
 ;; is a list, so the two are told apart without a sentinel field.
 (defun engine-controls ()
-  "The control table. A list of (NAME SCOPE READER WRITER RESETTER)."
+  "The control table, sorted by name (SURFACE_SPEC \"/api/engine/config\"). A
+list of (NAME SCOPE READER WRITER RESETTER). Declaration order listed
+phaseDetail before the include* controls, where C++ sorts, so the compared
+list differed by order alone."
+  (sort (declared-engine-controls) #'string< :key #'first))
+
+(defun declared-engine-controls ()
+  "The control table in declaration order; ENGINE-CONTROLS sorts it."
   ;; READ and WRITE are passed explicitly rather than derived from the accessor
   ;; name. `(fdefinition (list 'setf accessor))` would be shorter, but whether a
   ;; defstruct slot has a setf *function* as opposed to only a setf expander is
