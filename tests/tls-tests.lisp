@@ -98,6 +98,16 @@ and 127.0.0.1), a revoked client and a client from another CA."
                         "serve: a certificate from another CA is refused")
            (assert-true (not (tls-answered (tls-s-client dir re-port "/health" (format nil "-cert ~a/revoked.chain -key ~a/revoked.key" dir dir)) 200))
                         "serve: a revoked certificate is refused")
+           ;; A resumed session is served: Node's https agent resumes TLS 1.3
+           ;; sessions, and without a session id context OpenSSL refused every one
+           ;; (RealityEngine_CI#729).
+           (flet ((session (io)
+                    (tls-sh (format nil "( printf 'GET /health HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n'; sleep 1 ) | perl -e 'alarm shift; exec @ARGV' 5 ~a s_client -no_ign_eof -connect 127.0.0.1:~a -servername localhost -CAfile ~a/ca.crt ~a ~a ~a/session.pem"
+                                    (tls-openssl) re-port dir own io dir))))
+             (session "-sess_out")
+             (let ((again (session "-sess_in")))
+               (assert-true (and (search "Reused, TLSv1.3" again) (tls-answered again 200))
+                            "serve: a resumed TLS 1.3 session is served")))
            (let ((brief (tls-s-client dir re-port "/health" (format nil "~a -brief" own))))
              (assert-true (or (search "TLS_AES_256_GCM_SHA384" brief) (search "TLS_CHACHA20_POLY1305_SHA256" brief))
                           "serve: the negotiated suite is in the profile"))
