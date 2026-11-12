@@ -102,7 +102,20 @@ at the handshake unless some routes are open to devices."
     (setf *tls-server-groups* (tls-apply-profile ctx))
     (tls-load-own-certificate ctx)
     (tls-load-lane-trust ctx)
+    (tls-set-session-id-context ctx)
     ctx))
+
+(defun tls-set-session-id-context (ctx)
+  "A server that verifies client certificates must name a session id context,
+or OpenSSL refuses every resumed session (ssl_get_prev_session, alert 80
+internal_error). Node's https agent resumes TLS 1.3 sessions, so Manager's
+second request to this RE failed while curl's one-shot connections succeeded
+(RealityEngine_CI#729, found on the release lane; C++ had the same defect,
+RealityEngine_CPP#195)."
+  (cffi:with-foreign-string ((name len) "realityengine" :null-terminated-p nil)
+    (unless (eql 1 (cffi:foreign-funcall "SSL_CTX_set_session_id_context"
+                                         :pointer ctx :pointer name :unsigned-int len :int))
+      (tls-fail "cannot set the TLS session id context"))))
 
 ;;; Serving -------------------------------------------------------------------
 
