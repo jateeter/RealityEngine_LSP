@@ -1593,6 +1593,27 @@ output\"): the same model must see the same prompt from every engine."
                              "receivedAt" received-at)
            "signal" signal-result))))
 
+;;; Per-source client certificates on the device routes (owner, 2026-11-12;
+;;; RealityEngine_CI docs/TRANSPORT_SECURITY.md). The same rule in C++, Scala,
+;;; Rust and the TypeScript PE.
+
+(defun healthkit-certificate-sources ()
+  "HEALTHKIT_CLIENT_CERTIFICATE_REQUIRED: the sources that must present a client
+certificate on the device routes."
+  (remove "" (mapcar (lambda (s) (string-trim '(#\Space #\Tab) s))
+                     (split-string (or (env "HEALTHKIT_CLIENT_CERTIFICATE_REQUIRED" "") "") #\,))
+          :test #'string=))
+
+(defun healthkit-certificate-refusal (actor named)
+  "A 403 when the request's source (NAMED, else the configured bridge) must present
+a client certificate and, over TLS, did not. Nil otherwise."
+  (when (and *tls-connection* (not *tls-peer-verified*))
+    (let ((source (if (and (stringp named) (plusp (length named)))
+                      named
+                      (actor-ask actor #'perception-state-healthkit-bridge-id))))
+      (when (member source (healthkit-certificate-sources) :test #'string=)
+        (error-response "client certificate required" 403)))))
+
 (defun healthkit-status-json (state)
   (obj "bridgeId" (perception-state-healthkit-bridge-id state)
        "enabled" t
@@ -2747,15 +2768,21 @@ running loop, starts one timer, and returns the interval it runs at."
                                                            (if (consp result)
                                                                (json-response (cdr result) (car result))
                                                                (json-response result)))))
+   ;; Per source (owner, 2026-11-12; RealityEngine_CI TRANSPORT_SECURITY.md): a
+   ;; source named in HEALTHKIT_CLIENT_CERTIFICATE_REQUIRED (PIM's scope pushes)
+   ;; must present a lane certificate on these routes too.
    (make-route "GET" "/api/integrations/healthkit/status" (lambda (_ body query)
-                                                            (declare (ignore _ body query))
-                                                            (json-response (actor-ask actor #'healthkit-status-json))))
+                                                            (declare (ignore _ body))
+                                                            (or (healthkit-certificate-refusal actor (gethash "bridgeId" query))
+                                                                (json-response (actor-ask actor #'healthkit-status-json)))))
    (make-route "POST" "/api/integrations/healthkit/scope"
                (lambda (_ body query)
                  (declare (ignore _ query))
-                 (let* ((bearer (request-bearer-token))
-                        (result (actor-ask actor (lambda (state) (healthkit-scope-change state body bearer)))))
-                   (json-response (cdr result) (car result)))))
+                 (or (healthkit-certificate-refusal actor (or (let ((s (jstring body "source"))) (and (plusp (length s)) s))
+                                                              (jstring body "bridgeId")))
+                     (let* ((bearer (request-bearer-token))
+                            (result (actor-ask actor (lambda (state) (healthkit-scope-change state body bearer)))))
+                       (json-response (cdr result) (car result))))))
    (make-route "POST" "/api/integrations/healthkit/resync"
                (lambda (_ body query)
                  (declare (ignore _ query))
@@ -2764,13 +2791,14 @@ running loop, starts one timer, and returns the interval it runs at."
                    (json-response (cdr result) (car result)))))
    (make-route "POST" "/api/integrations/healthkit/ingest" (lambda (_ body query)
                                                              (declare (ignore _ query))
+                                                             (or (healthkit-certificate-refusal actor (jstring body "bridgeId"))
                                                              (let* ((bearer (request-bearer-token))
                                                                     (result (actor-ask actor
                                                                                        (lambda (state)
                                                                                          (ingest-healthkit state body bearer)))))
                                                                (if (consp result)
                                                                    (json-response (cdr result) (car result))
-                                                                   (json-response result)))))
+                                                                   (json-response result))))))
    (make-route "GET" "/api/integrations/carekit/status" (lambda (_ body query)
                                                           (declare (ignore _ body query))
                                                           (json-response (actor-ask actor #'carekit-status-json))))
