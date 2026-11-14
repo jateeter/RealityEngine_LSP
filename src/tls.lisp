@@ -122,6 +122,10 @@ RealityEngine_CPP#195)."
 (defvar *tls-peer-verified* nil
   "Within one connection: did the client present a certificate the lane CA verified?")
 
+(defvar *tls-connection* nil
+  "Within one connection: did it arrive over TLS? A route open to devices uses it
+with *tls-peer-verified* to require a certificate per source.")
+
 (defclass tls-acceptor (hunchentoot:easy-acceptor)
   ((tls-context :initarg :tls-context :reader acceptor-tls-context))
   (:documentation "Hunchentoot over TLS 1.3 with this engine's own context (the
@@ -131,7 +135,8 @@ profile, mTLS, the CRL). There is no plaintext listener beside it."))
 
 (defmethod hunchentoot:process-connection :around ((acceptor tls-acceptor) socket)
   (declare (ignore socket))
-  (let ((*tls-peer-verified* nil))
+  (let ((*tls-peer-verified* nil)
+        (*tls-connection* t))
     (call-next-method)))
 
 (defun ssl-peer-verified-p (ssl-stream)

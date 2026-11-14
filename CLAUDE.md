@@ -64,7 +64,10 @@ The contract, including which peers are internal and which PE routes are open
 to devices, is `RealityEngine_CI/docs/TRANSPORT_SECURITY.md`, and C++ and
 Scala implement the same choices. The code is `src/tls.lisp`, a Hunchentoot
 acceptor and a pooled Drakma stream over cl+ssl, with OpenSSL called directly
-for what cl+ssl does not expose. `tests/tls-tests.lisp` pins it.
+for what cl+ssl does not expose. `tests/tls-tests.lisp` pins it. On the device
+routes a source named in `HEALTHKIT_CLIENT_CERTIFICATE_REQUIRED` must still
+present a certificate (owner, 2026-11-12; `healthkit-certificate-refusal` in
+`src/perception-service.lisp`, with `*tls-connection*` and `*tls-peer-verified*`).
 
 ## Startup
 
