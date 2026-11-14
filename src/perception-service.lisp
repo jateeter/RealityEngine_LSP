@@ -251,7 +251,7 @@ the whole set sorted by key, per the contract."
    :ollama-base-url (trim-trailing-slashes (env "OLLAMA_BASE_URL" "http://localhost:11434"))
    ;; Canonical default shared by every runtime; override per engine with
    ;; OLLAMA_MODEL. See RealityEngine_CI/docs/OLLAMA_INTEGRATION.md.
-   :ollama-model (env "OLLAMA_MODEL" "llama3.1:8b")
+   :ollama-model (env "OLLAMA_MODEL" "nemotron-3-nano:4b")
    :ollama-completion-source-mapping-id (env "OLLAMA_COMPLETION_SOURCE_MAPPING_ID" "agent-completion-risk")
    :openai-base-url (trim-trailing-slashes (env "OPENAI_BASE_URL" "https://api.openai.com/v1"))
    :openai-model (env "OPENAI_MODEL" "gpt-5")
