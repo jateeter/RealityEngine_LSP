@@ -1719,8 +1719,100 @@ print('locked', flush=True); time.sleep(60)"
                            "phaseDetail" "transitionsInhibited"))
             () "engine controls differ from C++'s list: ~a" names)))
 
+;; MQTT client against an in-process broker (RealityEngine_LSP#197).  The
+;; broker publishes every 300 ms, faster than half the 2 s keepalive, which is
+;; what the live Yuma broker does to a 60 s keepalive: the client must still
+;; send PINGREQ (it used to measure keepalive from what it received, so it
+;; never pinged and the broker dropped it).  A subscription added after the
+;; connect must be sent, and after the broker drops the connection the client
+;; must close its socket and reconnect.
+(defun %fake-broker-read-packet (stream)
+  (let ((hdr (read-byte stream nil nil)))
+    (when hdr
+      (let ((len 0) (mult 1))
+        (loop for b = (read-byte stream nil nil)
+              while b
+              do (incf len (* (logand b #x7F) mult))
+                 (setf mult (* mult 128))
+              until (zerop (logand b #x80)))
+        (let ((body (make-array len :element-type '(unsigned-byte 8))))
+          (read-sequence body stream)
+          (cons (logand hdr #xF0) body))))))
+
+(defun test-mqtt-client-keepalive-and-reconnect ()
+  (let* ((listener (usocket:socket-listen "127.0.0.1" 0 :reuse-address t
+                                          :element-type '(unsigned-byte 8)))
+         (port (usocket:get-local-port listener))
+         (lock (bt:make-lock "fake-broker"))
+         (seen (list nil nil))                 ; packet types per connection
+         (first-closed-by-client nil)
+         (broker
+           (bt:make-thread
+            (lambda ()
+              (dotimes (conn 2)
+                (let* ((sock (usocket:socket-accept listener))
+                       (stream (usocket:socket-stream sock))
+                       (deadline (+ (get-internal-real-time)
+                                    (* (if (zerop conn) 3.5 2) internal-time-units-per-second)))
+                       (reader (bt:make-thread
+                                (lambda ()
+                                  (loop for pkt = (ignore-errors (%fake-broker-read-packet stream))
+                                        while pkt
+                                        do (bt:with-lock-held (lock)
+                                             (push (car pkt) (nth conn seen)))
+                                           (when (= (car pkt) #x10)
+                                             (bt:with-lock-held (lock)
+                                               (write-sequence #(#x20 2 0 0) stream)
+                                               (force-output stream)))
+                                           (when (= (car pkt) #xC0)
+                                             (bt:with-lock-held (lock)
+                                               (write-sequence #(#xD0 0) stream)
+                                               (force-output stream))))))))
+                  (loop while (< (get-internal-real-time) deadline)
+                        do (sleep 0.3)
+                           (ignore-errors
+                            (bt:with-lock-held (lock)
+                              ;; PUBLISH QoS 0, topic "a/b", payload "1"
+                              (write-sequence #(#x30 6 0 3 97 47 98 49) stream)
+                              (force-output stream))))
+                  (ignore-errors (usocket:socket-close sock))
+                  (ignore-errors (bt:join-thread reader))))
+              (usocket:socket-close listener))
+            :name "fake-mqtt-broker"))
+         (client (reality-engine-lsp::make-mqtt-client
+                  :config (reality-engine-lsp::make-mqtt-client-config
+                           :broker-host "127.0.0.1" :broker-port port
+                           :client-id "lsp-197" :keepalive-sec 2
+                           :reconnect-delay-ms 200)))
+         (received 0))
+    (declare (ignorable first-closed-by-client))
+    (reality-engine-lsp::mqtt-client-set-message-handler
+     client (lambda (topic payload) (declare (ignore topic payload)) (incf received)))
+    (reality-engine-lsp::mqtt-client-subscribe client "a/b" 0)
+    (reality-engine-lsp::mqtt-client-start client)
+    (sleep 0.5)
+    (reality-engine-lsp::mqtt-client-subscribe client "c/d" 0)
+    (bt:join-thread broker)
+    (sleep 0.3)
+    (let ((stats (reality-engine-lsp::mqtt-client-stats-snapshot client)))
+      (reality-engine-lsp::mqtt-client-stop client)
+      (let ((first (reverse (first seen)))
+            (second (reverse (second seen))))
+        (assert-true (member #xC0 first)
+                     (format nil "PINGREQ sent while PUBLISHes arrive every 300 ms (keepalive 2 s); saw ~s" first))
+        (assert-equal 2 (count #x80 first)
+                      "the subscription on connect and the one added after it were both sent")
+        (assert-true (member #x10 second) "reconnected after the broker dropped the connection")
+        (assert-true (member #x80 second) "resubscribed on the new connection")
+        (assert-true (>= (reality-engine-lsp::mqtt-client-stats-reconnects stats) 1)
+                     "the drop is counted as a reconnect")
+        (assert-true (>= (reality-engine-lsp::mqtt-client-stats-pings-sent stats) 1)
+                     "pings are counted")
+        (assert-true (> received 5) "messages were delivered")))))
+
 (defun run-tests ()
   (test-engine-controls-sorted)
+  (test-mqtt-client-keepalive-and-reconnect)
   (uiop:symbol-call '#:reality-engine-lsp.tests '#:test-clone-space)
   (test-escalation-dispatch-counter)
   (uiop:symbol-call '#:reality-engine-lsp.tests '#:test-lane-tls)

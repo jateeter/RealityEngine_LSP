@@ -2982,6 +2982,17 @@ running loop, starts one timer, and returns the interval it runs at."
                                        (let ((bridge-obj (obj)))
                                          (loop for (k . v) in stats
                                                do (setf (jget bridge-obj k) v))
+                                         (let ((cs (mqtt-client-stats-snapshot
+                                                    (reality-engine-lsp::%mqtt-bridge-client b))))
+                                           ;; The client's own counters, as the C++ PE reports
+                                           ;; them: a connection the broker keeps dropping shows
+                                           ;; here, not only as missing messages (LSP#197).
+                                           (setf (jget bridge-obj "connectAttempts") (mqtt-client-stats-connect-attempts cs)
+                                                 (jget bridge-obj "connectSuccesses") (mqtt-client-stats-connect-successes cs)
+                                                 (jget bridge-obj "reconnects") (mqtt-client-stats-reconnects cs)
+                                                 (jget bridge-obj "pingsSent") (mqtt-client-stats-pings-sent cs)
+                                                 (jget bridge-obj "bytesReceived") (mqtt-client-stats-bytes-received cs)
+                                                 (jget bridge-obj "lastMessageAtMs") (mqtt-client-stats-last-message-at-ms cs)))
                                          (obj "enabled" (json-bool t)
                                               "connected" (json-bool (mqtt-bridge-connected-p b))
                                               "brokerHost" (mqtt-client-config-broker-host cfg)
@@ -3172,7 +3183,15 @@ string when input is invalid."
                (cfg (make-mqtt-client-config
                      :broker-host broker-host
                      :broker-port broker-port
-                     :client-id   (or existing-client-id "reality-engine-pe-lsp")
+                     ;; The instance's own id (MQTT_CLIENT_ID, per instance from
+                     ;; startUniverse.sh): after a disable there is no current
+                     ;; bridge, and the fixed default made every LSP PE on the
+                     ;; shared broker one client, each connect evicting the
+                     ;; others (LSP#197).
+                     :client-id   (or existing-client-id
+                                      (let ((v (uiop:getenv "MQTT_CLIENT_ID")))
+                                        (when (and v (string/= v "")) v))
+                                      "reality-engine-pe-lsp")
                      :username    body-username
                      :password    body-password))
                (ingest (lambda (sensor-id offset length values ttl-ms topic mapping-id)
