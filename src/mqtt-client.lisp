@@ -47,7 +47,8 @@
   (subscriptions nil)              ; list of (topic . qos)
   (pending-subs nil)
   (next-packet-id 1)
-  (last-traffic-at 0)
+  (last-traffic-at 0)              ; last packet received from the broker
+  (last-sent-at 0)                 ; last packet sent to it (keepalive, MQTT 3.1.1 §3.1.2.10)
   (stats (make-mqtt-client-stats))
   (lock (bt:make-lock "mqtt-client"))
   (wakeup (bt:make-condition-variable :name "mqtt-client-wakeup")))
@@ -60,8 +61,8 @@ topic.  HANDLER is a function of (topic-string payload-bytes)."
   client)
 
 (defun mqtt-client-subscribe (client topic-filter &optional (qos 0))
-  "Add a topic to the subscription list.  Effective on the next reconnect;
-if already connected, sends an immediate SUBSCRIBE."
+  "Add a topic to the subscription list.  Sent on every connect; if already
+connected, the I/O thread sends it within a second."
   (let ((clamped (max 0 (min 1 qos))))
     (bt:with-lock-held ((%mqtt-client-lock client))
       (push (cons topic-filter clamped) (%mqtt-client-subscriptions client))
@@ -93,6 +94,7 @@ holding the client lock for any meaningful time."
 (defconstant +mqtt-connect+    #x10)
 (defconstant +mqtt-connack+    #x20)
 (defconstant +mqtt-publish+    #x30)
+(defconstant +mqtt-puback+     #x40)
 (defconstant +mqtt-subscribe+  #x80)
 (defconstant +mqtt-suback+     #x90)
 (defconstant +mqtt-pingreq+    #xC0)
@@ -196,7 +198,8 @@ holding the client lock for any meaningful time."
             (setf (%mqtt-client-socket client) sock
                   (%mqtt-client-stream client) stream
                   (%mqtt-client-connected-p client) t
-                  (%mqtt-client-last-traffic-at client) (now-ms))
+                  (%mqtt-client-last-traffic-at client) (now-ms)
+                  (%mqtt-client-last-sent-at client) (now-ms))
             (incf (mqtt-client-stats-connect-successes (%mqtt-client-stats client))))
           t)
       (error (c)
@@ -207,10 +210,15 @@ holding the client lock for any meaningful time."
 
 ;; ── SUBSCRIBE ───────────────────────────────────────────────────────────────
 
-(defun send-subscriptions (client)
+(defun send-subscriptions (client &optional only-pending)
+  "SUBSCRIBE to every subscription (on connect), or with ONLY-PENDING to the
+ones added since (mqtt-client-subscribe while connected).  Runs on the I/O
+thread, the only writer."
   (let* ((stream (%mqtt-client-stream client))
          (subs (bt:with-lock-held ((%mqtt-client-lock client))
-                 (copy-list (%mqtt-client-subscriptions client)))))
+                 (copy-list (if only-pending
+                                (%mqtt-client-pending-subs client)
+                                (%mqtt-client-subscriptions client))))))
     (when (and stream subs)
       (let ((body (make-array 32 :fill-pointer 0 :adjustable t
                                   :element-type '(unsigned-byte 8))))
@@ -229,7 +237,8 @@ holding the client lock for any meaningful time."
           (vector-push-extend (logior +mqtt-subscribe+ #x02) packet)
           (write-remaining-length packet (length body))
           (loop for b across body do (vector-push-extend b packet))
-          (handler-case (write-all stream packet)
+          (handler-case (progn (write-all stream packet)
+                               (setf (%mqtt-client-last-sent-at client) (now-ms)))
             (error () nil)))))
     (bt:with-lock-held ((%mqtt-client-lock client))
       (setf (%mqtt-client-pending-subs client) nil))))
@@ -241,6 +250,7 @@ holding the client lock for any meaningful time."
           (progn
             (write-all stream (make-array 2 :element-type '(unsigned-byte 8)
                                             :initial-contents (list +mqtt-pingreq+ 0)))
+            (setf (%mqtt-client-last-sent-at client) (now-ms))
             (bt:with-lock-held ((%mqtt-client-lock client))
               (incf (mqtt-client-stats-pings-sent (%mqtt-client-stats client)))))
         (error () nil)))))
@@ -248,22 +258,37 @@ holding the client lock for any meaningful time."
 ;; ── Read loop ──────────────────────────────────────────────────────────────
 
 (defun read-loop (client)
+  "Read packets until the connection ends.  Wakes at least once a second, so
+keepalive and late subscriptions do not wait for the broker to send something.
+
+Keepalive (MQTT 3.1.1 §3.1.2.10) is about what the CLIENT sends: the broker
+drops a client that sends nothing for 1.5 x keepalive.  It used to be measured
+from the last packet received and checked only after a read, so while the
+broker published more often than half the keepalive, no PINGREQ ever went out
+and the broker dropped the connection every ~90 s (RealityEngine_LSP#197).  A
+broker that has sent nothing, not even a PINGRESP, for 2 x keepalive is taken
+as gone, so a half-open connection reconnects instead of reporting connected."
   (let ((stream (%mqtt-client-stream client))
+        (sock (%mqtt-client-socket client))
         (cfg (%mqtt-client-config client)))
     (loop while (and (%mqtt-client-running-p client)
                      (%mqtt-client-connected-p client))
           do
-      ;; Keepalive check — send PINGREQ when half the keepalive window has
-      ;; elapsed since the last traffic.  Halfway is conventional and gives
-      ;; the broker generous margin before dropping us for inactivity.
       (let* ((k (mqtt-client-config-keepalive-sec cfg))
-             (last (%mqtt-client-last-traffic-at client))
-             (elapsed-ms (- (now-ms) last)))
-        (when (and (> k 0) (>= elapsed-ms (/ (* k 1000) 2)))
-          (send-ping client)
-          (setf (%mqtt-client-last-traffic-at client) (now-ms))))
-      ;; Try to read one packet; sleep briefly when no bytes are available
-      ;; so we can also fire keepalives on time.
+             (now (now-ms)))
+        (when (and (> k 0) (>= (- now (%mqtt-client-last-sent-at client)) (/ (* k 1000) 2)))
+          (send-ping client))
+        (when (and (> k 0) (> (- now (%mqtt-client-last-traffic-at client)) (* k 2000)))
+          (format *error-output* "[mqtt-client] broker silent for ~as; reconnecting~%"
+                  (round (- now (%mqtt-client-last-traffic-at client)) 1000))
+          (return)))
+      (when (bt:with-lock-held ((%mqtt-client-lock client))
+              (%mqtt-client-pending-subs client))
+        (send-subscriptions client t))
+      ;; Read one packet when one is waiting; otherwise come back in a second.
+      (when (or (ignore-errors (listen stream))
+                (handler-case (usocket:wait-for-input sock :timeout 1 :ready-only t)
+                  (error () t)))
       (handler-case
           (let ((hdr (read-byte stream nil nil)))
             (cond
@@ -282,6 +307,15 @@ holding the client lock for any meaningful time."
                              (payload-start (+ 2 topic-len (if (> qos 0) 2 0)))
                              (payload (subseq body payload-start))
                              (topic (babel:octets-to-string topic-bytes :encoding :utf-8)))
+                        ;; QoS 1: acknowledge, or the broker stops delivering
+                        ;; once its in-flight window is full.
+                        (when (= qos 1)
+                          (write-all stream (make-array 4 :element-type '(unsigned-byte 8)
+                                                          :initial-contents
+                                                          (list +mqtt-puback+ 2
+                                                                (aref body (+ 2 topic-len))
+                                                                (aref body (+ 3 topic-len)))))
+                          (setf (%mqtt-client-last-sent-at client) (now-ms)))
                         (let (handler)
                           (bt:with-lock-held ((%mqtt-client-lock client))
                             (incf (mqtt-client-stats-messages-received (%mqtt-client-stats client)))
@@ -298,7 +332,7 @@ holding the client lock for any meaningful time."
                    ((= type +mqtt-pingresp+) nil)
                    ((= type +mqtt-suback+) nil)
                    (t nil))))))
-        (error () (return))))
+        (error () (return)))))
     (setf (%mqtt-client-connected-p client) nil)))
 
 ;; ── I/O thread loop ────────────────────────────────────────────────────────
@@ -309,6 +343,14 @@ holding the client lock for any meaningful time."
       ((connect-and-authenticate client)
        (send-subscriptions client)
        (read-loop client)
+       ;; Close the connection that ended.  It was left open, so each
+       ;; reconnect leaked a socket in CLOSE_WAIT (LSP#197).
+       (let ((sock (bt:with-lock-held ((%mqtt-client-lock client))
+                     (prog1 (%mqtt-client-socket client)
+                       (setf (%mqtt-client-socket client) nil
+                             (%mqtt-client-stream client) nil
+                             (%mqtt-client-connected-p client) nil)))))
+         (when sock (ignore-errors (usocket:socket-close sock))))
        (when (%mqtt-client-running-p client)
          (bt:with-lock-held ((%mqtt-client-lock client))
            (incf (mqtt-client-stats-reconnects (%mqtt-client-stats client))))
