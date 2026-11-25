@@ -951,6 +951,7 @@ in the envelope too. Implemented long before any route called it (#100)."
                           "status" "recorded"
                           "mode" "replay"
                           "replayOf" dispatch-id
+                          "clock" (pe-event-clock)
                           "target" (or (jget original "target") +json-null+)
                           "machineId" (or (jstring original "machineId" nil) "")
                           "sequenceIds" (vectorize (jarray-list (jget original "sequenceIds")))
@@ -1300,6 +1301,9 @@ unaffected."
                         "semantics" (dispatch-semantics (jstring machine "name" nil) governance
                                                         (jarray-list (jget operation "sequenceIds")))
                         "replayOf" +json-null+
+                        ;; The PE's clock when it stored the record (#600); a
+                        ;; completion names it as causedBy.
+                        "clock" (pe-event-clock)
                         "attempts" 0
                         "createdAt" now
                         "updatedAt" now
@@ -1514,6 +1518,35 @@ output\"): the same model must see the same prompt from every engine."
                      "strict" t
                      "schema" (completion-schema-for-mapping mapping))))
 
+(defvar *pe-clock* nil
+  "The PE's participant clock (RealityEngine_CI#600): its own UUID
+(PE_INSTANCE_UUID), lock and marks, booted with the service. A completed push
+is its commit.")
+
+(defun pe-event-clock ()
+  "The PE's clock on a message it stores or forwards (#600): a tick, as
+{instance, lamport}. A PE without a booted clock (tests) mints one."
+  (unless *pe-clock*
+    (setf *pe-clock* (make-participant-clock :uuid (make-uuid))))
+  (pclock-event-json *pe-clock*))
+
+(defun completion-caused-by (state body)
+  "A completion's causedBy (#600): the clock of the dispatch it completes. The
+PE's own record wins -- dispatchId naming a record still in the ledger -- else
+the sender's echo, a well-formed {instance, lamport} in the body, else null."
+  (let* ((dispatch-id (jstring body "dispatchId" nil))
+         (record (and dispatch-id (lookup-dispatch-record state dispatch-id)))
+         (own (and record (jget record "clock")))
+         (echo (jget body "causedBy")))
+    (cond ((jobject-p own) own)
+          ((and (jobject-p echo)
+                (stringp (jget echo "instance"))
+                (lower-uuid-p (jget echo "instance"))
+                (integerp (jget echo "lamport"))
+                (<= 0 (jget echo "lamport") +max-lamport+))
+           (obj "instance" (jget echo "instance") "lamport" (jget echo "lamport")))
+          (t +json-null+))))
+
 (defun ingest-completion (state body)
   ;; Returns (cons http-status body-hash) — route handler unpacks it.
   (let* ((provider (or (jstring body "provider" nil) "agent"))
@@ -1572,13 +1605,17 @@ output\"): the same model must see the same prompt from every engine."
                                "source" (source-json source)
                                "push" +json-null+
                                "timestamp" received-at))
-           (mapping-id (or mapping-id-raw "")))
+           (mapping-id (or mapping-id-raw ""))
+           (caused-by (completion-caused-by state body))
+           (completion-clock (pe-event-clock)))
       (broadcast (obj "type" "agent.completion.received"
                       "provider" provider
                       "agent" agent
                       "sourceMappingId" mapping-id
                       "correlationId" (or (jstring body "correlationId" nil) +json-null+)
                       "envelopeId" (or (jstring body "envelopeId" nil) +json-null+)
+                      "clock" completion-clock
+                      "causedBy" caused-by
                       "timestamp" received-at))
       (obj "success" t
            "completion" (obj "provider" provider
@@ -1590,7 +1627,9 @@ output\"): the same model must see the same prompt from every engine."
                              "completionId"  (or (jstring body "completionId" nil)
                                                  (jstring body "id" nil)
                                                  +json-null+)
-                             "receivedAt" received-at)
+                             "receivedAt" received-at
+                             "clock" completion-clock
+                             "causedBy" caused-by)
            "signal" signal-result))))
 
 ;;; Per-source client certificates on the device routes (owner, 2026-11-12;
@@ -2646,11 +2685,6 @@ running loop, starts one timer, and returns the interval it runs at."
     {\"id\":\"agx032-temp-ok\",      \"topicFilter\":\"LATERAL/AmbientSuite/DEV0000009/SensorReadings/v1\",   \"sensorIdTemplate\":\"agx032.temp.ok\",            \"region\":{\"offset\":231,\"length\":1},\"extract\":{\"type\":\"json\",\"pointer\":\"/data/aTemp\"},       \"normalize\":{\"mode\":\"band\",\"min\":65,   \"max\":85}}
   ]}"))
 
-(defvar *pe-clock* nil
-  "The PE's participant clock (RealityEngine_CI#600): its own UUID
-(PE_INSTANCE_UUID), lock and marks, booted with the service. A completed push
-is its commit.")
-
 (defun perception-routes (actor)
   (list
    ;; GET /api/clock: {instance, lamport, commit, step} at the newest completed
@@ -2664,7 +2698,8 @@ is its commit.")
                                                                        0)))))
                                       (destructuring-bind (lamport . commit) (pclock-last-commit clock)
                                         (json-response (obj "instance" (participant-clock-uuid clock)
-                                                            "lamport" lamport "commit" commit "step" step))))))
+                                                            "lamport" lamport "commit" commit "step" step
+                                                            "headers" (pclock-headers-json clock)))))))
    (make-route "GET" "/" (lambda (_ body query)
                            (declare (ignore _ body query))
                            (json-response (obj "service" "Perception Engine (LSP)" "status" "running"))))

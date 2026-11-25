@@ -2653,12 +2653,18 @@ print('locked', flush=True); time.sleep(60)"
                     "dispatch ledger should retain PE-owned record")
       ;; Record shape, PATCH semantics and ledger order are settled 3-of-3
       ;; (RealityEngine_CI SURFACE_SPEC.md, Dispatch surface shapes).
-      (assert-equal '("attempts" "correlationId" "createdAt" "envelope" "envelopeId"
+      (assert-equal '("attempts" "clock" "correlationId" "createdAt" "envelope" "envelopeId"
                       "error" "id" "machineId" "mode" "processStatus" "providerReceipt"
                       "ragStatusCode" "replayOf" "semantics" "sequenceIds" "status"
                       "target" "updatedAt")
                     (sort (loop for k being the hash-keys of record collect k) #'string<)
                     "dispatch record carries exactly the agreed keys")
+      ;; The PE's clock when it stored the record (RealityEngine_CI#600).
+      (let ((clock (reality-engine-lsp::jget record "clock")))
+        (assert-true (and (reality-engine-lsp::jobject-p clock)
+                          (stringp (reality-engine-lsp::jget clock "instance"))
+                          (plusp (reality-engine-lsp::jget clock "lamport")))
+                     "dispatch record carries the PE's clock {instance, lamport}"))
       (let* ((id (reality-engine-lsp::jstring record "id" ""))
              (patched (reality-engine-lsp::update-dispatch-record
                        state id

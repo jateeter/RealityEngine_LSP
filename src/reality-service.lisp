@@ -252,7 +252,9 @@ sends arrive on request threads while commits run elsewhere, hence LOCK."
   (lamport-reserved 0) (commit-reserved 0)
   (lamport-file nil) (commit-file nil)
   (lock (bt2:make-lock :name "participant-clock"))
-  (last-commit (cons 0 0)))
+  (last-commit (cons 0 0))
+  ;; Inbound RE-Clock headers since boot: well-formed, absent, refused.
+  (headers-received 0) (headers-missing 0) (headers-rejected 0))
 
 (defun pclock-start (clock file)
   "Lock the participant, then resume the clock persisted in FILE (<uuid>.lamport)
@@ -331,6 +333,26 @@ is issued. Returns (values lamport commit)."
   (bt2:with-lock-held ((participant-clock-lock clock))
     (participant-clock-last-commit clock)))
 
+(defun pclock-count-header (clock kind)
+  "Count an inbound request's RE-Clock header: :received, :missing or :rejected."
+  (bt2:with-lock-held ((participant-clock-lock clock))
+    (ecase kind
+      (:received (incf (participant-clock-headers-received clock)))
+      (:missing (incf (participant-clock-headers-missing clock)))
+      (:rejected (incf (participant-clock-headers-rejected clock))))))
+
+(defun pclock-headers-json (clock)
+  "`headers` on a clock route: {received, missing, rejected} since boot."
+  (bt2:with-lock-held ((participant-clock-lock clock))
+    (obj "received" (participant-clock-headers-received clock)
+         "missing" (participant-clock-headers-missing clock)
+         "rejected" (participant-clock-headers-rejected clock))))
+
+(defun pclock-event-json (clock)
+  "`clock` on a message the participant stores or forwards: a tick, as
+{instance, lamport} (SURFACE_SPEC \"The instance clock\", body fields)."
+  (obj "instance" (participant-clock-uuid clock) "lamport" (pclock-send clock)))
+
 (defun pclock-header (clock lamport)
   (format nil "instance=~a; lamport=~d" (participant-clock-uuid clock) lamport))
 
@@ -405,10 +427,14 @@ stamped."
         (lambda ()
           (let ((values (loop for (name . value) in (hunchentoot:headers-in*)
                               when (eq name :re-clock) collect value)))
-            (cond ((null values) (pclock-receive clock nil) nil)
+            (cond ((null values)
+                   (pclock-count-header clock :missing)
+                   (pclock-receive clock nil) nil)
                   ((and (null (cdr values)) (parse-re-clock (car values)))
+                   (pclock-count-header clock :received)
                    (pclock-receive clock (parse-re-clock (car values))) nil)
-                  (t (pclock-receive clock nil)
+                  (t (pclock-count-header clock :rejected)
+                     (pclock-receive clock nil)
                      (error-response "malformed RE-Clock header" 400)))))
         *response-send*
         (lambda ()
@@ -2523,8 +2549,11 @@ for the route to answer, since error-response cannot run on the actor thread."
   "GET /api/engine/clock — this engine's clock at the newest committed step: its
 UUID, that step's lamport and commit (never reset; the clock as booted before
 the first since boot) and its number (-1 before the first since boot or reset)."
-  (let ((committed (last-commit state)))
-    (lamport-tick-json state (car committed) (cdr committed) (latest-committed-step state))))
+  (let ((committed (last-commit state))
+        (out nil))
+    (setf out (lamport-tick-json state (car committed) (cdr committed) (latest-committed-step state)))
+    (setf (gethash "headers" out) (pclock-headers-json (state-clock state)))
+    out))
 
 (defun stamp-step-clock (state step)
   "Put the committed step's clock in its reply, so a PE can key what it records
