@@ -2487,6 +2487,8 @@ minted per runtime, so id order would differ between runtimes
           ;; inside assembly, which made `/api/state` advance them too — see
           ;; advance-perception-engine.
           (advance-perception-engine engine)
+          ;; A completed push is the PE's commit (RealityEngine_CI#600).
+          (when *pe-clock* (pclock-commit-step *pe-clock*))
           ;; Semantic audit (SEMANTIC_AUDIT_CONTRACT.md): one re:PerceptionEvent
           ;; per active source region written this push, attributed to the
           ;; integration feeding it and joined to the corpus ABox when the
@@ -2644,8 +2646,25 @@ running loop, starts one timer, and returns the interval it runs at."
     {\"id\":\"agx032-temp-ok\",      \"topicFilter\":\"LATERAL/AmbientSuite/DEV0000009/SensorReadings/v1\",   \"sensorIdTemplate\":\"agx032.temp.ok\",            \"region\":{\"offset\":231,\"length\":1},\"extract\":{\"type\":\"json\",\"pointer\":\"/data/aTemp\"},       \"normalize\":{\"mode\":\"band\",\"min\":65,   \"max\":85}}
   ]}"))
 
+(defvar *pe-clock* nil
+  "The PE's participant clock (RealityEngine_CI#600): its own UUID
+(PE_INSTANCE_UUID), lock and marks, booted with the service. A completed push
+is its commit.")
+
 (defun perception-routes (actor)
   (list
+   ;; GET /api/clock: {instance, lamport, commit, step} at the newest completed
+   ;; push, commit counting completed pushes and step the globalStep (#600).
+   (make-route "GET" "/api/clock" (lambda (_ body query)
+                                    (declare (ignore _ body query))
+                                    (let ((clock (or *pe-clock* (make-participant-clock :uuid (make-uuid))))
+                                          (step (actor-ask actor (lambda (state)
+                                                                   (or (perception-engine-global-step
+                                                                        (perception-state-engine state))
+                                                                       0)))))
+                                      (destructuring-bind (lamport . commit) (pclock-last-commit clock)
+                                        (json-response (obj "instance" (participant-clock-uuid clock)
+                                                            "lamport" lamport "commit" commit "step" step))))))
    (make-route "GET" "/" (lambda (_ body query)
                            (declare (ignore _ body query))
                            (json-response (obj "service" "Perception Engine (LSP)" "status" "running"))))
@@ -3264,6 +3283,10 @@ startup — the PE still serves HTTP signals as a pure REST engine."
                                       (localai-url "http://localhost:4000")
                                       (localai-machine-dir "../localAIStack/data/machines")
                                       (dimension 7680))
+  ;; The PE's participant clock, booted before it calls anyone (#600): every
+  ;; request a receive, every response and call to an internal peer a send.
+  (setf *pe-clock* (boot-participant-clock "PE_INSTANCE_UUID"))
+  (install-participant-clock *pe-clock*)
   (let* ((state (make-perception-state-from-config :dimension dimension
                                                    :reality-url reality-url
                                                    :localai-url localai-url
