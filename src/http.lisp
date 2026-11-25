@@ -79,6 +79,20 @@ Must be called on the request thread — the hunchentoot context is dynamic."
         (hunchentoot:header-out :access-control-allow-methods) +cors-allow-methods+
         (hunchentoot:header-out :access-control-allow-headers) +cors-allow-headers+))
 
+;; Run around every routed request, a 404 included (RealityEngine_CI#600, the
+;; participant clock): *REQUEST-RECEIVE* before it is handled, and the body it
+;; returns, when it returns one, answers instead (a malformed RE-Clock);
+;; *RESPONSE-SEND* on every response (stamping RE-Clock). Both run on the
+;; request thread. Unset, nothing changes.
+(defvar *request-receive* nil)
+(defvar *response-send* nil)
+;; The participant clock on outbound calls (#600): *CLIENT-CLOCK-STAMP* ticks and
+;; returns the RE-Clock value for a call to an internal peer;
+;; *CLIENT-CLOCK-RECEIVE* takes the response's RE-Clock, or NIL. Unset, nothing
+;; is stamped; an external party never is.
+(defvar *client-clock-stamp* nil)
+(defvar *client-clock-receive* nil)
+
 (defun dispatch-route (routes)
   (let* ((method (string-upcase (symbol-name (hunchentoot:request-method*))))
          (path (hunchentoot:script-name*))
@@ -90,6 +104,14 @@ Must be called on the request thread — the hunchentoot context is dynamic."
     ;; them surfaces in the browser as an opaque CORS failure rather than the
     ;; 404 it actually is.
     (set-cors-headers)
+    (let* ((refused (and *request-receive* (funcall *request-receive*)))
+           (body (or refused (dispatch-matched method path route))))
+      (when *response-send* (funcall *response-send*))
+      body)))
+
+(defun dispatch-matched (method path route)
+  "Answer a request DISPATCH-ROUTE matched (or did not)."
+  (let ((route route))
     (cond
       ;; Preflight is answered for any path, matching the other runtimes:
       ;; the browser asks before it knows whether the route exists.
@@ -188,39 +210,46 @@ patterns a device may reach without a client certificate."
            (error "HTTP request to ~a timed out (connect ~a s, total ~a s)"
                   ,u (http-connect-timeout) (http-total-timeout)))))))
 
+(defun clocked-drakma (url drakma-args)
+  "DRAKMA:HTTP-REQUEST for URL with DRAKMA-ARGS, lane TLS or plain, bounded, the
+participant clock applied (#600): a call to an internal peer carries RE-Clock
+and its response's RE-Clock is received. Returns the body."
+  (let* ((host (ignore-errors (puri:uri-host (puri:parse-uri url))))
+         (clocked (and *client-clock-stamp* host (internal-host-p host)))
+         (args (if clocked
+                   (let ((extra (getf drakma-args :additional-headers)))
+                     (append (list :additional-headers
+                                   (acons "RE-Clock" (funcall *client-clock-stamp*) extra))
+                             (loop for (key value) on drakma-args by #'cddr
+                                   unless (eq key :additional-headers) append (list key value))))
+                   drakma-args)))
+    (with-bounded-http (url)
+      (multiple-value-bind (body headers)
+          (if (tls-lane-url-p url)
+              (tls-lane-request url args)
+              (multiple-value-bind (b status hs)
+                  (apply #'drakma:http-request url
+                         (append args (list :close t :connection-timeout (http-connect-timeout))))
+                (declare (ignore status))
+                (values b hs)))
+        (when (and clocked *client-clock-receive*)
+          (funcall *client-clock-receive* (cdr (assoc :re-clock headers))))
+        body))))
+
 (defun http-get-json (url)
-  (with-bounded-http (url)
-    (parse-json (drakma-body-string
-                 (if (tls-lane-url-p url)
-                     (tls-lane-request url (list :method :get))
-                     (drakma:http-request url :method :get :close t
-                                          :connection-timeout (http-connect-timeout)))))))
+  (parse-json (drakma-body-string (clocked-drakma url (list :method :get)))))
 
 (defun http-post-json (url payload)
-  (with-bounded-http (url)
-    (parse-json (drakma-body-string
-                 (if (tls-lane-url-p url)
-                     (tls-lane-request url (list :method :post
-                                                 :content (json-stringify payload)
-                                                 :content-type "application/json"))
-                     (drakma:http-request url
-                                          :method :post
-                                          :content (json-stringify payload)
-                                          :content-type "application/json"
-                                          :close t
-                                          :connection-timeout (http-connect-timeout)))))))
+  (parse-json (drakma-body-string
+               (clocked-drakma url (list :method :post
+                                         :content (json-stringify payload)
+                                         :content-type "application/json")))))
 
 (defun http-request-json (url &key (method :get) payload headers)
-  (let ((args (list url :method method)))
+  (let ((args (list :method method)))
     (when payload
       (setf args (append args (list :content (json-stringify payload)
                                     :content-type "application/json"))))
     (when headers
       (setf args (append args (list :additional-headers headers))))
-    (with-bounded-http (url)
-      (parse-json (drakma-body-string
-                   (if (tls-lane-url-p url)
-                       (tls-lane-request url (rest args))
-                       (apply #'drakma:http-request
-                              (append args (list :close t
-                                                 :connection-timeout (http-connect-timeout))))))))))
+    (parse-json (drakma-body-string (clocked-drakma url args)))))

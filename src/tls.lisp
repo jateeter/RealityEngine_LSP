@@ -266,7 +266,8 @@ instance registry addresses engines by IP)."
          :external-format (flexi-streams:make-external-format :latin-1 :eol-style :lf))))))
 
 (defun tls-lane-request (url drakma-args)
-  "DRAKMA:HTTP-REQUEST over a pooled lane TLS stream. Returns the body."
+  "DRAKMA:HTTP-REQUEST over a pooled lane TLS stream. Returns the body and the
+response headers."
   (let* ((uri (puri:parse-uri url))
          (host (puri:uri-host uri))
          (port (or (puri:uri-port uri) 443))
@@ -275,11 +276,11 @@ instance registry addresses engines by IP)."
     (flet ((attempt (stream)
              (multiple-value-bind (body status headers uri* stream* must-close)
                  (apply #'drakma:http-request url :stream stream :close nil drakma-args)
-               (declare (ignore status headers uri*))
+               (declare (ignore status uri*))
                (if must-close
                    (ignore-errors (close stream*))
                    (tls-pool-put key stream*))
-               body)))
+               (values body headers))))
       (let ((reused (tls-pool-take key)))
         (if reused
             (handler-case (attempt reused)

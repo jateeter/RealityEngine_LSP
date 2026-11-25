@@ -94,9 +94,9 @@
   ;; The id this engine instance was launched as (INSTANCE_ID, e.g. lsp-1): the
   ;; middle segment of every clone id. Without it nothing can be cloned.
   (engine-instance (or (uiop:getenv "INSTANCE_ID") ""))
-  (lamport 0)
-  (lamport-reserved 0)
-  (lamport-file nil)
+  ;; The participant clock (RealityEngine_CI#296, #600): lamport, commit, their
+  ;; marks and lock. One implementation for the RE and the PE.
+  (clock (make-participant-clock))
   ;; The step completion point (RealityEngine_CI#375): signalled when a step's
   ;; (ISRE, OSRE) pair is committed, waited on by GET /api/engine/steps/:n/pair.
   (step-signal (make-step-signal)))
@@ -239,26 +239,141 @@ over it, so a crash leaves the old mark or the new one and never a torn one."
       (finish-output out))
     (uiop:rename-file-overwriting-target tmp file)))
 
-(defun start-lamport-clock (state file)
-  "Lock the instance, then resume the clock persisted in FILE: start from its
-mark and reserve the next block before issuing any tick. A lock held elsewhere,
-or a file that cannot be read or written, is an error, not a fallback -- either
-way ticks could be issued twice, which is the one thing the clock must not do."
+(defstruct participant-clock
+  "A participant's clock (RealityEngine_CI#600): `lamport` is the full Lamport
+clock (a committed step, a send, a receive), `commit` counts committed steps.
+Neither resets. For an allocated participant each has a mark reserved
++lamport-reservation+ ahead (<uuid>.lamport, <uuid>.commit), and a tick past a
+mark -- a receive jumping past it included -- persists the next mark first.
+LAST-COMMIT is (lamport . commit) of the newest commit since boot. Receives and
+sends arrive on request threads while commits run elsewhere, hence LOCK."
+  uuid
+  (lamport 0) (commit 0)
+  (lamport-reserved 0) (commit-reserved 0)
+  (lamport-file nil) (commit-file nil)
+  (lock (bt2:make-lock :name "participant-clock"))
+  (last-commit (cons 0 0))
+  ;; Inbound RE-Clock headers since boot: well-formed, absent, refused.
+  (headers-received 0) (headers-missing 0) (headers-rejected 0))
+
+(defun pclock-start (clock file)
+  "Lock the participant, then resume the clock persisted in FILE (<uuid>.lamport)
+and its commit mark beside it (<uuid>.commit): start from each mark and reserve
+the next block before issuing any tick. A directory from before #600 holds only
+<uuid>.lamport, which counted committed steps; it seeds both marks, which keeps
+lamport >= commit. A lock held elsewhere, or a file that cannot be read or
+written, is an error, not a fallback -- either way ticks could be issued twice,
+which is the one thing the clock must not do."
   (lock-instance file)
-  (let ((mark (read-lamport-reservation file)))
-    (setf (reality-state-lamport-file state) file
-          (reality-state-lamport state) mark
-          (reality-state-lamport-reserved state) (+ mark +lamport-reservation+))
-    (write-lamport-reservation file (reality-state-lamport-reserved state))
-    state))
+  (let* ((commit-file (make-pathname :type "commit" :defaults file))
+         (migrating (not (probe-file commit-file)))
+         (lamport (read-lamport-reservation file))
+         (commit (if migrating lamport (read-lamport-reservation commit-file))))
+    (setf lamport (max lamport commit))
+    (setf (participant-clock-lamport-file clock) file
+          (participant-clock-commit-file clock) commit-file
+          (participant-clock-lamport clock) lamport
+          (participant-clock-commit clock) commit
+          (participant-clock-lamport-reserved clock) (+ lamport +lamport-reservation+)
+          (participant-clock-commit-reserved clock) (+ commit +lamport-reservation+)
+          (participant-clock-last-commit clock) (cons lamport commit))
+    (write-lamport-reservation commit-file (participant-clock-commit-reserved clock))
+    (write-lamport-reservation file (participant-clock-lamport-reserved clock))
+    clock))
+
+(defun boot-participant-clock (variable)
+  "The participant's clock for this boot, from VARIABLE (INSTANCE_UUID for an RE,
+PE_INSTANCE_UUID for a PE): an allocated UUID resumes its persisted clock; a
+minted one starts at 0, being a new participant."
+  (let ((allocated (env variable nil)))
+    (cond ((canonical-uuid-p allocated)
+           (let ((uuid (string-downcase allocated)))
+             (pclock-start (make-participant-clock :uuid uuid) (lamport-file-for uuid))))
+          (t (when (and allocated (plusp (length allocated)))
+               (format *error-output* "~&~a ~s is not a canonical UUID; minting one~%" variable allocated))
+             (make-participant-clock :uuid (make-uuid))))))
+
+(defun pclock-advance (clock next)
+  "Set lamport to NEXT, persisting the next block first when NEXT passes the
+reserved mark. Caller holds the clock's lock."
+  (let ((file (participant-clock-lamport-file clock)))
+    (when (and file (> next (participant-clock-lamport-reserved clock)))
+      (let ((reserved (+ next +lamport-reservation+)))
+        (write-lamport-reservation file reserved)
+        (setf (participant-clock-lamport-reserved clock) reserved)))
+    (setf (participant-clock-lamport clock) next)))
+
+(defun pclock-commit-step (clock)
+  "A committed step: tick commit and lamport together, each persisted before it
+is issued. Returns (values lamport commit)."
+  (bt2:with-lock-held ((participant-clock-lock clock))
+    (let ((commit (1+ (participant-clock-commit clock)))
+          (file (participant-clock-commit-file clock)))
+      (when (and file (> commit (participant-clock-commit-reserved clock)))
+        (let ((reserved (+ commit +lamport-reservation+)))
+          (write-lamport-reservation file reserved)
+          (setf (participant-clock-commit-reserved clock) reserved)))
+      (setf (participant-clock-commit clock) commit)
+      (let ((lamport (pclock-advance clock (1+ (participant-clock-lamport clock)))))
+        (setf (participant-clock-last-commit clock) (cons lamport commit))
+        (values lamport commit)))))
+
+(defun pclock-send (clock)
+  "A send -- a response or an outbound call: tick lamport; return it."
+  (bt2:with-lock-held ((participant-clock-lock clock))
+    (pclock-advance clock (1+ (participant-clock-lamport clock)))))
+
+(defun pclock-receive (clock received)
+  "A receive: max(local, RECEIVED) + 1, or local + 1 when RECEIVED is NIL."
+  (bt2:with-lock-held ((participant-clock-lock clock))
+    (pclock-advance clock (1+ (max (participant-clock-lamport clock) (or received 0))))))
+
+(defun pclock-last-commit (clock)
+  "(lamport . commit) of the newest commit since boot."
+  (bt2:with-lock-held ((participant-clock-lock clock))
+    (participant-clock-last-commit clock)))
+
+(defun pclock-count-header (clock kind)
+  "Count an inbound request's RE-Clock header: :received, :missing or :rejected."
+  (bt2:with-lock-held ((participant-clock-lock clock))
+    (ecase kind
+      (:received (incf (participant-clock-headers-received clock)))
+      (:missing (incf (participant-clock-headers-missing clock)))
+      (:rejected (incf (participant-clock-headers-rejected clock))))))
+
+(defun pclock-headers-json (clock)
+  "`headers` on a clock route: {received, missing, rejected} since boot."
+  (bt2:with-lock-held ((participant-clock-lock clock))
+    (obj "received" (participant-clock-headers-received clock)
+         "missing" (participant-clock-headers-missing clock)
+         "rejected" (participant-clock-headers-rejected clock))))
+
+(defun pclock-event-json (clock)
+  "`clock` on a message the participant stores or forwards: a tick, as
+{instance, lamport} (SURFACE_SPEC \"The instance clock\", body fields)."
+  (obj "instance" (participant-clock-uuid clock) "lamport" (pclock-send clock)))
+
+(defun pclock-header (clock lamport)
+  (format nil "instance=~a; lamport=~d" (participant-clock-uuid clock) lamport))
+
+;; The RE's names for its clock, kept so call sites read as before.
+(defun state-clock (state)
+  "STATE's participant clock, given the state's instance UUID."
+  (let ((clock (reality-state-clock state)))
+    (unless (participant-clock-uuid clock)
+      (setf (participant-clock-uuid clock) (state-instance-uuid state)))
+    clock))
+
+(defun start-lamport-clock (state file)
+  "Resume STATE's clock from FILE (see PCLOCK-START). Returns STATE."
+  (pclock-start (state-clock state) file)
+  state)
 
 (defun boot-instance-clock (state)
-  "Give STATE its instance UUID and clock at boot. An allocated UUID resumes its
-persisted clock; a minted one starts at 0, being a new instance."
-  (multiple-value-bind (uuid allocated-p) (boot-instance-uuid)
-    (setf (reality-state-instance-uuid state) uuid)
-    (when allocated-p
-      (start-lamport-clock state (lamport-file-for uuid)))
+  "Give STATE its instance UUID and clock at boot (INSTANCE_UUID)."
+  (let ((clock (boot-participant-clock "INSTANCE_UUID")))
+    (setf (reality-state-clock state) clock
+          (reality-state-instance-uuid state) (participant-clock-uuid clock))
     state))
 
 (defun state-instance-uuid (state)
@@ -266,20 +381,73 @@ persisted clock; a minted one starts at 0, being a new instance."
   (or (reality-state-instance-uuid state)
       (setf (reality-state-instance-uuid state) (make-uuid))))
 
-(defun tick-lamport (state)
-  "Advance the Lamport clock for a committed step and return the new value.
-For an allocated instance the next block is persisted before a tick past the
-persisted mark is issued, never after."
-  (let ((next (1+ (reality-state-lamport state)))
-        (file (reality-state-lamport-file state)))
-    (when (and file (> next (reality-state-lamport-reserved state)))
-      (let ((reserved (+ next +lamport-reservation+)))
-        (write-lamport-reservation file reserved)
-        (setf (reality-state-lamport-reserved state) reserved)))
-    (setf (reality-state-lamport state) next)))
+(defun commit-step (state) (pclock-commit-step (state-clock state)))
+(defun clock-send (state) (pclock-send (state-clock state)))
+(defun clock-receive (state received) (pclock-receive (state-clock state) received))
+(defun last-commit (state) (pclock-last-commit (state-clock state)))
 
-(defun lamport-tick-json (state lamport step-number)
-  (obj "instance" (state-instance-uuid state) "lamport" lamport "step" step-number))
+(defun lamport-tick-json (state lamport commit step-number)
+  "The clock as every surface reports it: {instance, lamport, commit, step}."
+  (obj "instance" (state-instance-uuid state) "lamport" lamport "commit" commit "step" step-number))
+
+;; ── The RE-Clock header (SURFACE_SPEC "The header", RealityEngine_CI#600) ──
+(defconstant +max-lamport+ 9007199254740991
+  "2^53 - 1: the largest lamport an RE-Clock header may carry.")
+
+(defun lower-uuid-p (string)
+  (and (canonical-uuid-p string) (notany #'upper-case-p string)))
+
+(defun parse-re-clock (value)
+  "The sender's lamport from an RE-Clock value, or NIL when it is malformed:
+`instance=<lower-case uuid>; lamport=<n>`, both once and in that order, N an
+integer in [0, 2^53 - 1] with no sign or leading zeros."
+  (let ((semi (and (stringp value) (position #\; value))))
+    (when (and semi (null (position #\; value :start (1+ semi))))
+      (let ((first (string-trim " " (subseq value 0 semi)))
+            (second (string-trim " " (subseq value (1+ semi)))))
+        (when (and (> (length first) 9) (string= "instance=" first :end2 9)
+                   (> (length second) 8) (string= "lamport=" second :end2 8))
+          (let ((uuid (subseq first 9))
+                (digits (subseq second 8)))
+            (when (and (lower-uuid-p uuid)
+                       (<= (length digits) 16)
+                       (every #'digit-char-p digits)
+                       (or (= (length digits) 1) (char/= (char digits 0) #\0)))
+              (let ((n (parse-integer digits)))
+                (when (<= n +max-lamport+) n)))))))))
+
+(defun install-participant-clock (clock)
+  "The participant clock on this process's HTTP boundaries (#600), for the RE
+and the PE alike. Server: every request is a receive, applied before it is
+handled, a malformed or repeated RE-Clock refused with 400 (still a receive),
+and every response a send stamped RE-Clock. Client: every call to an internal
+peer a send (stamped) and its response a receive; an external party is never
+stamped."
+  (setf *request-receive*
+        (lambda ()
+          (let ((values (loop for (name . value) in (hunchentoot:headers-in*)
+                              when (eq name :re-clock) collect value)))
+            (cond ((null values)
+                   (pclock-count-header clock :missing)
+                   (pclock-receive clock nil) nil)
+                  ((and (null (cdr values)) (parse-re-clock (car values)))
+                   (pclock-count-header clock :received)
+                   (pclock-receive clock (parse-re-clock (car values))) nil)
+                  (t (pclock-count-header clock :rejected)
+                     (pclock-receive clock nil)
+                     (error-response "malformed RE-Clock header" 400)))))
+        *response-send*
+        (lambda ()
+          (setf (hunchentoot:header-out "RE-Clock")
+                (pclock-header clock (pclock-send clock))))
+        *client-clock-stamp*
+        (lambda () (pclock-header clock (pclock-send clock)))
+        *client-clock-receive*
+        (lambda (header) (pclock-receive clock (and header (parse-re-clock header))))))
+
+(defun install-request-clock (state)
+  "The RE's participant clock on its HTTP boundaries."
+  (install-participant-clock (state-clock state)))
 
 ;; ── Arbitration retention keyed by step (RealityEngine_CI#296) ───────────────
 ;; Every function here runs on the actor thread, which is what serialises the
@@ -296,12 +464,12 @@ persisted mark is issued, never after."
              steps)
     (dolist (step dead) (remhash step steps))))
 
-(defun retain-arbitration (state step-number lamport records)
-  "Keep STEP-NUMBER's records, stamped with the LAMPORT tick it committed at,
-when retention is on and the window is non-empty."
+(defun retain-arbitration (state step-number clock records)
+  "Keep STEP-NUMBER's records, stamped with the CLOCK, (lamport . commit), it
+committed at, when retention is on and the window is non-empty."
   (when (and (reality-state-arbitration-retention-p state)
              (plusp (reality-state-arbitration-window state)))
-    (setf (gethash step-number (reality-state-arbitration-steps state)) (cons lamport records))
+    (setf (gethash step-number (reality-state-arbitration-steps state)) (cons clock records))
     (prune-arbitration-steps state step-number)))
 
 (defun compose-key (producer-machine-id producer-sequence-id)
@@ -2102,8 +2270,9 @@ always treated presence as activation; this runtime is the one that differed."
       (record-trajectory state isre osre)
       ;; Retained before the completion point is signalled, so an observer woken
       ;; for step n finds n's arbitration records already there (#296).
-      (retain-arbitration state (jnumber isre "stepNumber" 0) (tick-lamport state)
-                          (reality-state-arbitration state))
+      (multiple-value-bind (lamport commit) (commit-step state)
+        (retain-arbitration state (jnumber isre "stepNumber" 0) (cons lamport commit)
+                            (reality-state-arbitration state)))
       (tick-step-phase state 3)                             ; B4: pair committed
       ;; The pair is committed: the step's completion point (#375).
       (signal-step-completed state (jnumber isre "stepNumber" 0))
@@ -2338,9 +2507,9 @@ the most recent step."
 
 (defun arbitration-step-json (state step-number entry)
   "One retained step: its records, canonically ordered, under its clock.
-ENTRY is (lamport . records) as retain-arbitration stored it."
-  (destructuring-bind (lamport . records) entry
-    (obj "clock" (lamport-tick-json state lamport step-number)
+ENTRY is ((lamport . commit) . records) as retain-arbitration stored it."
+  (destructuring-bind ((lamport . commit) . records) entry
+    (obj "clock" (lamport-tick-json state lamport commit step-number)
          "registryEntries" (arbitration-registry-size)
          "registrySource" (or *arbitration-source* :null)
          "shards" (arbiter-shards)
@@ -2377,10 +2546,22 @@ for the route to answer, since error-response cannot run on the actor thread."
                (list :refused (format nil "step ~d is no longer retained" step-number) 410))))))
 
 (defun engine-clock-json (state)
-  "GET /api/engine/clock — this engine's clock: its UUID, the Lamport value of
-the newest committed step (0 before the first since boot; never reset) and that
-step's number (-1 before the first step since boot or reset)."
-  (lamport-tick-json state (reality-state-lamport state) (latest-committed-step state)))
+  "GET /api/engine/clock — this engine's clock at the newest committed step: its
+UUID, that step's lamport and commit (never reset; the clock as booted before
+the first since boot) and its number (-1 before the first since boot or reset)."
+  (let ((committed (last-commit state))
+        (out nil))
+    (setf out (lamport-tick-json state (car committed) (cdr committed) (latest-committed-step state)))
+    (setf (gethash "headers" out) (pclock-headers-json (state-clock state)))
+    out))
+
+(defun stamp-step-clock (state step)
+  "Put the committed step's clock in its reply, so a PE can key what it records
+by the RE's (instance, commit) (SURFACE_SPEC \"Identity, clock and parity\")."
+  (let ((committed (last-commit state)))
+    (setf (jget step "clock")
+          (lamport-tick-json state (car committed) (cdr committed) (jnumber step "stepNumber" 0)))
+    step))
 
 (defun machine-graph-json (state)
   (let (nodes edges)
@@ -2754,6 +2935,7 @@ list differed by order alone."
          (let ((step (process-perceptual-input state (reality-state-perceptual-space state)
                                                :include-machine-results t
                                                :include-perceptual-space t)))
+           (stamp-step-clock state step)
            (setf (reality-state-sim-current-step state) (1+ current))
            ;; A live run ends on the step that finishes the walk, not on the
            ;; call after, so isRunning reads false as soon as the last Reality Event
@@ -3946,6 +4128,7 @@ its block held by a machine that no longer exists."
                                                                            ;; Presence activates the selector, not
                                                                            ;; content (#367).
                                                                            :only-present (jobject-p (jget body "only")))))
+                                                                (stamp-step-clock state step)
                                                                 (re-broadcast (obj "type" "step-result" "step" step))
                                                                 step)
                                                               (obj "error" "Provide exactly one of: vector, sparseVector, domainVectors"))))))))))
@@ -3953,6 +4136,7 @@ its block held by a machine that no longer exists."
 (defun start-reality-service (&key (port 5601) (machine-dir "../RealityEngine_Machines/machines") (dimension 7680))
   (let* ((state (make-reality-state-from-config :machine-dir machine-dir :dimension dimension))
          (actor (state-actor "reality-service" state)))
+    (install-request-clock state)
     (start-http-server port (reality-routes actor) :name "reality-engine-lsp"
                        :extra-dispatchers
                        (list (hunchentoot:create-prefix-dispatcher

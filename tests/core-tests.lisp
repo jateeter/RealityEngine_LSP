@@ -1431,8 +1431,8 @@ declared operator over [0..1] (ARBITER_CONTRACT.md section 4.4b)."
            (commit (state n records)
              ;; What the step does: set the latest records, retain, signal.
              (setf (reality-engine-lsp::reality-state-arbitration state) records)
-             (reality-engine-lsp::retain-arbitration
-              state n (reality-engine-lsp::tick-lamport state) records)
+             (multiple-value-bind (lamport commit) (reality-engine-lsp::commit-step state)
+               (reality-engine-lsp::retain-arbitration state n (cons lamport commit) records))
              (reality-engine-lsp::signal-step-completed state n))
            (window (state) (reality-engine-lsp::arbitration-window-json state))
            (steps-of (list) (map 'list (lambda (e) (reality-engine-lsp::jget
@@ -1544,8 +1544,8 @@ declared operator over [0..1] (ARBITER_CONTRACT.md section 4.4b)."
           (put state "arbitrationWindow" 4)
           (commit state 0 nil)
           (commit state 1 nil)
-          (assert-equal '(1 2) (list (field (clock) "step") (field (clock) "lamport"))
-                        "two steps: step 1 at lamport 2 -- one tick per committed step")
+          (assert-equal '(1 2 2) (list (field (clock) "step") (field (clock) "lamport") (field (clock) "commit"))
+                        "two steps: step 1 at lamport 2, commit 2")
           (reality-engine-lsp::reset-reality-state state)
           (assert-equal -1 (field (clock) "step") "a reset restarts the step count")
           (assert-equal 2 (field (clock) "lamport") "a reset does not touch the Lamport clock")
@@ -1554,6 +1554,7 @@ declared operator over [0..1] (ARBITER_CONTRACT.md section 4.4b)."
             (assert-equal 0 (field tick "step") "the step count restarted at 0")
             (assert-equal 3 (field tick "lamport")
                           "the Lamport clock kept ticking: step 0 again, but a new tick")
+            (assert-equal 3 (field tick "commit") "and so did commit")
             (assert-equal engine (field tick "instance")
                           "a reset never changes the engine"))))
       (assert-true (not (reality-engine-lsp::canonical-uuid-p "cpp-1"))
@@ -1568,17 +1569,24 @@ declared operator over [0..1] (ARBITER_CONTRACT.md section 4.4b)."
                     (reality-engine-lsp::start-lamport-clock (fresh) file))
                   (mark () (reality-engine-lsp::read-lamport-reservation file)))
              (let* ((first (boot))
-                    (issued (loop repeat 3 collect (reality-engine-lsp::tick-lamport first))))
+                    (issued (loop repeat 3 collect (reality-engine-lsp::commit-step first))))
                (assert-equal '(1 2 3) issued "a new engine ticks from 1")
                (assert-equal 1024 (mark) "a block is reserved before the first tick")
+               (assert-equal 1024 (reality-engine-lsp::read-lamport-reservation
+                                   (make-pathname :type "commit" :defaults file))
+                             "and its commit mark beside it")
                (let* ((second (boot))
-                      (after-restart (reality-engine-lsp::tick-lamport second)))
+                      (after-restart (reality-engine-lsp::commit-step second)))
                  (assert-true (> after-restart 3) "a restart never reissues a tick")
                  (assert-equal 1025 after-restart "it resumes past the reserved block")
-                 (let ((last (loop repeat 1100 maximize (reality-engine-lsp::tick-lamport second))))
+                 (let ((last (loop repeat 1100 maximize (reality-engine-lsp::clock-send second))))
                    (assert-true (>= (mark) last)
                                 "crossing a block persists the next before the tick is issued")
-                   (assert-true (> (reality-engine-lsp::tick-lamport (boot)) last)
+                   (let ((jumped (reality-engine-lsp::clock-receive second (+ last 10240))))
+                     (assert-equal (+ last 10241) jumped "a receive is max(local, received) + 1")
+                     (assert-true (>= (mark) jumped) "a jump past the mark is durable before it is used")
+                     (setf last jumped))
+                   (assert-true (> (reality-engine-lsp::clock-send (boot)) last)
                                 "and the next boot starts beyond it")))))
         (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))
       (let ((bad (merge-pathnames "bad.lamport" dir)))
@@ -1592,6 +1600,48 @@ declared operator over [0..1] (ARBITER_CONTRACT.md section 4.4b)."
                       (reality-engine-lsp::start-lamport-clock
                        (fresh) #p"/dev/null/cannot/0192f3a0.lamport"))
                     "an unwritable clock refuses the boot"))
+;; The full clock (RealityEngine_CI#600): sends and receives tick lamport only,
+    ;; a receive is max(local, received) + 1, and a pre-#600 directory seeds
+    ;; both marks from its <uuid>.lamport.
+    (let ((state (fresh)))
+      (multiple-value-bind (l c) (reality-engine-lsp::commit-step state)
+        (assert-equal '(1 1) (list l c) "a commit ticks both"))
+      (assert-equal 2 (reality-engine-lsp::clock-send state) "a send ticks lamport")
+      (assert-equal 1 (reality-engine-lsp::participant-clock-commit (reality-engine-lsp::reality-state-clock state)) "and not commit")
+      (assert-equal 3 (reality-engine-lsp::clock-receive state nil) "a receive without a header: + 1")
+      (assert-equal 101 (reality-engine-lsp::clock-receive state 100) "max(local, received) + 1")
+      (assert-equal 102 (reality-engine-lsp::clock-receive state 5) "a value behind moves it by one"))
+    (let* ((dir (uiop:ensure-directory-pathname
+                 (format nil "/tmp/re-lsp-migrate-~d/" (random 1000000000 (make-random-state t)))))
+           (file (merge-pathnames "0192f3a0-0000-7000-8000-0000000003aa.lamport" dir)))
+      (unwind-protect
+           (progn
+             (ensure-directories-exist file)
+             (with-open-file (out file :direction :output :if-exists :supersede)
+               (format out "500~%"))
+             (let ((state (reality-engine-lsp::start-lamport-clock (fresh) file)))
+               (assert-equal '(500 500) (list (reality-engine-lsp::participant-clock-lamport (reality-engine-lsp::reality-state-clock state))
+                                              (reality-engine-lsp::participant-clock-commit (reality-engine-lsp::reality-state-clock state)))
+                             "a pre-#600 <uuid>.lamport seeds both marks")
+               (multiple-value-bind (l c) (reality-engine-lsp::commit-step state)
+                 (declare (ignore l))
+                 (assert-equal 501 c "commit carries on from it"))))
+        (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))
+    (let ((u "0192f3a0-0000-7000-8000-0000000002d9"))
+      (assert-equal 42 (reality-engine-lsp::parse-re-clock (format nil "instance=~a; lamport=42" u)) "a header")
+      (assert-equal 0 (reality-engine-lsp::parse-re-clock (format nil "instance=~a;lamport=0" u)) "no spaces")
+      (assert-equal 9007199254740991
+                    (reality-engine-lsp::parse-re-clock (format nil "instance=~a ;  lamport=9007199254740991" u))
+                    "2^53 - 1")
+      (dolist (bad (list "" (format nil "lamport=1; instance=~a" u) (format nil "instance=~a" u)
+                         (format nil "instance=~a; lamport=" u) (format nil "instance=~a; lamport=-1" u)
+                         (format nil "instance=~a; lamport=01" u)
+                         (format nil "instance=~a; lamport=9007199254740992" u)
+                         (format nil "instance=~a; lamport=1; x=2" u)
+                         "instance=0192F3A0-0000-7000-8000-0000000002D9; lamport=1"
+                         "instance=cpp-1; lamport=1"))
+        (assert-true (null (reality-engine-lsp::parse-re-clock bad))
+                     (format nil "malformed: ~s" bad))))
     ;; Two live instances may not share a UUID: while another process holds the
     ;; instance lock, a boot presenting the same UUID is refused.
     (let* ((dir (uiop:ensure-directory-pathname
@@ -2603,12 +2653,18 @@ print('locked', flush=True); time.sleep(60)"
                     "dispatch ledger should retain PE-owned record")
       ;; Record shape, PATCH semantics and ledger order are settled 3-of-3
       ;; (RealityEngine_CI SURFACE_SPEC.md, Dispatch surface shapes).
-      (assert-equal '("attempts" "correlationId" "createdAt" "envelope" "envelopeId"
+      (assert-equal '("attempts" "clock" "correlationId" "createdAt" "envelope" "envelopeId"
                       "error" "id" "machineId" "mode" "processStatus" "providerReceipt"
                       "ragStatusCode" "replayOf" "semantics" "sequenceIds" "status"
                       "target" "updatedAt")
                     (sort (loop for k being the hash-keys of record collect k) #'string<)
                     "dispatch record carries exactly the agreed keys")
+      ;; The PE's clock when it stored the record (RealityEngine_CI#600).
+      (let ((clock (reality-engine-lsp::jget record "clock")))
+        (assert-true (and (reality-engine-lsp::jobject-p clock)
+                          (stringp (reality-engine-lsp::jget clock "instance"))
+                          (plusp (reality-engine-lsp::jget clock "lamport")))
+                     "dispatch record carries the PE's clock {instance, lamport}"))
       (let* ((id (reality-engine-lsp::jstring record "id" ""))
              (patched (reality-engine-lsp::update-dispatch-record
                        state id
