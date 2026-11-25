@@ -79,6 +79,14 @@ Must be called on the request thread — the hunchentoot context is dynamic."
         (hunchentoot:header-out :access-control-allow-methods) +cors-allow-methods+
         (hunchentoot:header-out :access-control-allow-headers) +cors-allow-headers+))
 
+;; Run around every routed request, a 404 included (RealityEngine_CI#600, the
+;; participant clock): *REQUEST-RECEIVE* before it is handled, and the body it
+;; returns, when it returns one, answers instead (a malformed RE-Clock);
+;; *RESPONSE-SEND* on every response (stamping RE-Clock). Both run on the
+;; request thread. Unset, nothing changes.
+(defvar *request-receive* nil)
+(defvar *response-send* nil)
+
 (defun dispatch-route (routes)
   (let* ((method (string-upcase (symbol-name (hunchentoot:request-method*))))
          (path (hunchentoot:script-name*))
@@ -90,6 +98,14 @@ Must be called on the request thread — the hunchentoot context is dynamic."
     ;; them surfaces in the browser as an opaque CORS failure rather than the
     ;; 404 it actually is.
     (set-cors-headers)
+    (let* ((refused (and *request-receive* (funcall *request-receive*)))
+           (body (or refused (dispatch-matched method path route))))
+      (when *response-send* (funcall *response-send*))
+      body)))
+
+(defun dispatch-matched (method path route)
+  "Answer a request DISPATCH-ROUTE matched (or did not)."
+  (let ((route route))
     (cond
       ;; Preflight is answered for any path, matching the other runtimes:
       ;; the browser asks before it knows whether the route exists.
