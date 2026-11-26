@@ -50,6 +50,11 @@
                    ;; Set on a clone only: the template, the assetID and the
                    ;; dispatch envelope. Serialised only when set.
                    (clone-of nil)
+                   ;; The machine object as its file or request body declared it,
+                   ;; without what ingestion assigns (no `id`): the corpus
+                   ;; fingerprint's input (RealityEngine_CI#603). A copy taken
+                   ;; before the loader writes into the parsed tree.
+                   (declared nil)
                    (asset-id nil)
                    (envelope-id nil))
 

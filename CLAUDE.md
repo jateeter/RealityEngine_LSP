@@ -117,6 +117,21 @@ rebuild, three times per launch, the first time a runner comes up with a cold
   same UUID refuses to boot. An unreadable or unwritable clock refuses the boot
   too. `GET /api/engine/clock` reports the clock. Off, the legacy object is
   unchanged except that a reset clears it.
+- K-lines (RealityEngine_CI#603, #172) are captured in `src/kline.lisp` at the
+  step completion point, after the commit tick and arbitration retention, by
+  the same algorithm as RealityEngine_CPP `src/kline.cpp`: the tracker reads
+  each committed step's sequence results and the machines' active events,
+  never re-deriving the transition rule, and appends closed K-lines
+  (`re-kline/1`) and `sustain-end` events to `<INSTANCE_KLINE_DIR>/<uuid>/`
+  (default the clock dir's sibling `klines/`), fsynced before the completion
+  is published, with `open.json` checkpointed. SHA-256 is libcrypto's
+  `EVP_Digest` through CFFI (cl+ssl loads it); the fingerprint hashes each
+  machine's `declared` form, copied at load before the loader writes into the
+  parsed tree. Until Scala serves K-lines, capture is off by default and
+  `RE_KLINE_CAPTURE=1` turns it on; its controls are not on
+  `/api/engine/config` and the routes are not in the OpenAPI document, both
+  compared across the voters. `tests/kline-tests.lisp` covers the boundaries
+  and the store.
 - Use the same ACP/OpenClaw environment defaults as the rest of the application.
 
 ## LSP Support

@@ -97,6 +97,11 @@
   ;; The participant clock (RealityEngine_CI#296, #600): lamport, commit, their
   ;; marks and lock. One implementation for the RE and the PE.
   (clock (make-participant-clock))
+  ;; K-lines (RealityEngine_CI#603): the tracker, and the resident corpus's
+  ;; fingerprint cached by mapping version.
+  (klines nil)
+  (kline-fingerprint "")
+  (kline-fingerprint-version -1)
   ;; The step completion point (RealityEngine_CI#375): signalled when a step's
   ;; (ISRE, OSRE) pair is committed, waited on by GET /api/engine/steps/:n/pair.
   (step-signal (make-step-signal)))
@@ -382,6 +387,29 @@ is issued. Returns (values lamport commit)."
       (setf (reality-state-instance-uuid state) (make-uuid))))
 
 (defun commit-step (state) (pclock-commit-step (state-clock state)))
+
+(defun kline-failed (state condition)
+  "A store that cannot be written stops capture, not the engine, and says so."
+  (format *error-output* "~&K-line capture stopped: ~a~%" condition)
+  (setf (klt-capture (reality-state-klines state)) nil))
+
+(defun capture-klines (state step commit composed merge-batch isre osre)
+  (let ((tracker (reality-state-klines state)))
+    (when (and tracker (klt-capture tracker) composed)
+      (handler-case
+          (progn
+            (unless (eql (reality-state-kline-fingerprint-version state) (reality-state-mapping-version state))
+              (let (pairs)
+                (maphash (lambda (_ m)
+                           (declare (ignore _))
+                           (push (cons (machine-name m) (or (machine-declared m) (obj "name" (machine-name m)))) pairs))
+                         (reality-state-machines state))
+                (setf (reality-state-kline-fingerprint state) (corpus-fingerprint pairs)
+                      (klt-longest-path tracker) (kline-longest-path (reality-state-machines state))
+                      (reality-state-kline-fingerprint-version state) (reality-state-mapping-version state))))
+            (kline-on-step tracker step commit composed merge-batch isre osre
+                           (reality-state-machines state) (reality-state-kline-fingerprint state)))
+        (error (e) (kline-failed state e))))))
 (defun clock-send (state) (pclock-send (state-clock state)))
 (defun clock-receive (state received) (pclock-receive (state-clock state) received))
 (defun last-commit (state) (pclock-last-commit (state-clock state)))
@@ -763,6 +791,8 @@ schema does not declare — isActive, state, wasJustMatched — which
     ;; clock, or whose UUID another live process holds, fails here rather than
     ;; after minutes of loading.
     (boot-instance-clock state)
+    (setf (reality-state-klines state)
+          (make-engine-kline-tracker (state-instance-uuid state) (lambda () (clock-send state))))
     (dolist (machine (load-machines-from-directory machine-dir))
       (put-machine state machine))
     state))
@@ -889,6 +919,10 @@ same state — an engine with nothing loaded requires nothing."
          "latchedEventBitCount" (hash-table-count (reality-state-latched-event-bits state)))))
 
 (defun reset-reality-state (state)
+  ;; Open K-lines close `interrupted` (reset) at the last committed step (#603).
+  (when (reality-state-klines state)
+    (handler-case (kline-on-reset (reality-state-klines state))
+      (error (e) (kline-failed state e))))
   ;; Step numbers restart, so the completion point does too (#375).
   (reset-step-signal state)
   ;; Arbitration records belong to a step, and a reset ends every step there
@@ -1930,7 +1964,12 @@ always treated presence as activation; this runtime is the one that differed."
         ;; MERGE-BATCH because a refusal removes the machine from the batch and
         ;; must not remove it from the event bus.
         (contributions nil)
-        (active-regions nil))
+        (active-regions nil)
+        ;; What the K-line tracker reads at the completion point (#603): the
+        ;; compositions and the unfiltered batch, before a selective reply
+        ;; shadows MERGE-BATCH.
+        (kline-composed nil)
+        (kline-ops nil))
     ;; Composition, in parallel (RealityEngine_CI#375). Every machine composes
     ;; its Reality Event from ISRE(n) at once, through lparallel; `pmap` is the
     ;; join, so nothing below runs until every composer has completed. Only then
@@ -1940,6 +1979,7 @@ always treated presence as activation; this runtime is the one that differed."
     ;; parallel, and the join the contract requires did not exist.
     (tick-step-phase state 0)                               ; B1: ISRE captured
     (let ((composed (compose-machines state override)))
+    (setf kline-composed composed)
     (tick-step-phase state 1)                               ; B2: every composer joined
     (dolist (machine (object-values-sorted (reality-state-machines state)))
       (let ((id (machine-id machine)))
@@ -2085,6 +2125,7 @@ always treated presence as activation; this runtime is the one that differed."
     ;; so the bump order matches AI/CPP exactly.  `%deprecatedFires` is the
     ;; internal per-firing detail the counter needs and the wire must not see,
     ;; so it is stripped in the same pass that consumes it.
+    (setf kline-ops merge-batch)
     (dolist (op merge-batch)
       (record-merge-coverage state op)
       (remhash "%deprecatedFires" op))
@@ -2272,7 +2313,10 @@ always treated presence as activation; this runtime is the one that differed."
       ;; for step n finds n's arbitration records already there (#296).
       (multiple-value-bind (lamport commit) (commit-step state)
         (retain-arbitration state (jnumber isre "stepNumber" 0) (cons lamport commit)
-                            (reality-state-arbitration state)))
+                            (reality-state-arbitration state))
+        ;; K-lines that closed at this step are stored before its completion is
+        ;; published (#603), the same place arbitration retention commits.
+        (capture-klines state (jnumber isre "stepNumber" 0) commit kline-composed kline-ops isre osre))
       (tick-step-phase state 3)                             ; B4: pair committed
       ;; The pair is committed: the step's completion point (#375).
       (signal-step-completed state (jnumber isre "stepNumber" 0))
@@ -3596,6 +3640,10 @@ its block held by a machine that no longer exists."
                                                              (if (and existing (machine-clone-of existing))
                                                                  (clone-refused)
                                                                  (progn
+                                                                   (when (and existing (reality-state-klines state))
+                                                                     (handler-case (kline-on-machine-removed (reality-state-klines state)
+                                                                                                             (machine-name existing))
+                                                                       (error (e) (kline-failed state e))))
                                                                    (unregister-compose-subscriptions state (gethash "id" params))
                                                                    (let ((removed (remhash (gethash "id" params)
                                                                                            (reality-state-machines state))))
@@ -3958,6 +4006,45 @@ its block held by a machine that no longer exists."
                                  (if (and (consp result) (eq (first result) :refused))
                                      (error-response (second result) (third result))
                                      (json-response result)))))))))
+     ;; K-lines (#603; SURFACE_SPEC "Routes"). The fixed paths come before
+     ;; /api/klines/:id, which would otherwise take "open" and "stats" as ids.
+     (make-route "GET" "/api/klines/open" (lambda (_ body query)
+                                            (declare (ignore _ body query))
+                                            (json-response (actor-ask actor (lambda (state) (kline-open-json (reality-state-klines state)))))))
+     (make-route "GET" "/api/klines/stats" (lambda (_ body query)
+                                             (declare (ignore _ body query))
+                                             (json-response (actor-ask actor (lambda (state) (kline-stats (reality-state-klines state)))))))
+     (make-route "POST" "/api/klines/export"
+                 (lambda (_ body query)
+                   (declare (ignore _ query))
+                   (let* ((outcomes (coerce (or (jget body "outcome") #()) 'list))
+                          (machines (coerce (or (jget body "machines") #()) 'list))
+                          (since (let ((v (jget body "since"))) (if (numberp v) (truncate v) 0))))
+                     (text-response (actor-ask actor (lambda (state)
+                                                       (kline-export (reality-state-klines state) outcomes since machines)))
+                                    200 "application/x-ndjson"))))
+     (make-route "GET" "/api/klines/:id" (lambda (params body query)
+                                           (declare (ignore body query))
+                                           (let* ((id (hunchentoot:url-decode (gethash "id" params)))
+                                                  (rec (actor-ask actor (lambda (state) (kline-get (reality-state-klines state) id)))))
+                                             (if rec
+                                                 (json-response rec)
+                                                 (error-response (format nil "no K-line ~a" id) 404)))))
+     (make-route "GET" "/api/klines"
+                 (lambda (_ body query)
+                   (declare (ignore _ body))
+                   (flet ((q (key) (let ((v (and (hash-table-p* query) (gethash key query))))
+                                     (and v (plusp (length v)) v)))
+                          (non-negative (raw default)
+                            (if (null raw) default
+                                (and (every #'digit-char-p raw) (parse-integer raw)))))
+                     (let ((since (non-negative (q "since") 0))
+                           (limit (non-negative (q "limit") 100)))
+                       (if (or (null since) (null limit))
+                           (error-response "since and limit are non-negative integers" 400)
+                           (json-response (actor-ask actor (lambda (state)
+                                                             (kline-list (reality-state-klines state) (q "outcome") (q "machine")
+                                                                         (q "sequence") since limit)))))))))
      ;; The Lamport clock (#296): instance UUID, Lamport value, newest step.
      (make-route "GET" "/api/engine/clock" (lambda (_ body query)
                                              (declare (ignore _ body query))
