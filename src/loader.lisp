@@ -260,6 +260,11 @@ from a request body with no machine in scope."
   (when strict-sta
     (assert-sta-for-life-safety json))
   (let* ((root (if (jobject-p (jget json "machine")) (jget json "machine") json))
+         ;; The declared form, copied before anything below writes into ROOT
+         ;; (inputSequences goes into its metadata), without `id` (#603).
+         (declared (let ((copy (parse-json (json-stringify root))))
+                     (when (hash-table-p copy) (remhash "id" copy))
+                     copy))
          (metadata (or (jget root "metadata") (obj)))
          (sequences (make-hash-table :test #'equal))
          (machine (make-machine
@@ -281,7 +286,8 @@ from a request body with no machine in scope."
     (dolist (sequence-json (jarray-list (or (jget root "sequences") (arr))))
       (let ((sequence (parse-sequence sequence-json (machine-match-algorithm machine))))
         (setf (gethash (sequence-id sequence) sequences) sequence)))
-    (setf (machine-sequences machine) sequences)
+    (setf (machine-sequences machine) sequences
+          (machine-declared machine) declared)
     machine))
 
 (defun load-machine-from-file (path)
