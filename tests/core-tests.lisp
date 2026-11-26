@@ -2944,6 +2944,31 @@ print('locked', flush=True); time.sleep(60)"
     (assert-equal 7 (reality-engine-lsp::source-cursor sim)
                   "reset leaves a simulated source's cursor alone"))
 
+  ;; ── A simulated source serves its pattern (#200) ───────────────────────
+  ;; Cell I at global step N is sampled at t = N + I*0.1, phase =
+  ;; fmod(t*frequency, 1), as C++ `source_values' and Scala `computeSample'.
+  ;; This runtime used to serve dcOffset for every pattern.
+  (flet ((sim (pattern length &key (frequency 0.25d0) (amplitude 1.0d0) (dc 0.0d0))
+           (reality-engine-lsp::make-source
+            :id (format nil "s-~a" pattern) :kind "simulated" :name pattern :active-p t
+            :region (reality-engine-lsp::make-region :offset 0 :length length)
+            :pattern pattern :frequency frequency :amplitude amplitude :dc-offset dc))
+         (near (expected actual message)
+           (assert-true (and (= (length expected) (length actual))
+                             (every (lambda (e a) (< (abs (- e a)) 1d-12)) expected actual))
+                        (format nil "~a: expected ~a, got ~a" message expected actual))))
+    (let ((binary (sim "binary" 1))
+          (square (sim "square" 1 :amplitude 0.25d0 :dc 0.5d0))
+          (ramp (sim "linear-ramp" 3))
+          (constant (sim "constant" 2 :dc 0.4d0)))
+      (near '(1.0d0) (reality-engine-lsp::sample-source binary 4 0) "binary, phase 0")
+      (near '(0.0d0) (reality-engine-lsp::sample-source binary 4 2) "binary, phase 0.5")
+      (near '(0.75d0) (reality-engine-lsp::sample-source square 4 0) "square, high half")
+      (near '(0.25d0) (reality-engine-lsp::sample-source square 4 3) "square, low half")
+      (near '(0.25d0 0.275d0 0.3d0) (reality-engine-lsp::sample-source ramp 4 1)
+            "linear-ramp, cell i sampled at step + i*0.1")
+      (near '(0.4d0 0.4d0) (reality-engine-lsp::sample-source constant 4 9) "constant")))
+
   ;; ── Ingress is the only origin of activity for an integration source ───
   ;; An integration (sensor-kind) source that has never received a value must
   ;; report inactive at every observation point, through any sequence of

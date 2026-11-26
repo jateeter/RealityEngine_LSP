@@ -305,11 +305,10 @@ and the auto interval to 1000ms as a side effect of rebuilding the struct."
                  ;; other kinds was touching a field that is not theirs.
                  ;;
                  ;; There is no RandomWalk seed to re-seed here: this
-                 ;; runtime's simulated branch is stateless, deriving its
-                 ;; payload from `dcOffset' rather than from a walk carried
-                 ;; between steps. Nothing is owed on that half of the
-                 ;; parity, and if a stateful pattern generator ever lands it
-                 ;; re-seeds here.
+                 ;; runtime's simulated branch is a pure function of the
+                 ;; global step (#200), and its random-walk serves `dcOffset'
+                 ;; rather than a walk carried between steps. If a stateful
+                 ;; pattern generator ever lands it re-seeds here.
                  (when (string= (source-kind source) "test")
                    (setf (source-cursor source) 0))
                  (setf (source-active-p source)
@@ -612,7 +611,7 @@ of (CELL RESOLUTION WINNER SUPPRESSED) with SUPPRESSED in canonical order."
   (let ((dimension (perception-engine-dimension engine))
         (writers (make-hash-table)))
     (dolist (source (sources-in-composition-order engine))
-      (multiple-value-bind (payload offset length) (sample-source source dimension)
+      (multiple-value-bind (payload offset length) (sample-source source dimension (perception-engine-global-step engine))
         (when payload
           ;; The cells assembly writes: one per payload value, up to LENGTH.
           (loop for cell from offset
@@ -723,8 +722,9 @@ observed (RealityEngine_CI corpus parity sweep, 2026-08-19)."
        sources)))
   engine)
 
-(defun sample-source (source dimension)
+(defun sample-source (source dimension &optional (step 0))
   "Return (values PAYLOAD OFFSET LENGTH) for SOURCE, or NIL when inactive.
+STEP is the engine's global step, which a simulated source is sampled at.
 
 A pure read: it reports what the source currently publishes and does not
 advance it. ADVANCE-PERCEPTION-ENGINE does that, once per push.
@@ -753,9 +753,39 @@ writes per source.  Callers now place the payload themselves."
                   (when (not (sensor-stale-p source))
                     (source-last-value source)))
                  (t
-                  (make-list length :initial-element (or (source-dc-offset source) 0.0d0))))))
+                  (simulated-payload source length step)))))
       (when payload
         (values payload offset length)))))
+
+(defun simulated-sample (pattern step-time frequency amplitude dc-offset)
+  "One simulated sample at STEP-TIME, as C++ `source_values' and Scala
+`computeSample' compute it (#200; SURFACE_SPEC Sources & Sensors).
+
+RANDOM-WALK serves DC-OFFSET, the value C++ and Scala start a walk at; this
+runtime carries no walk between steps. GAUSSIAN-NOISE is drawn uniformly in
+[-1, 1] like C++. Neither is deterministic, so neither is a parity term."
+  (let* ((period (if (> frequency 0) (/ 1.0d0 frequency) 1.0d0))
+         (phase (mod (/ step-time period) 1.0d0)))
+    (cond
+      ((string= pattern "sine") (+ dc-offset (* amplitude (sin (* 2.0d0 pi phase)))))
+      ((string= pattern "sawtooth") (+ dc-offset (* amplitude (- (* 2.0d0 phase) 1.0d0))))
+      ((string= pattern "square") (+ dc-offset (* amplitude (if (< phase 0.5d0) 1.0d0 -1.0d0))))
+      ((string= pattern "linear-ramp") (+ dc-offset (* amplitude phase)))
+      ((string= pattern "binary") (if (< phase 0.5d0) 1.0d0 0.0d0))
+      ((string= pattern "gaussian-noise") (+ dc-offset (* amplitude (- (random 2.0d0) 1.0d0))))
+      (t dc-offset))))
+
+(defun simulated-payload (source length step)
+  "The LENGTH cells a simulated SOURCE serves at global STEP: cell I is sampled
+at STEP + I * 0.1."
+  (let ((frequency (coerce (or (source-frequency source) 1.0d0) 'double-float))
+        (amplitude (coerce (or (source-amplitude source) 1.0d0) 'double-float))
+        (dc-offset (coerce (or (source-dc-offset source) 0.0d0) 'double-float))
+        (pattern (or (source-pattern source) "constant")))
+    (loop for i from 0 below length
+          collect (simulated-sample pattern
+                                    (+ (coerce (or step 0) 'double-float) (* i 0.1d0))
+                                    frequency amplitude dc-offset))))
 
 (defun update-from-perceptual-space (engine ps)
   "Adopt the RE's post-merge perceptual space.
@@ -805,7 +835,7 @@ our dimension — grow to match rather than truncating to it."
     ;; shared lanes (RealityEngine_CPP#146).
     (dolist (source (sources-in-composition-order engine))
      (let ()
-       (multiple-value-bind (payload offset length) (sample-source source dimension)
+       (multiple-value-bind (payload offset length) (sample-source source dimension (perception-engine-global-step engine))
          (when payload
            ;; Growth should make this unreachable; if a region still does not
            ;; fit, say which machine lost its input rather than dropping it
