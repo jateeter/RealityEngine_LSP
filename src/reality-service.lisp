@@ -70,6 +70,9 @@
   ;; measured while PHASE-DETAIL-P is on. STEP-PHASE-ACTIVE-P is decided at B0 so
   ;; a toggle mid-step cannot split one step's phases.
   (phase-detail-p nil)
+  ;; GET /api/machines/json/:name serves the list form instead of the full
+  ;; form (RealityEngine_CI#886).
+  (machine-json-summary-p nil)
   (step-phase-seconds (make-array 5 :element-type 'double-float :initial-element 0d0))
   (step-detail-steps 0)
   (step-phase-active-p nil)
@@ -2868,6 +2871,10 @@ list differed by order alone."
      (kline-number-control "klineStoreMaxBytes" 2147483648 9007199254740991
                            (lambda (state) (klt-store-max-bytes (reality-state-klines state)))
                            (lambda (state v) (setf (klt-store-max-bytes (reality-state-klines state)) v)))
+     (boolean-control "machineJsonSummary"
+                      #'reality-state-machine-json-summary-p
+                      (lambda (state v) (setf (reality-state-machine-json-summary-p state) v))
+                      nil)
      (list "transitionsInhibited" "machine"
            #'transitions-inhibited-control
            (lambda (state body)
@@ -3763,7 +3770,11 @@ its block held by a machine that no longer exists."
                                                                             (path (resolve-machine-json-path (reality-state-machine-dir state) name))
                                                                             (machine (load-machine-from-file path)))
                                                                        (put-machine state machine)
-                                                                       (obj "success" t "machine" (machine-json machine :full t)
+                                                                       ;; The full form, as GET /api/machines/:id serves
+                                                                       ;; it; with machineJsonSummary on, the list form,
+                                                                       ;; as GET /api/machines lists it (CI#886).
+                                                                       (obj "success" t
+                                                                            "machine" (machine-json machine :full (not (reality-state-machine-json-summary-p state)))
                                                                             "message" "Machine loaded successfully"))))
                                                      (error (c) (error-response (princ-to-string c) 404)))))
      (make-route "POST" "/api/machines/json/import" (lambda (_ body query)
