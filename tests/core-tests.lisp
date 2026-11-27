@@ -1767,7 +1767,7 @@ print('locked', flush=True); time.sleep(60)"
     (assert (equal names '("arbitrationRetention" "arbitrationWindow" "clone.maxActive" "historyLimit"
                            "includeActiveRegions" "includeMachineResults" "includePerceptualSpace"
                            "klineCapture" "klineFeedbackHops" "klineStoreMaxBytes"
-                           "phaseDetail" "transitionsInhibited"))
+                           "machineJsonSummary" "phaseDetail" "transitionsInhibited"))
             () "engine controls differ from C++'s list: ~a" names)))
 
 ;; MQTT client against an in-process broker (RealityEngine_LSP#197).  The
