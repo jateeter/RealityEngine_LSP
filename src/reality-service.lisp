@@ -425,6 +425,15 @@ is issued. Returns (values lamport commit)."
 (defun lower-uuid-p (string)
   (and (canonical-uuid-p string) (notany #'upper-case-p string)))
 
+(defun re-clock-json (value)
+  "{instance, lamport} from a well-formed RE-Clock VALUE, or NIL (CI#603)."
+  (let ((lamport (and (stringp value) (parse-re-clock value))))
+    (when lamport
+      (obj "instance" (subseq (string-trim " " (subseq value 0 (position #\; value))) 9)
+           "lamport" lamport))))
+
+(setf *request-clock-parser* 're-clock-json)
+
 (defun parse-re-clock (value)
   "The sender's lamport from an RE-Clock value, or NIL when it is malformed:
 `instance=<lower-case uuid>; lamport=<n>`, both once and in that order, N an

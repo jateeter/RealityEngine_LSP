@@ -208,7 +208,9 @@ the whole set sorted by key, per the contract."
   carekit-bridge-id carekit-default-source-mapping-id carekit-bridge-token
   ;; MQTT bridge — NIL when the bridge isn't configured (no MQTT_BROKER_HOST).
   ;; When non-NIL, owned by the perception service and torn down on stop.
-  mqtt-bridge)
+  mqtt-bridge
+  ;; The PE half of K-lines (RealityEngine_CI#603): the composition recorder.
+  (isre nil))
 
 (defun make-perception-state-from-config (&key dimension reality-url localai-url localai-machine-dir)
   (make-perception-state
@@ -2489,8 +2491,16 @@ minted per runtime, so id order would differ between runtimes
   (let* ((engine (perception-state-engine state))
          ;; The push is the transition: record what this assembly resolved. A
          ;; read of /api/state assembles too, and must not count (section 4.4b).
-         (vector (multiple-value-bind (assembled folds) (assemble-perception-vector engine)
+         (isre-cells nil)
+         (isre-folds #())
+         (vector (multiple-value-bind (assembled folds writer) (assemble-perception-vector engine)
                    (record-source-contention engine folds)
+                   ;; The step's ISRE composition, from the assembly just resolved;
+                   ;; recorded once the RE answers with its clock (CI#603).
+                   (let ((rec (perception-state-isre state)))
+                     (when (and rec (isr-capture rec))
+                       (setf isre-cells (perception-composition engine writer folds)
+                             isre-folds (vectorize folds))))
                    assembled))
          ;; Always ask the Reality Engine for the perceptual space and the
          ;; machine results. The PE needs both to compute the next input
@@ -2528,6 +2538,17 @@ minted per runtime, so id order would differ between runtimes
           (advance-perception-engine engine)
           ;; A completed push is the PE's commit (RealityEngine_CI#600).
           (when *pe-clock* (pclock-commit-step *pe-clock*))
+          ;; The composition record: a stored message, a tick of its own,
+          ;; flushed before the push is answered (CI#603).
+          (let ((rec (perception-state-isre state)))
+            (when (and rec (isr-capture rec) (hash-table-p (jget step "clock")) *pe-clock*)
+              (handler-case
+                  (isre-record rec (jget step "clock")
+                               (obj "instance" (participant-clock-uuid *pe-clock*) "lamport" (pclock-send *pe-clock*))
+                               isre-cells isre-folds)
+                (error (e)
+                  (format *error-output* "~&ISRE composition capture stopped: ~a~%" e)
+                  (setf (isr-capture rec) nil)))))
           ;; Semantic audit (SEMANTIC_AUDIT_CONTRACT.md): one re:PerceptionEvent
           ;; per active source region written this push, attributed to the
           ;; integration feeding it and joined to the corpus ABox when the
@@ -2914,14 +2935,64 @@ running loop, starts one timer, and returns the interval it runs at."
                                         (json-response (obj "success" t))))
    (make-route "PATCH" "/api/config" (lambda (_ body query)
                                       (declare (ignore _ query))
-                                      (json-response
-                                       (actor-ask actor
-                                                  (lambda (state)
-                                                    (when (jstring body "matchAlgorithm" nil)
-                                                      (setf (perception-engine-match-algorithm (perception-state-engine state))
-                                                            (jstring body "matchAlgorithm")))
-                                                    (obj "success" t
-                                                         "matchAlgorithm" (perception-engine-match-algorithm (perception-state-engine state))))))))
+                                      ;; The ISRE composition controls (CI#603), validated
+                                      ;; before anything changes.
+                                      (let ((capture (jget body "isreCapture" :missing))
+                                            (bytes (jget body "isreStoreMaxBytes" :missing)))
+                                        (cond
+                                          ((not (member capture (list :missing t +json-false+)))
+                                           (error-response "isreCapture requires a boolean" 400))
+                                          ((and (not (eq bytes :missing))
+                                                (or (not (realp bytes)) (/= bytes (truncate bytes)) (minusp bytes)
+                                                    (> bytes 9007199254740991)))
+                                           (error-response "isreStoreMaxBytes requires a whole number in [0, 9007199254740991]" 400))
+                                          (t
+                                           (let ((result
+                                                   (actor-ask actor
+                                                              (lambda (state)
+                                                                (let ((rec (perception-state-isre state)))
+                                                                  (if (and (eq capture t) (null (isr-taxonomy rec)))
+                                                                      :no-taxonomy
+                                                                      (progn
+                                                                        (when (jstring body "matchAlgorithm" nil)
+                                                                          (setf (perception-engine-match-algorithm (perception-state-engine state))
+                                                                                (jstring body "matchAlgorithm")))
+                                                                        (unless (eq capture :missing) (setf (isr-capture rec) (eq capture t)))
+                                                                        (unless (eq bytes :missing) (setf (isr-store-max-bytes rec) (truncate bytes)))
+                                                                        (obj "success" t
+                                                                             "matchAlgorithm" (perception-engine-match-algorithm (perception-state-engine state))
+                                                                             "isreCapture" (json-bool (isr-capture rec))
+                                                                             "isreStoreMaxBytes" (isr-store-max-bytes rec)))))))))
+                                             (if (eq result :no-taxonomy)
+                                                 (error-response (format nil "isreCapture requires re-source-kinds/~d in the corpus"
+                                                                         +isre-taxonomy-version+)
+                                                                 409)
+                                                 (json-response result))))))))
+   ;; The PE half of K-lines (CI#603; SURFACE_SPEC "Routes (PE)").
+   (make-route "GET" "/api/isre-composition/stats"
+               (lambda (_ body query)
+                 (declare (ignore _ body query))
+                 (json-response (actor-ask actor (lambda (state) (isre-stats (perception-state-isre state)))))))
+   (make-route "POST" "/api/isre-composition/export"
+               (lambda (_ body query)
+                 (declare (ignore _ query))
+                 (let ((from (let ((v (jget body "from"))) (if (realp v) (truncate v) 0)))
+                       (to (let ((v (jget body "to"))) (if (realp v) (truncate v) -1))))
+                   (text-response (actor-ask actor (lambda (state) (isre-export (perception-state-isre state) from to)))
+                                  200 "application/x-ndjson"))))
+   (make-route "GET" "/api/isre-composition"
+               (lambda (_ body query)
+                 (declare (ignore _ body))
+                 (flet ((whole (key default)
+                          (let ((v (and (hash-table-p* query) (gethash key query))))
+                            (cond ((or (null v) (zerop (length v))) default)
+                                  ((every #'digit-char-p v) (parse-integer v))
+                                  (t :bad)))))
+                   (let ((from (whole "from" 0)) (to (whole "to" -1)) (limit (whole "limit" 100)))
+                     (if (member :bad (list from to limit))
+                         (error-response "from, to and limit are non-negative integers" 400)
+                         (json-response (actor-ask actor (lambda (state)
+                                                           (isre-list (perception-state-isre state) from to limit)))))))))
    (make-route "POST" "/api/reset" (lambda (_ body query)
                                     (declare (ignore _ body query))
                                     (json-response
@@ -3327,6 +3398,7 @@ startup — the PE still serves HTTP signals as a pure REST engine."
                                                    :localai-url localai-url
                                                    :localai-machine-dir localai-machine-dir))
          (actor (state-actor "perception-service" state)))
+    (setf (perception-state-isre state) (make-engine-isre-recorder (participant-clock-uuid *pe-clock*)))
     (load-integrations-config state)
     ;; Background machine catalog refresher — best-effort initial fetch + 60 s loop.
     ;; Starts before HTTP so the catalog is warm before the first push cycle.

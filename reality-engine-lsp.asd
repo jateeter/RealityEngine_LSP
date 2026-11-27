@@ -45,6 +45,7 @@
                  (:file "ws")           ; SSE broadcast surface (GET /api/events)
                  (:file "arbiter")       ; output arbiter (ARBITER_CONTRACT.md)
                  (:file "kline")        ; K-line capture and store (CI#603)
+                 (:file "isre")         ; ISRE composition, the PE half (CI#603)
                  (:file "reality-service")
                  (:file "vector-aggregator") ; PE machine output aggregator
                  (:file "perception-service")
@@ -64,7 +65,8 @@
                              (:file "oracle-parity-tests")
                              (:file "tls-tests")
                              (:file "clone-tests")
-                             (:file "kline-tests"))))
+                             (:file "kline-tests")
+                             (:file "isre-tests"))))
   :perform (asdf:test-op (op c)
              (declare (ignore op c))
              (uiop:symbol-call '#:reality-engine-lsp.tests '#:run-tests)))

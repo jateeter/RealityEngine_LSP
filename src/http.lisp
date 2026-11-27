@@ -104,7 +104,9 @@ Must be called on the request thread — the hunchentoot context is dynamic."
     ;; them surfaces in the browser as an opaque CORS failure rather than the
     ;; 404 it actually is.
     (set-cors-headers)
-    (let* ((refused (and *request-receive* (funcall *request-receive*)))
+    (let* ((*request-clock* (and *request-clock-parser*
+                                 (funcall *request-clock-parser* (hunchentoot:header-in* :re-clock))))
+           (refused (and *request-receive* (funcall *request-receive*)))
            (body (or refused (dispatch-matched method path route))))
       (when *response-send* (funcall *response-send*))
       body)))

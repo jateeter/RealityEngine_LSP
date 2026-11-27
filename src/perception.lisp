@@ -12,7 +12,10 @@
   ;; (ARBITER_CONTRACT.md section 4.4b). Within a composition tier the source
   ;; activated earliest keeps a contended cell. Not serialised on the listing;
   ;; reported by GET /api/sources/contention.
-  (activated-at 0))
+  (activated-at 0)
+  ;; The RE-Clock {instance, lamport} of the request that last wrote this
+  ;; source's value, or NIL: the composition record's causedBy (CI#603).
+  (caused-by nil))
 
 (defstruct perception-engine
   dimension sources match-algorithm last-push auto-running-p auto-interval-ms
@@ -230,7 +233,8 @@ contribute zeros while holding a fresh value.  That would be a worse defect
 than the reporting one this replaces."
   (let ((was (source-active-p source)))
     (setf (source-last-value source) values
-          (source-last-updated source) now)
+          (source-last-updated source) now
+          (source-caused-by source) *request-clock*)
     (setf (source-active-p source) (source-validated-active-p source now))
     ;; Earning activity is an activation (section 4.4b).
     (note-activation source was))
@@ -436,6 +440,7 @@ and its machine never receives input."
      :loop-p (jbool json "loop" t)
      :sensor-id (jstring json "sensorId" nil)
      :last-value (numbers-from-json (or (jget json "lastValue") (arr)))
+     :caused-by *request-clock*
      ;; NIL, not 0: a source read back from JSON with no `lastUpdated` has
      ;; never been updated, and storing 0 would reintroduce the epoch claim
      ;; the emitter above removes.
@@ -886,7 +891,26 @@ our dimension — grow to match rather than truncating to it."
                    (push record folds))))
              (perception-engine-osre-fold engine))
     (values (coerce assembled 'list)
-            (sort folds #'< :key (lambda (r) (jget r "cell"))))))
+            (sort folds #'< :key (lambda (r) (jget r "cell")))
+            ;; The last writer of each cell: the ISRE composition (CI#603).
+            writer)))
+
+(defun perception-composition (engine writer folds)
+  "Each input cell's winner, as RealityEngine_CPP PerceptionEngine::composition:
+a list of (cell feedback-p id kind origin caused-by). A source wins the cells it
+wrote unless the fold kept OSRE; OSRE cells no source wrote are feedback."
+  (let ((kept (make-hash-table)) (osre (perception-engine-osre-fold engine)) (out nil))
+    (dolist (f folds) (setf (gethash (truncate (jnumber f "cell" 0)) kept) (jstring f "kept" "")))
+    (dotimes (cell (length writer))
+      (let ((w (svref writer cell))
+            (osre-cell (nth-value 1 (gethash cell osre))))
+        (cond ((and w osre-cell (equal (gethash cell kept) "osre"))
+               (push (list cell t "" "" "" nil) out))
+              (w (push (list cell nil (or (source-id w) "") (or (source-kind w) "") (or (source-origin w) "")
+                             (source-caused-by w))
+                       out))
+              (osre-cell (push (list cell t "" "" "" nil) out)))))
+    (nreverse out)))
 
 (defun perception-state-json (engine)
   (obj "perceptionDimension" (perception-engine-dimension engine)
