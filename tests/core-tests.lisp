@@ -1766,6 +1766,7 @@ print('locked', flush=True); time.sleep(60)"
             "engine controls not sorted by name: ~a" names)
     (assert (equal names '("arbitrationRetention" "arbitrationWindow" "clone.maxActive" "historyLimit"
                            "includeActiveRegions" "includeMachineResults" "includePerceptualSpace"
+                           "klineCapture" "klineFeedbackHops" "klineStoreMaxBytes"
                            "phaseDetail" "transitionsInhibited"))
             () "engine controls differ from C++'s list: ~a" names)))
 
