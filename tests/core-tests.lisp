@@ -1866,6 +1866,7 @@ print('locked', flush=True); time.sleep(60)"
   (test-mqtt-client-keepalive-and-reconnect)
   (uiop:symbol-call '#:reality-engine-lsp.tests '#:test-clone-space)
   (uiop:symbol-call '#:reality-engine-lsp.tests '#:test-kline)
+  (uiop:symbol-call '#:reality-engine-lsp.tests '#:test-isre)
   (test-escalation-dispatch-counter)
   (uiop:symbol-call '#:reality-engine-lsp.tests '#:test-lane-tls)
   (let* ((machine-json (reality-engine-lsp::obj

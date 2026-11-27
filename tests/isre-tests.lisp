@@ -1,0 +1,38 @@
+(in-package #:reality-engine-lsp.tests)
+
+;;; The PE half of K-lines (RealityEngine_CI#603): the taxonomy derivation and
+;;; the runs, as RealityEngine_CPP tests/isre_tests.cpp.
+
+(defun test-isre ()
+  (let ((dir (uiop:ensure-directory-pathname
+              (format nil "~a/isre-test-~d/" (uiop:temporary-directory) (sb-posix:getpid)))))
+    (ensure-directories-exist dir)
+    (with-open-file (out (merge-pathnames "re-source-kinds-2.json" dir) :direction :output :if-exists :supersede)
+      (write-string "{\"format\":\"re-source-kinds\",\"version\":2,\"purpose\":\"t\",\"classes\":[\"deterministic\",\"measured\",\"generated\"],\"providerMapping\":{\"openclaw\":\"acp\"},\"kinds\":[{\"kind\":\"test\",\"meaning\":\"t\",\"class\":\"deterministic\"},{\"kind\":\"sensor\",\"meaning\":\"s\",\"providers\":[{\"provider\":\"healthkit\",\"class\":\"measured\"},{\"provider\":\"signal\",\"class\":\"measured\"},{\"provider\":\"acp\",\"class\":\"generated\"}]},{\"kind\":\"simulated\",\"meaning\":\"m\",\"class\":\"measured\"},{\"kind\":\"feedback\",\"meaning\":\"f\",\"class\":\"deterministic\"},{\"kind\":\"none\",\"meaning\":\"n\",\"class\":null}],\"unknownProvider\":{\"provider\":\"unattributed\",\"class\":\"generated\"},\"mappingFromPrevious\":[]}" out))
+    (let ((tx (reality-engine-lsp::load-isre-taxonomy dir)))
+      (assert-true tx "version 2 loads")
+      (assert-true (null (reality-engine-lsp::load-isre-taxonomy dir 3)) "a missing version does not")
+      (assert-equal '("sensor" "acp" "generated")
+                    (multiple-value-list (reality-engine-lsp::isre-source-entry tx "sensor" "openclaw.agent.x"))
+                    "openclaw.* is acp, generated")
+      (assert-equal '("sensor" "signal" "measured")
+                    (multiple-value-list (reality-engine-lsp::isre-source-entry tx "sensor" ""))
+                    "an empty origin is signal")
+      (assert-equal '("sensor" "unattributed" "generated")
+                    (multiple-value-list (reality-engine-lsp::isre-source-entry tx "sensor" "Mystery"))
+                    "an unlisted provider is unattributed")
+      (assert-equal '("simulated" nil "measured")
+                    (multiple-value-list (reality-engine-lsp::isre-source-entry tx "simulated" ""))
+                    "simulated is measured, no provider")
+      (let ((runs (reality-engine-lsp::isre-sources-json
+                   (list (list 10 nil "a" "test" "" nil) (list 11 nil "a" "test" "" nil) (list 12 nil "b" "test" "" nil)
+                         (list 20 t "" "" "" nil) (list 21 t "" "" "" nil)
+                         (list 30 nil "h" "sensor" "healthkit" (reality-engine-lsp::obj "instance" "x" "lamport" 1))
+                         (list 31 nil "h" "sensor" "healthkit" (reality-engine-lsp::obj "instance" "x" "lamport" 2)))
+                   tx)))
+        (assert-equal 5 (length runs) "runs split by id and by causedBy")
+        (assert-equal "[10,11]" (reality-engine-lsp::jcs (reality-engine-lsp::jget (aref runs 0) "cells"))
+                      "a run is [first, last] of one winner")
+        (assert-equal "feedback" (reality-engine-lsp::jget (aref runs 2) "kind") "feedback runs")
+        (assert-true (null (nth-value 1 (gethash "provider" (aref runs 2)))) "feedback has no provider")))
+    (uiop:delete-directory-tree dir :validate t)))

@@ -180,6 +180,14 @@
                                      :segment segment :offset offset :line line)))
              (setf (gethash (kmeta-id m) (kstore-by-id store)) (length (kstore-metas store)))
              (vector-push-extend m (kstore-metas store))))
+          ((string= format "re-isre-composition/1")
+           ;; The PE's composition records, keyed by the RE's commit (CI#603).
+           (let* ((c (truncate (jnumber (jget j "re") "commit" 0)))
+                  (m (make-kline-meta :id (format nil "~d" c) :machine "" :sequence "" :outcome ""
+                                      :close-commit c :close-step (truncate (jnumber (jget j "re") "step" 0))
+                                      :open-step 0 :segment segment :offset offset :line line)))
+             (setf (gethash (kmeta-id m) (kstore-by-id store)) (length (kstore-metas store)))
+             (vector-push-extend m (kstore-metas store))))
           ((string= format "re-kline-event/1")
            (let ((id (jstring j "kline" "")))
              (setf (gethash id (kstore-events store))

@@ -185,3 +185,12 @@ each step."
   (if (perceptual-space-p space)
       (coerce space 'simple-vector)
       (coerce space 'vector)))
+
+(defvar *request-clock* nil
+  "The RE-Clock {instance, lamport} the request being handled presented, or NIL.
+Bound per request by DISPATCH-ROUTE and carried into the actor by ACTOR-ASK; a
+source write stamps it as the source's causedBy (RealityEngine_CI#603).")
+
+(defvar *request-clock-parser* nil
+  "A function from an RE-Clock header value to {instance, lamport}, or NIL;
+set by reality-service.lisp, which owns the header's grammar.")

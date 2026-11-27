@@ -138,6 +138,12 @@
    `internal-time-units-per-second` on every wakeup; `try-pop-queue` takes the
    timeout directly."
   (let* ((reply (lparallel.queue:make-queue))
+         ;; The request's presented clock travels with the work into the actor's
+         ;; thread, where a source write stamps it (RealityEngine_CI#603).
+         (message (if (and (functionp message) *request-clock*)
+                      (let ((clock *request-clock*) (inner message))
+                        (lambda (&rest args) (let ((*request-clock* clock)) (apply inner args))))
+                      message))
          (envelope (make-envelope :message message :reply-queue reply)))
     (lparallel.queue:push-queue envelope (actor-mailbox actor))
     (multiple-value-bind (outcome present-p)

@@ -134,6 +134,17 @@ rebuild, three times per launch, the first time a runner comes up with a cold
   checkpoint holds first (`kline-start-capture`). The routes are in
   `docs/openapi/reality-engine.yaml`. `tests/kline-tests.lisp` covers the boundaries
   and the store.
+- The PE half (`src/isre.lisp`) records one `re-isre-composition/1` per
+  completed push into `<INSTANCE_ISRE_DIR>/<pe_uuid>/` (the K-line store's
+  format, keyed by the RE's commit), as RealityEngine_CPP `src/isre.cpp` does:
+  each cell's winner from the push's own assembly (`perception-composition`
+  over the writer array `assemble-perception-vector` returns), named under
+  `re-source-kinds/2` from `<MACHINES_DIR>/../schemas/source-kinds/`. A source's
+  causedBy is `*request-clock*`, bound per request in `dispatch-route` and
+  carried into the actor by `actor-ask`. `isreCapture` (default `false`) and
+  `isreStoreMaxBytes` are on `PATCH /api/config`; `RE_ISRE_CAPTURE=1` sets the
+  initial value. Routes: `GET /api/isre-composition`, `/stats`, `POST /export`;
+  `tests/isre-tests.lisp`.
 - Use the same ACP/OpenClaw environment defaults as the rest of the application.
 
 ## LSP Support
