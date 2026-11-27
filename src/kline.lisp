@@ -921,6 +921,17 @@
         (kline-persist tr (nreverse lines))
         (setf (klt-last-step tr) -1)))))
 
+(defun kline-start-capture (tr)
+  "klineCapture turned on (at boot or at runtime): capture starts afresh, first
+closing what the checkpoint holds, as at boot. Turning it off is setting
+KLT-CAPTURE to nil, which leaves the store and its checkpoint untouched."
+  (setf (klt-open tr) nil (klt-sustain tr) nil (klt-ring tr) nil (klt-last-step tr) -1
+        (klt-capture tr) t)
+  (clrhash (klt-closed tr))
+  (clrhash (klt-baseline tr))
+  (clrhash (klt-current tr))
+  (kline-recover tr))
+
 (defun kline-trim-ring (tr)
   (let ((keep-from (- (klt-last-step tr) (max 1 (* (klt-longest-path tr) (1+ (klt-feedback-hops tr)))))))
     (dolist (k (klt-open tr))
@@ -1023,11 +1034,12 @@
 (defun make-engine-kline-tracker (instance tick)
   "The tracker for this engine: its store under <INSTANCE_KLINE_DIR>/<uuid>/ for an
 allocated instance (the parent defaulting to the clock directory's sibling), in
-memory for a minted one. Capture is RE_KLINE_CAPTURE=1 until the three voters
-serve K-lines; their controls are not on /api/engine/config, which is compared."
+memory for a minted one. The store opens whatever the klineCapture control says,
+so the routes always answer from it; RE_KLINE_CAPTURE=1 sets capture's initial
+value (the control's default is false until the PE half lands)."
   (let* ((allocated (string-downcase (or (env "INSTANCE_UUID" nil) "")))
          (capture (member (or (env "RE_KLINE_CAPTURE" nil) "") '("1" "true") :test #'string=))
-         (dir (when (and capture (string= allocated instance))
+         (dir (when (string= allocated instance)
                 (merge-pathnames (format nil "~a/" instance)
                                  (uiop:ensure-directory-pathname
                                   (or (env "INSTANCE_KLINE_DIR" nil)
@@ -1035,9 +1047,8 @@ serve K-lines; their controls are not on /api/engine/config, which is compared."
                                                        (uiop:ensure-directory-pathname
                                                         (or (env "INSTANCE_CLOCK_DIR" nil)
                                                             (merge-pathnames ".reality-engine/clock/" (user-homedir-pathname))))))))))
-         (tracker (make-kline-tracker :instance instance :tick tick :store (open-kline-store (and dir (namestring dir)))
-                                      :capture (and capture t))))
+         (tracker (make-kline-tracker :instance instance :tick tick :store (open-kline-store (and dir (namestring dir))))))
     (when capture
       (format *error-output* "~&K-line capture on — store ~a~%" (if dir (namestring dir) "in memory"))
-      (kline-recover tracker))
+      (kline-start-capture tracker))
     tracker))

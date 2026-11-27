@@ -2833,6 +2833,32 @@ list differed by order alone."
                       #'reality-state-include-perceptual-space-p
                       (lambda (state v) (setf (reality-state-include-perceptual-space-p state) v))
                       t)
+     ;; K-lines (#603; SURFACE_SPEC "Controls"). Off stops capture and leaves
+     ;; the store untouched; on starts afresh, closing what the checkpoint holds.
+     (flet ((current (state)
+              (control-json "klineCapture" "engine"
+                            (json-bool (klt-capture (reality-state-klines state))) +json-false+)))
+       (list "klineCapture" "engine"
+             #'current
+             (lambda (state body)
+               (let ((v (jget body "value" :missing)))
+                 (if (not (or (eq v t) (eq v +json-false+)))
+                     (list :refused "klineCapture requires a boolean `value`" 400)
+                     (let ((tracker (reality-state-klines state)))
+                       (cond ((and (eq v t) (not (klt-capture tracker)))
+                              (handler-case (kline-start-capture tracker)
+                                (error (e) (kline-failed state e))))
+                             ((eq v +json-false+) (setf (klt-capture tracker) nil)))
+                       (current state)))))
+             (lambda (state)
+               (setf (klt-capture (reality-state-klines state)) nil)
+               (current state))))
+     (kline-number-control "klineFeedbackHops" 3 16
+                           (lambda (state) (klt-feedback-hops (reality-state-klines state)))
+                           (lambda (state v) (setf (klt-feedback-hops (reality-state-klines state)) v)))
+     (kline-number-control "klineStoreMaxBytes" 2147483648 9007199254740991
+                           (lambda (state) (klt-store-max-bytes (reality-state-klines state)))
+                           (lambda (state v) (setf (klt-store-max-bytes (reality-state-klines state)) v)))
      (list "transitionsInhibited" "machine"
            #'transitions-inhibited-control
            (lambda (state body)
@@ -2846,6 +2872,18 @@ list differed by order alone."
                                               (jstring body "machine" nil)) 404)
                        result))))
            (lambda (state) (set-transitions-inhibited state nil nil))))))
+
+(defun kline-number-control (name declared-default max read write)
+  "An engine-scoped whole number in [0, MAX], as arbitrationWindow is written."
+  (flet ((current (state) (control-json name "engine" (funcall read state) declared-default)))
+    (list name "engine"
+          #'current
+          (lambda (state body)
+            (let ((v (jget body "value" :missing)))
+              (if (or (eq v :missing) (not (realp v)) (/= v (truncate v)) (minusp v) (> v max))
+                  (list :refused (format nil "~a requires a whole-number `value` in [0, ~d]" name max) 400)
+                  (progn (funcall write state (truncate v)) (current state)))))
+          (lambda (state) (funcall write state declared-default) (current state)))))
 
 (defun find-engine-control (name)
   "The table entry for NAME, or NIL."

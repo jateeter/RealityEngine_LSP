@@ -127,10 +127,12 @@ rebuild, three times per launch, the first time a runner comes up with a cold
   is published, with `open.json` checkpointed. SHA-256 is libcrypto's
   `EVP_Digest` through CFFI (cl+ssl loads it); the fingerprint hashes each
   machine's `declared` form, copied at load before the loader writes into the
-  parsed tree. Until Scala serves K-lines, capture is off by default and
-  `RE_KLINE_CAPTURE=1` turns it on; its controls are not on
-  `/api/engine/config` and the routes are not in the OpenAPI document, both
-  compared across the voters. `tests/kline-tests.lisp` covers the boundaries
+  parsed tree. The controls `klineCapture` (default `false` until the PE half
+  lands; owner, 2026-11-26), `klineFeedbackHops` and `klineStoreMaxBytes` are
+  on `/api/engine/config`, as on C++ and Scala; `RE_KLINE_CAPTURE=1` sets
+  capture's initial value. Off leaves the store untouched; on closes what the
+  checkpoint holds first (`kline-start-capture`). The routes are in
+  `docs/openapi/reality-engine.yaml`. `tests/kline-tests.lisp` covers the boundaries
   and the store.
 - Use the same ACP/OpenClaw environment defaults as the rest of the application.
 
