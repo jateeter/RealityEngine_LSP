@@ -1867,6 +1867,7 @@ print('locked', flush=True); time.sleep(60)"
   (uiop:symbol-call '#:reality-engine-lsp.tests '#:test-clone-space)
   (uiop:symbol-call '#:reality-engine-lsp.tests '#:test-kline)
   (uiop:symbol-call '#:reality-engine-lsp.tests '#:test-isre)
+  (uiop:symbol-call '#:reality-engine-lsp.tests '#:test-snapshot)
   (test-escalation-dispatch-counter)
   (uiop:symbol-call '#:reality-engine-lsp.tests '#:test-lane-tls)
   (let* ((machine-json (reality-engine-lsp::obj

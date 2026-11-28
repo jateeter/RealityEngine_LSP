@@ -105,6 +105,10 @@
   (klines nil)
   (kline-fingerprint "")
   (kline-fingerprint-version -1)
+  ;; Runtime snapshots (RealityEngine_CI#287): what each retained step needs,
+  ;; and the store.
+  (snapshot-retention (make-snapshot-retention))
+  (snapshot-store (snapshot-store-from-environment))
   ;; The step completion point (RealityEngine_CI#375): signalled when a step's
   ;; (ISRE, OSRE) pair is committed, waited on by GET /api/engine/steps/:n/pair.
   (step-signal (make-step-signal)))
@@ -413,6 +417,188 @@ is issued. Returns (values lamport commit)."
             (kline-on-step tracker step commit composed merge-batch isre osre
                            (reality-state-machines state) (reality-state-kline-fingerprint state)))
         (error (e) (kline-failed state e))))))
+(defun snapshot-response (result)
+  "RESULT is (status body)."
+  (if (= (first result) 200) (json-response (second result)) (json-response (second result) (first result))))
+
+(defun refresh-corpus-fingerprint (state)
+  (unless (eql (reality-state-kline-fingerprint-version state) (reality-state-mapping-version state))
+    (let (pairs)
+      (maphash (lambda (_ m)
+                 (declare (ignore _))
+                 (push (cons (machine-name m) (or (machine-declared m) (obj "name" (machine-name m)))) pairs))
+               (reality-state-machines state))
+      (setf (reality-state-kline-fingerprint state) (corpus-fingerprint pairs))
+      (when (reality-state-klines state)
+        (setf (klt-longest-path (reality-state-klines state)) (kline-longest-path (reality-state-machines state))))
+      (setf (reality-state-kline-fingerprint-version state) (reality-state-mapping-version state))))
+  (reality-state-kline-fingerprint state))
+
+(defun snapshot-state-parts (state from to)
+  "(values controls machine-controls overrides arbitration), by corpus machine name."
+  (let ((controls (obj)) (machine-controls (obj)) (overrides (obj)))
+    (dolist (c (engine-controls))
+      (destructuring-bind (name scope reader &rest _) c
+        (declare (ignore _))
+        (let ((read (funcall reader state)))
+          (if (string= scope "engine")
+              (setf (gethash name controls) (jget read "value"))
+              (let ((v (jget read "value")))
+                (when (hash-table-p v)
+                  (maphash (lambda (id val)
+                             (let ((m (gethash id (reality-state-machines state))))
+                               (when m
+                                 (let ((per (or (gethash (machine-name m) machine-controls)
+                                                (setf (gethash (machine-name m) machine-controls) (obj)))))
+                                   (setf (gethash name per) val)))))
+                           v)))))))
+    (maphash (lambda (_ m)
+               (declare (ignore _))
+               (let ((j (machine-json m)))
+                 (setf (gethash (machine-name m) overrides)
+                       (obj "arbiterRule" (jget j "arbiterRule")
+                            "outputMergeTransformation" (jget j "outputMergeTransformation")
+                            "outputMergeLocked" (json-bool (machine-output-merge-locked m))))))
+             (reality-state-machines state))
+    (values controls machine-controls overrides
+            (if (reality-state-arbitration-retention-p state)
+                (let (steps)
+                  (maphash (lambda (n entry) (when (<= from n to) (push (cons n entry) steps)))
+                           (reality-state-arbitration-steps state))
+                  (vectorize (mapcar (lambda (p) (arbitration-step-json state (car p) (cdr p)))
+                                     (sort steps #'< :key #'car))))
+                +json-null+))))
+
+(defun snapshot-route-capture (state body)
+  (let ((st (reality-state-snapshot-store state)))
+    (unless (snapshot-store-enabled-p st) (return-from snapshot-route-capture (list 503 (obj "error" "snapshots are disabled"))))
+    (let* ((scope-j (jget body "scope"))
+           (names (let (n) (maphash (lambda (_ m) (declare (ignore _)) (push (machine-name m) n)) (reality-state-machines state)) n))
+           (scope (cond ((vectorp scope-j) (coerce scope-j 'list))
+                        ((or (null scope-j) (eq scope-j +json-null+) (equal scope-j "corpus")) nil)
+                        (t (return-from snapshot-route-capture
+                             (list 422 (obj "error" "scope is \"corpus\" or a list of machine names")))))))
+      (dolist (n scope)
+        (unless (member n names :test #'string=)
+          (return-from snapshot-route-capture (list 422 (obj "error" (format nil "no machine ~a" n))))))
+      (flet ((step-arg (k)
+               (let ((v (jget body k)))
+                 (cond ((or (null v) (eq v +json-null+)) nil)
+                       ((and (realp v) (>= v 0) (= v (truncate v))) (truncate v))
+                       (t :bad)))))
+        (let ((from (step-arg "from")) (to (step-arg "to")))
+          (when (or (eq from :bad) (eq to :bad))
+            (return-from snapshot-route-capture (list 422 (obj "error" "from and to are step numbers"))))
+          (let* ((steps (sret-steps (reality-state-snapshot-retention state)))
+                 (newest (if steps (sst-step (car (last steps))) -1))
+                 (to* (or to from newest)) (from* (or from to*)))
+            (multiple-value-bind (controls machine-controls overrides arbitration)
+                (snapshot-state-parts state from* to*)
+              (multiple-value-bind (snap status err)
+                  (snapshot-capture (reality-state-snapshot-retention state)
+                                    :scope scope :from from :to to :instance (state-instance-uuid state)
+                                    :fingerprint (refresh-corpus-fingerprint state)
+                                    :machine-count (hash-table-count (reality-state-machines state))
+                                    :controls controls :machine-controls machine-controls :overrides overrides
+                                    :arbitration arbitration :machines (reality-state-machines state))
+                (if (null snap)
+                    (list status err)
+                    (let ((id (snapshot-id snap)))
+                      (snapshot-store-put st id snap)
+                      (list 200 (obj "id" id "digest" (jget snap "digest") "span" (jget (jget snap "kline") "span")))))))))))))
+
+(defun snapshot-route-restore (state body)
+  (let ((st (reality-state-snapshot-store state)))
+    (unless (snapshot-store-enabled-p st) (return-from snapshot-route-restore (list 503 (obj "error" "snapshots are disabled"))))
+    (let ((snap (cond ((hash-table-p (jget body "snapshot")) (jget body "snapshot"))
+                      ((stringp (jget body "id"))
+                       (or (snapshot-store-get st (jget body "id"))
+                           (return-from snapshot-route-restore
+                             (list 404 (obj "error" (format nil "no snapshot ~a" (jget body "id")))))))
+                      (t (return-from snapshot-route-restore (list 422 (obj "error" "body is {id} or {snapshot}")))))))
+      (unless (equal (jstring snap "format" "") "re-snapshot/1")
+        (return-from snapshot-route-restore (list 422 (obj "error" "unknown format"))))
+      (unless (equal (jstring snap "digest" "") (snapshot-digest snap))
+        (return-from snapshot-route-restore (list 422 (obj "error" "the digest does not match the body"))))
+      (let ((expected (jstring (jget snap "corpus") "fingerprint" ""))
+            (actual (refresh-corpus-fingerprint state)))
+        (unless (string= expected actual)
+          (return-from snapshot-route-restore
+            (list 409 (obj "error" "corpus mismatch" "expected" expected "actual" actual)))))
+      (let ((by-name (make-hash-table :test #'equal)))
+        (maphash (lambda (_ m) (declare (ignore _)) (setf (gethash (machine-name m) by-name) m)) (reality-state-machines state))
+        ;; Controls first: historyLimit bounds what follows.
+        (let ((controls (jget snap "controls")))
+          (when (hash-table-p controls)
+            (dolist (c (engine-controls))
+              (destructuring-bind (name scope reader writer &rest _) c
+                (declare (ignore reader _))
+                (multiple-value-bind (v present) (gethash name controls)
+                  (when (and present (string= scope "engine"))
+                    (let ((r (funcall writer state (obj "value" v))))
+                      (when (and (consp r) (eq (first r) :refused))
+                        (return-from snapshot-route-restore (list 422 (obj "error" (second r))))))))))))
+        (let ((mc (jget snap "machineControls")))
+          (when (hash-table-p mc)
+            (maphash (lambda (name per)
+                       (let ((m (gethash name by-name)) (v (and (hash-table-p per) (gethash "transitionsInhibited" per))))
+                         (when (and m (member v (list t +json-false+)))
+                           (setf (machine-transitions-inhibited m) (eq v t)))))
+                     mc)))
+        (let ((ov (jget snap "machineOverrides")))
+          (when (hash-table-p ov)
+            (maphash (lambda (name o)
+                       (let ((m (gethash name by-name)))
+                         (when (and m (hash-table-p o))
+                           (when (stringp (jget o "outputMergeTransformation"))
+                             (setf (machine-output-merge-transformation m)
+                                   (output-merge-name (jget o "outputMergeTransformation"))))
+                           (multiple-value-bind (lk present) (gethash "outputMergeLocked" o)
+                             (when present (setf (machine-output-merge-locked m) (eq lk t)))))))
+                     ov)))
+        (let* ((kl (jget snap "kline"))
+               (corpus (stringp (jget kl "scope")))
+               (scope (if corpus
+                          (loop for n being the hash-keys of by-name collect n)
+                          (coerce (jget kl "scope") 'list)))
+               (after (map 'list (lambda (e) (list (jstring e "machine" "") (jstring e "sequence" "") (jstring e "event" "")
+                                                    (eq (jget e "justMatched") t)))
+                           (jget kl "activeAfter"))))
+          ;; Each scoped machine's events take exactly the listed state; restored
+          ;; events start a fresh predecessor chain (a snapshot carries none).
+          (dolist (name scope)
+            (let ((m (gethash name by-name)))
+              (when m
+                (maphash (lambda (_ seq)
+                           (declare (ignore _))
+                           (maphash (lambda (_ ev)
+                                      (declare (ignore _))
+                                      (setf (reality-event-active-p ev) nil (reality-event-just-matched-p ev) nil
+                                            (reality-event-predecessor-chain ev) nil))
+                                    (sequence-vectors seq)))
+                         (machine-sequences m)))))
+          (dolist (e after)
+            (destructuring-bind (mname sid eid jm) e
+              (let* ((m (and (member mname scope :test #'string=) (gethash mname by-name)))
+                     (seq (and m (gethash sid (machine-sequences m))))
+                     (ev (and seq (gethash eid (sequence-vectors seq)))))
+                (when ev (setf (reality-event-active-p ev) t (reality-event-just-matched-p ev) jm)))))
+          (when corpus
+            (let ((to (truncate (jnumber (jget kl "span") "to" 0))))
+              (setf (reality-state-isre-history state) (map 'list (lambda (p) (jget p "isre")) (jget kl "pairs"))
+                    (reality-state-osre-history state) (map 'list (lambda (p) (jget p "osre")) (jget kl "pairs"))
+                    (reality-state-step-count state) (1+ to))
+              (clrhash (reality-state-arbitration-steps state))
+              (snapshot-retention-restore (reality-state-snapshot-retention state) after)
+              (signal-step-completed state to)))
+          ;; A restore is a reset for K-line capture: open K-lines close
+          ;; interrupted/reset. It commits no step, so lamport does not tick.
+          (when (and (reality-state-klines state) (klt-capture (reality-state-klines state)))
+            (handler-case (kline-on-reset (reality-state-klines state)) (error (e) (kline-failed state e))))
+          (list 200 (obj "digest" (jget snap "digest")
+                         "step" (if corpus (truncate (jnumber (jget kl "span") "to" 0))
+                                    (1- (reality-state-step-count state))))))))))
+
 (defun clock-send (state) (pclock-send (state-clock state)))
 (defun clock-receive (state received) (pclock-receive (state-clock state) received))
 (defun last-commit (state) (pclock-last-commit (state-clock state)))
@@ -946,6 +1132,7 @@ same state — an engine with nothing loaded requires nothing."
   ;; restarts its count under the same engine.
   (setf (reality-state-arbitration state) nil)
   (clrhash (reality-state-arbitration-steps state))
+  (snapshot-retention-reset (reality-state-snapshot-retention state))
   (maphash (lambda (_ machine)
              (declare (ignore _))
              (dolist (sequence (machine-sequence-list machine))
@@ -2330,7 +2517,11 @@ always treated presence as activation; this runtime is the one that differed."
                             (reality-state-arbitration state))
         ;; K-lines that closed at this step are stored before its completion is
         ;; published (#603), the same place arbitration retention commits.
-        (capture-klines state (jnumber isre "stepNumber" 0) commit kline-composed kline-ops isre osre))
+        (capture-klines state (jnumber isre "stepNumber" 0) commit kline-composed kline-ops isre osre)
+        ;; Snapshot retention (#287): every retained step's active list,
+        ;; contributions and clock, whether or not K-line capture is on.
+        (snapshot-retain (reality-state-snapshot-retention state) (jnumber isre "stepNumber" 0) lamport isre osre
+                         kline-ops (reality-state-machines state) (or (reality-state-history-limit state) 250)))
       (tick-step-phase state 3)                             ; B4: pair committed
       ;; The pair is committed: the step's completion point (#375).
       (signal-step-completed state (jnumber isre "stepNumber" 0))
@@ -4084,6 +4275,45 @@ its block held by a machine that no longer exists."
      (make-route "GET" "/api/klines/stats" (lambda (_ body query)
                                              (declare (ignore _ body query))
                                              (json-response (actor-ask actor (lambda (state) (kline-stats (reality-state-klines state)))))))
+     ;; ── Runtime snapshots (RealityEngine_CI#287; SURFACE_SPEC "Routes") ──
+     (make-route "POST" "/api/runtime/snapshot"
+                 (lambda (_ body query)
+                   (declare (ignore _ query))
+                   (let ((result (actor-ask actor (lambda (state) (snapshot-route-capture state body)))))
+                     (snapshot-response result))))
+     (make-route "GET" "/api/runtime/snapshots"
+                 (lambda (_ body query)
+                   (declare (ignore _ body query))
+                   (snapshot-response
+                    (actor-ask actor (lambda (state)
+                                       (let ((st (reality-state-snapshot-store state)))
+                                         (if (snapshot-store-enabled-p st)
+                                             (list 200 (snapshot-store-list st))
+                                             (list 503 (obj "error" "snapshots are disabled")))))))))
+     (make-route "GET" "/api/runtime/snapshot/:id"
+                 (lambda (params body query)
+                   (declare (ignore body query))
+                   (let ((id (gethash "id" params)))
+                     (snapshot-response
+                      (actor-ask actor (lambda (state)
+                                         (let ((st (reality-state-snapshot-store state)))
+                                           (cond ((not (snapshot-store-enabled-p st)) (list 503 (obj "error" "snapshots are disabled")))
+                                                 ((snapshot-store-get st id) (list 200 (snapshot-store-get st id)))
+                                                 (t (list 404 (obj "error" (format nil "no snapshot ~a" id))))))))))))
+     (make-route "DELETE" "/api/runtime/snapshot/:id"
+                 (lambda (params body query)
+                   (declare (ignore body query))
+                   (let ((id (gethash "id" params)))
+                     (snapshot-response
+                      (actor-ask actor (lambda (state)
+                                         (let ((st (reality-state-snapshot-store state)))
+                                           (cond ((not (snapshot-store-enabled-p st)) (list 503 (obj "error" "snapshots are disabled")))
+                                                 ((snapshot-store-remove st id) (list 200 (obj "deleted" id)))
+                                                 (t (list 404 (obj "error" (format nil "no snapshot ~a" id))))))))))))
+     (make-route "POST" "/api/runtime/restore"
+                 (lambda (_ body query)
+                   (declare (ignore _ query))
+                   (snapshot-response (actor-ask actor (lambda (state) (snapshot-route-restore state body))))))
      (make-route "POST" "/api/klines/export"
                  (lambda (_ body query)
                    (declare (ignore _ query))
