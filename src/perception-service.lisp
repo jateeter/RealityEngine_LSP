@@ -2726,7 +2726,13 @@ running loop, starts one timer, and returns the interval it runs at."
                            (json-response (obj "service" "Perception Engine (LSP)" "status" "running"))))
    (make-route "GET" "/api/health" (lambda (_ body query)
                                      (declare (ignore _ body query))
-                                     (json-response (obj "status" "healthy"))))
+                                     ;; The ISRE composition store's budget warnings, when
+                                     ;; there are any, from its cache, never through the actor.
+                                     (let* ((rec (ignore-errors (perception-state-isre (actor-state actor))))
+                                            (w (and rec (kstore-cached-warnings (isr-store rec))))
+                                            (body (obj "status" "healthy")))
+                                       (when w (setf (gethash "warnings" body) (vectorize w)))
+                                       (json-response body))))
    (make-route "GET" "/api/state" (lambda (_ body query)
                                     (declare (ignore _ body query))
                                     (json-response (actor-ask actor (lambda (state)
@@ -2958,7 +2964,9 @@ running loop, starts one timer, and returns the interval it runs at."
                                                                           (setf (perception-engine-match-algorithm (perception-state-engine state))
                                                                                 (jstring body "matchAlgorithm")))
                                                                         (unless (eq capture :missing) (setf (isr-capture rec) (eq capture t)))
-                                                                        (unless (eq bytes :missing) (setf (isr-store-max-bytes rec) (truncate bytes)))
+                                                                        (unless (eq bytes :missing)
+                                                                          (setf (isr-store-max-bytes rec) (truncate bytes))
+                                                                          (kstore-refresh-warnings (isr-store rec) (isre-controls rec)))
                                                                         (obj "success" t
                                                                              "matchAlgorithm" (perception-engine-match-algorithm (perception-state-engine state))
                                                                              "isreCapture" (json-bool (isr-capture rec))
@@ -3399,6 +3407,7 @@ startup — the PE still serves HTTP signals as a pure REST engine."
                                                    :localai-machine-dir localai-machine-dir))
          (actor (state-actor "perception-service" state)))
     (setf (perception-state-isre state) (make-engine-isre-recorder (participant-clock-uuid *pe-clock*)))
+    (let ((rec (perception-state-isre state))) (kstore-refresh-warnings (isr-store rec) (isre-controls rec)))
     (load-integrations-config state)
     ;; Background machine catalog refresher — best-effort initial fetch + 60 s loop.
     ;; Starts before HTTP so the catalog is warm before the first push cycle.

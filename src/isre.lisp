@@ -98,6 +98,10 @@
 (defstruct (isre-recorder (:conc-name isr-))
   instance store taxonomy (capture nil) (store-max-bytes (* 2 1024 1024 1024)) (re-instance ""))
 
+(defun isre-controls (rec)
+  "The composition store's budget, named as its control is (CI#603)."
+  (list :store-max-bytes (isr-store-max-bytes rec) :budget-name "isreStoreMaxBytes"))
+
 (defun isre-record (rec re pe cells folds)
   (when (and (isr-capture rec) (isr-taxonomy rec))
     (when (stringp (jget re "instance")) (setf (isr-re-instance rec) (jget re "instance")))
@@ -106,7 +110,7 @@
                      "folds" (if (vectorp folds) folds (vector)) "delta" +json-false+)))
       (kstore-append (isr-store rec) (list line) (isre-taxonomy-name (isr-taxonomy rec))
                      (truncate (jnumber re "commit" 0)))
-      (kstore-enforce-budget (isr-store rec) (list :store-max-bytes (isr-store-max-bytes rec))))))
+      (kstore-enforce-budget (isr-store rec) (isre-controls rec)))))
 
 (defun isre-list (rec from to limit)
   (let ((limit (min 1000 (max 1 (if (and limit (plusp limit)) limit 100))))
@@ -120,7 +124,7 @@
     (obj "records" (vectorize (nreverse out)) "next" next)))
 
 (defun isre-stats (rec)
-  (let ((s (kstore-stats (isr-store rec) (list :store-max-bytes (isr-store-max-bytes rec)))))
+  (let ((s (kstore-stats (isr-store rec) (isre-controls rec))))
     (obj "segments" (jget s "segments") "bytes" (jget s "bytes") "budget" (jget s "budget")
          "warnings" (jget s "warnings") "records" (length (kstore-metas (isr-store rec)))
          "isreCapture" (json-bool (isr-capture rec))
@@ -136,6 +140,7 @@
                              (pushnew (kmeta-segment m) segments :test #'string=)))))
       (dolist (seg (kstore-segments store))
         (when (member (kseg-name seg) segments :test #'string=) (setf (kseg-exported seg) t)))
+      (kstore-refresh-warnings store (isre-controls rec))
       (kstore-write-manifest store)
       (format nil "~a~%~a"
               (jcs (obj "format" "re-isre-bundle/1" "source" (obj "instance" (isr-instance rec))
