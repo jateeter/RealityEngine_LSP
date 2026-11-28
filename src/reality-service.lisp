@@ -508,7 +508,8 @@ trip never holds up a step (#900). Off is 503, and so is a store that cannot ans
                 (snapshot-state-parts state from* to*)
               (multiple-value-bind (snap status err)
                   (snapshot-capture (reality-state-snapshot-retention state)
-                                    :scope scope :from from :to to :instance (state-instance-uuid state)
+                                    :scope scope :from from :to to
+                                    :scope-given (or (vectorp scope-j) (equal scope-j "corpus"))
                                     :fingerprint (refresh-corpus-fingerprint state)
                                     :machine-count (hash-table-count (reality-state-machines state))
                                     :controls controls :machine-controls machine-controls :overrides overrides
@@ -597,13 +598,18 @@ trip never holds up a step (#900). Off is 503, and so is a store that cannot ans
                      (seq (and m (gethash sid (machine-sequences m))))
                      (ev (and seq (gethash eid (sequence-vectors seq)))))
                 (when ev (setf (reality-event-active-p ev) t (reality-event-just-matched-p ev) jm)))))
+          ;; Any restore is a retention boundary (#904): the next step starts
+          ;; from the live list, and until it the restored snapshot is what a
+          ;; capture returns.
+          (snapshot-retention-restore (reality-state-snapshot-retention state)
+                                      (snapshot-all-actives (reality-state-machines state))
+                                      kl (or (jget snap "arbitration") +json-null+))
           (when corpus
             (let ((to (truncate (jnumber (jget kl "span") "to" 0))))
               (setf (reality-state-isre-history state) (map 'list (lambda (p) (jget p "isre")) (jget kl "pairs"))
                     (reality-state-osre-history state) (map 'list (lambda (p) (jget p "osre")) (jget kl "pairs"))
                     (reality-state-step-count state) (1+ to))
               (clrhash (reality-state-arbitration-steps state))
-              (snapshot-retention-restore (reality-state-snapshot-retention state) after)
               (signal-step-completed state to)))
           ;; A restore is a reset for K-line capture: open K-lines close
           ;; interrupted/reset. It commits no step, so lamport does not tick.
@@ -2534,7 +2540,8 @@ always treated presence as activation; this runtime is the one that differed."
         (capture-klines state (jnumber isre "stepNumber" 0) commit kline-composed kline-ops isre osre)
         ;; Snapshot retention (#287): every retained step's active list,
         ;; contributions and clock, whether or not K-line capture is on.
-        (snapshot-retain (reality-state-snapshot-retention state) (jnumber isre "stepNumber" 0) lamport isre osre
+        (snapshot-retain (reality-state-snapshot-retention state) (jnumber isre "stepNumber" 0)
+                         (state-instance-uuid state) lamport isre osre
                          kline-ops (reality-state-machines state) (or (reality-state-history-limit state) 250)))
       (tick-step-phase state 3)                             ; B4: pair committed
       ;; The pair is committed: the step's completion point (#375).
