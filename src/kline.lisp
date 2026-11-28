@@ -136,7 +136,12 @@
   (by-id (make-hash-table :test #'equal))
   (events (make-hash-table :test #'equal))   ; id -> list of (through . raw), oldest first
   (lines (make-array 0 :adjustable t :fill-pointer t))
-  (appends 0))
+  (appends 0)
+  ;; The budget warnings as of the last budget check, export or control
+  ;; change, for /api/health: read from any thread, never through the actor,
+  ;; so health never waits on a step (SURFACE_SPEC "The K-line store").
+  (cached-warnings nil)
+  (last-controls nil))
 
 (defun kstore-path (store name)
   (merge-pathnames name (uiop:ensure-directory-pathname (kstore-dir store))))
@@ -337,8 +342,12 @@
         (incf sealed (kseg-bytes s))
         (unless (kseg-exported s) (incf unexported))))
     (when (and (> sealed (getf controls :store-max-bytes)) (plusp unexported))
-      (list (format nil "klineStoreMaxBytes reached: ~d unexported sealed segment(s) are kept; export them to free space"
-                    unexported)))))
+      (list (format nil "~a reached: ~d unexported sealed segment(s) are kept; export them to free space"
+                    (or (getf controls :budget-name) "klineStoreMaxBytes") unexported)))))
+
+(defun kstore-refresh-warnings (store controls)
+  (setf (kstore-last-controls store) controls
+        (kstore-cached-warnings store) (kstore-warnings store controls)))
 
 (defun kstore-stats (store controls)
   (let ((by-outcome (obj)) (by-machine (obj)) (bytes 0) (live 0))
@@ -352,6 +361,10 @@
          "budget" (getf controls :store-max-bytes) "warnings" (vectorize (kstore-warnings store controls)))))
 
 (defun kstore-enforce-budget (store controls)
+  (kstore-enforce-budget-now store controls)
+  (kstore-refresh-warnings store controls))
+
+(defun kstore-enforce-budget-now (store controls)
   (flet ((sealed-bytes ()
            (loop for s in (kstore-segments store) when (and (kseg-sealed s) (not (kseg-archived s))) sum (kseg-bytes s))))
     (let (moved)
@@ -1006,6 +1019,7 @@ KLT-CAPTURE to nil, which leaves the store and its checkpoint untouched."
                              (pushnew (kmeta-segment m) segments :test #'string=)))))
       (dolist (seg (kstore-segments store))
         (when (member (kseg-name seg) segments :test #'string=) (setf (kseg-exported seg) t)))
+      (kstore-refresh-warnings (klt-store tr) (or (kstore-last-controls (klt-store tr)) (klt-controls tr)))
       (kstore-write-manifest store)
       (format nil "~a~%~a"
               (jcs (obj "format" "re-kline-bundle/1" "source" (obj "instance" (klt-instance tr))

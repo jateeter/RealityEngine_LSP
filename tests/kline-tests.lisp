@@ -130,4 +130,31 @@
     (kline-step st '((0 . 1)))
     (reality-engine-lsp::reset-reality-state st)
     (assert-equal "reset" (reality-engine-lsp::jstring (kline-find (kline-records st) "Linear" "interrupted" 0) "reason" "")
-                  "a reset closes it interrupted")))
+                  "a reset closes it interrupted"))
+  ;; The budget warning reaches /api/health through the store's cache
+  ;; (SURFACE_SPEC "The K-line store", budget): cached by a budget check,
+  ;; cleared once the segment is exported and evicted, naming its budget.
+  (let* ((dir (format nil "~a/kline-warn-~d/" (uiop:temporary-directory) (sb-posix:getpid)))
+         (store (reality-engine-lsp::open-kline-store dir))
+         (controls (list :store-max-bytes 0)))
+    (reality-engine-lsp::kstore-append store (list (reality-engine-lsp::obj "format" "re-kline/1" "id" "a:1"
+                                                    "close" (reality-engine-lsp::obj "commit" 1))) "fp-a" 1)
+    (reality-engine-lsp::kstore-append store (list (reality-engine-lsp::obj "format" "re-kline/1" "id" "a:2"
+                                                    "close" (reality-engine-lsp::obj "commit" 2))) "fp-b" 2)
+    (assert-true (null (reality-engine-lsp::kstore-cached-warnings store)) "no warning before a budget check")
+    (reality-engine-lsp::kstore-enforce-budget store controls)
+    (let ((w (reality-engine-lsp::kstore-cached-warnings store)))
+      (assert-true (and (= 1 (length w)) (eql 0 (search "klineStoreMaxBytes reached" (first w))))
+                   "a sealed, unexported segment over budget is kept and warned about"))
+    (dolist (seg (reality-engine-lsp::kstore-segments store)) (setf (reality-engine-lsp::kseg-exported seg) t))
+    (reality-engine-lsp::kstore-enforce-budget store controls)
+    (assert-true (null (reality-engine-lsp::kstore-cached-warnings store)) "exported and evicted, the warning clears")
+    (let ((pe (reality-engine-lsp::open-kline-store (format nil "~ape/" dir))))
+      (reality-engine-lsp::kstore-append pe (list (reality-engine-lsp::obj "format" "re-isre-composition/1"
+                                                 "re" (reality-engine-lsp::obj "commit" 1))) "f1" 1)
+      (reality-engine-lsp::kstore-append pe (list (reality-engine-lsp::obj "format" "re-isre-composition/1"
+                                                 "re" (reality-engine-lsp::obj "commit" 2))) "f2" 2)
+      (reality-engine-lsp::kstore-enforce-budget pe (list :store-max-bytes 0 :budget-name "isreStoreMaxBytes"))
+      (assert-true (eql 0 (search "isreStoreMaxBytes reached" (first (reality-engine-lsp::kstore-cached-warnings pe))))
+                   "the composition store names its own budget"))
+    (uiop:delete-directory-tree (pathname dir) :validate t)))

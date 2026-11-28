@@ -805,6 +805,8 @@ schema does not declare — isActive, state, wasJustMatched — which
     (boot-instance-clock state)
     (setf (reality-state-klines state)
           (make-engine-kline-tracker (state-instance-uuid state) (lambda () (clock-send state))))
+    ;; A population over budget from an earlier run warns from boot.
+    (let ((tr (reality-state-klines state))) (kstore-refresh-warnings (klt-store tr) (klt-controls tr)))
     (dolist (machine (load-machines-from-directory machine-dir))
       (put-machine state machine))
     state))
@@ -2870,7 +2872,10 @@ list differed by order alone."
                            (lambda (state v) (setf (klt-feedback-hops (reality-state-klines state)) v)))
      (kline-number-control "klineStoreMaxBytes" 2147483648 9007199254740991
                            (lambda (state) (klt-store-max-bytes (reality-state-klines state)))
-                           (lambda (state v) (setf (klt-store-max-bytes (reality-state-klines state)) v)))
+                           (lambda (state v)
+                             (let ((tr (reality-state-klines state)))
+                               (setf (klt-store-max-bytes tr) v)
+                               (kstore-refresh-warnings (klt-store tr) (klt-controls tr)))))
      (boolean-control "machineJsonSummary"
                       #'reality-state-machine-json-summary-p
                       (lambda (state v) (setf (reality-state-machine-json-summary-p state) v))
@@ -3123,7 +3128,14 @@ its block held by a machine that no longer exists."
                                 (json-response (obj "name" "Reality Engine" "version" "0.1.0-lsp" "status" "running"))))
      (make-route "GET" "/api/health" (lambda (_ body query)
                                        (declare (ignore _ body query))
-                                       (json-response (obj "status" "healthy"))))
+                                       ;; The K-line store's budget warnings, when there are
+                                       ;; any (SURFACE_SPEC "The K-line store"), read from the
+                                       ;; store's cache, never through the actor.
+                                       (let* ((tr (ignore-errors (reality-state-klines (actor-state actor))))
+                                              (w (and tr (kstore-cached-warnings (klt-store tr))))
+                                              (body (obj "status" "healthy")))
+                                         (when w (setf (gethash "warnings" body) (vectorize w)))
+                                         (json-response body))))
      (make-route "GET" "/api/config" (lambda (_ body query)
                                        (declare (ignore _ body query))
                                        (state-json (lambda (state)
