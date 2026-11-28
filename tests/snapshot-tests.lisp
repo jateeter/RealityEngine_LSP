@@ -45,7 +45,7 @@
     (sb-posix:setenv "RE_SNAPSHOT_STORE" "qdrant:https://example.invalid" 1)
     (assert-true (reality-engine-lsp::snapshot-store-qdrant-p (reality-engine-lsp::snapshot-store-from-environment))
                  "qdrant:<https url> is the Qdrant store (#900)")
-    (let ((st (reality-engine-lsp::snapshot-store-from-value "qdrant:http://localhost:4333")))
+    (let ((st (reality-engine-lsp::snapshot-store-from-value "qdrant:http://qdrant.invalid:4333"))) ; insecure-transport: negative-test
       (assert-true (and (not (reality-engine-lsp::snapshot-store-enabled-p st)) (reality-engine-lsp::snps-off-reason st))
                    "a plaintext Qdrant URL leaves the store off, with the reason"))
     (assert-true (not (reality-engine-lsp::snapshot-store-enabled-p (reality-engine-lsp::snapshot-store-from-value "redis:x")))
