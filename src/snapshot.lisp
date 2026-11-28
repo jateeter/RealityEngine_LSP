@@ -10,17 +10,24 @@
 ;;;; list after it, its contributions and its clock, whether or not K-line
 ;;;; capture is on (owner decision 4, 2026-11-24).
 
-(defstruct (snap-step (:conc-name sst-)) step lamport isre osre ops after)
+;;; A step's clock is the instance that committed it and its lamport
+;;; (RealityEngine_CI#904).
+(defstruct (snap-step (:conc-name sst-)) step instance lamport isre osre ops after)
 
+;;; RESTORED is what a restore re-established, (kline . arbitration), until the
+;;; next step (#904): a capture returns it, so restore then capture is an
+;;; identity. Its clocks keep the instance that committed those steps, which on
+;;; a sandbox replica is the source, never the replica.
 (defstruct (snapshot-retention (:conc-name sret-))
-  (base nil) (base-set nil) (steps nil))   ; steps oldest first
+  (base nil) (base-set nil) (steps nil) (restored nil))   ; steps oldest first
 
 (defun snapshot-all-actives (machines)
   (let (out)
     (maphash (lambda (_ m) (declare (ignore _)) (setf out (append (machine-actives m) out))) machines)
     out))
 
-(defun snapshot-retain (ret step lamport isre osre merge-batch machines limit)
+(defun snapshot-retain (ret step instance lamport isre osre merge-batch machines limit)
+  (setf (sret-restored ret) nil)
   (unless (or (sret-steps ret) (sret-base-set ret))
     ;; The reset hook runs before the machines reset, so the base is taken at the
     ;; first step after it: every machine at its initial events.
@@ -29,7 +36,7 @@
       (setf (sret-base ret) base (sret-base-set ret) t)))
   (setf (sret-steps ret)
         (append (sret-steps ret)
-                (list (make-snap-step :step step :lamport lamport :isre isre :osre osre
+                (list (make-snap-step :step step :instance instance :lamport lamport :isre isre :osre osre
                                       :ops (mapcar (lambda (op)
                                                      (list (jstring op "machineName" "")
                                                            (make-region-from-json (jget op "region"))
@@ -41,10 +48,13 @@
                  (sret-steps ret) (rest (sret-steps ret)))))
 
 (defun snapshot-retention-reset (ret)
-  (setf (sret-base ret) nil (sret-base-set ret) nil (sret-steps ret) nil))
+  (setf (sret-base ret) nil (sret-base-set ret) nil (sret-steps ret) nil (sret-restored ret) nil))
 
-(defun snapshot-retention-restore (ret base)
-  (setf (sret-base ret) base (sret-base-set ret) t (sret-steps ret) nil))
+(defun snapshot-retention-restore (ret live kline arbitration)
+  "Any restore: nothing retained, LIVE is the next step's base, and the restored
+K-line is the restore point until that step."
+  (setf (sret-base ret) live (sret-base-set ret) t (sret-steps ret) nil
+        (sret-restored ret) (cons kline arbitration)))
 
 (defun snapshot-at (ret step) (find step (sret-steps ret) :key #'sst-step))
 
@@ -71,10 +81,45 @@
   (let ((d (jstring body "digest" "")))
     (if (and (> (length d) 7) (string= "sha256:" d :end2 7)) (subseq d 7) d)))
 
-(defun snapshot-capture (ret &key scope from to instance fingerprint machine-count controls machine-controls
+(defun snapshot-body (kline arbitration &key fingerprint machine-count controls machine-controls overrides)
+  (let ((body (obj "format" "re-snapshot/1"
+                   "corpus" (obj "algorithm" "sha256/resident-declared-v1" "fingerprint" fingerprint
+                                 "machines" machine-count)
+                   "controls" controls "machineControls" machine-controls "machineOverrides" overrides
+                   "kline" kline
+                   "arbitration" arbitration)))
+    (setf (gethash "digest" body) (snapshot-digest body))
+    body))
+
+(defun snapshot-capture-restored (restored &key scope scope-given from to fingerprint machine-count controls
+                                              machine-controls overrides)
+  "Right after a restore (#904): the restored K-line, when the request asks for
+its scope and span or leaves them out."
+  (let* ((kl (car restored))
+         (rscope (jget kl "scope"))
+         (span (jget kl "span"))
+         (same (and (cond (scope (and (vectorp rscope) (not (stringp rscope))
+                                      (equal (sort (remove-duplicates (copy-list scope) :test #'string=) #'octets<)
+                                             (sort (coerce rscope 'list) #'octets<))))
+                          (scope-given (stringp rscope))
+                          (t t))
+                    (or (null from) (eql from (jnumber span "from" -1)))
+                    (or (null to) (eql to (jnumber span "to" -1))))))
+    (if same
+        (values (snapshot-body kl (cdr restored) :fingerprint fingerprint :machine-count machine-count
+                               :controls controls :machine-controls machine-controls :overrides overrides)
+                200 nil)
+        (values nil 410 (obj "error" "no step is retained since the restore; only the restored snapshot is capturable")))))
+
+(defun snapshot-capture (ret &key scope scope-given from to fingerprint machine-count controls machine-controls
                                    overrides arbitration machines)
   "(values body status error-body). SCOPE nil is the corpus, else a list of names."
   (let ((steps (sret-steps ret)))
+    (when (and (null steps) (sret-restored ret))
+      (return-from snapshot-capture
+        (snapshot-capture-restored (sret-restored ret) :scope scope :scope-given scope-given :from from :to to
+                                   :fingerprint fingerprint :machine-count machine-count :controls controls
+                                   :machine-controls machine-controls :overrides overrides)))
     (when (null steps)
       (return-from snapshot-capture (values nil 410 (obj "error" "no step is retained"))))
     (let* ((newest (sst-step (car (last steps))))
@@ -107,7 +152,7 @@
                         below (min (+ (region-offset o) (region-length o)) (+ (region-offset x) (region-length x)))
                       do (pushnew c shared)))))
           (flet ((in-scope (list) (if scope (remove-if-not (lambda (e) (member (first e) scope :test #'string=)) list) list))
-                 (clock (s) (obj "instance" instance "lamport" (sst-lamport s) "step" (sst-step s))))
+                 (clock (s) (obj "instance" (sst-instance s) "lamport" (sst-lamport s) "step" (sst-step s))))
             (let* ((pairs
                      (loop for k from from to to
                            for s = (snapshot-at ret k)
@@ -128,19 +173,17 @@
                                                                                   "length" (region-length (second op)))
                                                                     "values" (vectorize (third op))))
                                                              ops))))))
-                   (body (obj "format" "re-snapshot/1"
-                              "corpus" (obj "algorithm" "sha256/resident-declared-v1" "fingerprint" fingerprint
-                                            "machines" machine-count)
-                              "controls" controls "machineControls" machine-controls "machineOverrides" overrides
-                              "kline" (obj "scope" (if scope (vectorize scope-sorted) "corpus")
+                   (body (snapshot-body
+                              (obj "scope" (if scope (vectorize scope-sorted) "corpus")
                                            "span" (obj "from" from "to" to)
                                            "clocks" (obj "from" (clock (snapshot-at ret from)) "to" (clock (snapshot-at ret to)))
                                            "activeBefore" (actives-json (in-scope before))
                                            "pairs" (vectorize pairs)
                                            "activeAfter" (actives-json (in-scope (sst-after (snapshot-at ret to))))
                                            "sharedCells" (vectorize (sort shared #'<)))
-                              "arbitration" arbitration)))
-              (setf (gethash "digest" body) (snapshot-digest body))
+                              arbitration
+                              :fingerprint fingerprint :machine-count machine-count :controls controls
+                              :machine-controls machine-controls :overrides overrides)))
               (values body 200 nil))))))))
 
 ;;; ── A snapshot's state, and nearest (SURFACE_SPEC "Nearest", #900) ─────────
