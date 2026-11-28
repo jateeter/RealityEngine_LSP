@@ -417,6 +417,18 @@ is issued. Returns (values lamport commit)."
             (kline-on-step tracker step commit composed merge-batch isre osre
                            (reality-state-machines state) (reality-state-kline-fingerprint state)))
         (error (e) (kline-failed state e))))))
+(defun snapshot-store-op (actor fn)
+  "FN of the snapshot store, answering (status body): on the actor for memory and
+file, whose tables are the actor's; on this thread for qdrant, so a Qdrant round
+trip never holds up a step (#900). Off is 503, and so is a store that cannot answer."
+  (let ((st (actor-ask actor (lambda (state) (reality-state-snapshot-store state)))))
+    (if (not (snapshot-store-enabled-p st))
+        (list 503 (obj "error" "snapshots are disabled"))
+        (handler-case (if (snapshot-store-qdrant-p st)
+                          (funcall fn st)
+                          (actor-ask actor (lambda (state) (declare (ignore state)) (funcall fn st))))
+          (snapshot-store-unavailable (c) (list 503 (obj "error" (format nil "~a" c))))))))
+
 (defun snapshot-response (result)
   "RESULT is (status body)."
   (if (= (first result) 200) (json-response (second result)) (json-response (second result) (first result))))
@@ -504,8 +516,10 @@ is issued. Returns (values lamport commit)."
                 (if (null snap)
                     (list status err)
                     (let ((id (snapshot-id snap)))
-                      (snapshot-store-put st id snap)
-                      (list 200 (obj "id" id "digest" (jget snap "digest") "span" (jget (jget snap "kline") "span")))))))))))))
+                      ;; A Qdrant store is written by the route, off the actor (#900).
+                      (unless (snapshot-store-qdrant-p st) (snapshot-store-put st id snap))
+                      (list 200 (obj "id" id "digest" (jget snap "digest") "span" (jget (jget snap "kline") "span"))
+                            snap)))))))))))
 
 (defun snapshot-route-restore (state body)
   (let ((st (reality-state-snapshot-store state)))
@@ -4280,40 +4294,59 @@ its block held by a machine that no longer exists."
                  (lambda (_ body query)
                    (declare (ignore _ query))
                    (let ((result (actor-ask actor (lambda (state) (snapshot-route-capture state body)))))
+                     (when (and (= (first result) 200) (third result))
+                       (let ((put (snapshot-store-op actor (lambda (st) (snapshot-store-put st (jget (second result) "id") (third result))
+                                                             (list 200 nil)))))
+                         (unless (= (first put) 200) (setf result put))))
                      (snapshot-response result))))
      (make-route "GET" "/api/runtime/snapshots"
                  (lambda (_ body query)
                    (declare (ignore _ body query))
-                   (snapshot-response
-                    (actor-ask actor (lambda (state)
-                                       (let ((st (reality-state-snapshot-store state)))
-                                         (if (snapshot-store-enabled-p st)
-                                             (list 200 (snapshot-store-list st))
-                                             (list 503 (obj "error" "snapshots are disabled")))))))))
+                   (snapshot-response (snapshot-store-op actor (lambda (st) (list 200 (snapshot-store-list st)))))))
      (make-route "GET" "/api/runtime/snapshot/:id"
                  (lambda (params body query)
                    (declare (ignore body query))
                    (let ((id (gethash "id" params)))
                      (snapshot-response
-                      (actor-ask actor (lambda (state)
-                                         (let ((st (reality-state-snapshot-store state)))
-                                           (cond ((not (snapshot-store-enabled-p st)) (list 503 (obj "error" "snapshots are disabled")))
-                                                 ((snapshot-store-get st id) (list 200 (snapshot-store-get st id)))
-                                                 (t (list 404 (obj "error" (format nil "no snapshot ~a" id))))))))))))
+                      (snapshot-store-op actor (lambda (st)
+                                                 (let ((got (snapshot-store-get st id)))
+                                                   (if got (list 200 got)
+                                                       (list 404 (obj "error" (format nil "no snapshot ~a" id)))))))))))
      (make-route "DELETE" "/api/runtime/snapshot/:id"
                  (lambda (params body query)
                    (declare (ignore body query))
                    (let ((id (gethash "id" params)))
                      (snapshot-response
-                      (actor-ask actor (lambda (state)
-                                         (let ((st (reality-state-snapshot-store state)))
-                                           (cond ((not (snapshot-store-enabled-p st)) (list 503 (obj "error" "snapshots are disabled")))
-                                                 ((snapshot-store-remove st id) (list 200 (obj "deleted" id)))
-                                                 (t (list 404 (obj "error" (format nil "no snapshot ~a" id))))))))))))
+                      (snapshot-store-op actor (lambda (st)
+                                                 (if (snapshot-store-remove st id)
+                                                     (list 200 (obj "deleted" id))
+                                                     (list 404 (obj "error" (format nil "no snapshot ~a" id))))))))))
      (make-route "POST" "/api/runtime/restore"
                  (lambda (_ body query)
                    (declare (ignore _ query))
-                   (snapshot-response (actor-ask actor (lambda (state) (snapshot-route-restore state body))))))
+                   ;; Restore by id from a Qdrant store: fetched here, off the actor (#900).
+                   (let ((pre (snapshot-store-op
+                               actor (lambda (st)
+                                       (if (and (snapshot-store-qdrant-p st) (not (hash-table-p (jget body "snapshot")))
+                                                (stringp (jget body "id")))
+                                           (let ((got (snapshot-store-get st (jget body "id"))))
+                                             (if got (list 200 (obj "snapshot" got))
+                                                 (list 404 (obj "error" (format nil "no snapshot ~a" (jget body "id"))))))
+                                           (list 200 body))))))
+                     (snapshot-response
+                      (if (= (first pre) 200)
+                          (actor-ask actor (lambda (state) (snapshot-route-restore state (second pre))))
+                          pre)))))
+     (make-route "POST" "/api/runtime/snapshots/nearest"
+                 (lambda (_ body query)
+                   (declare (ignore _ query))
+                   (let ((q (snapshot-parse-state (jget body "isre")))
+                         (limit (jget body "limit" 5)))
+                     (snapshot-response
+                      (cond ((null q) (list 422 (obj "error" "isre is {length, nonZero: [{index, value}]}")))
+                            ((not (and (realp limit) (= limit (truncate limit)) (<= 1 limit 100)))
+                             (list 422 (obj "error" "limit is a whole number from 1 to 100")))
+                            (t (snapshot-store-op actor (lambda (st) (list 200 (snapshot-store-nearest st q (truncate limit)))))))))))
      (make-route "POST" "/api/klines/export"
                  (lambda (_ body query)
                    (declare (ignore _ query))
