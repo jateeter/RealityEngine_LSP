@@ -143,52 +143,221 @@
               (setf (gethash "digest" body) (snapshot-digest body))
               (values body 200 nil))))))))
 
+;;; ── A snapshot's state, and nearest (SURFACE_SPEC "Nearest", #900) ─────────
+
+(defun snapshot-state-of (body)
+  "A snapshot's state, a hash table cell -> value: the ISRE at span.to."
+  (let* ((k (jget body "kline"))
+         (to (jnumber (jget k "span") "to" -1))
+         (out (make-hash-table)))
+    (loop for p across (or (jget k "pairs") #())
+          when (eql (jnumber p "stepNumber" -2) to)
+            do (loop for c across (or (jget (jget p "isre") "nonZero") #())
+                     do (setf (gethash (truncate (jnumber c "index" 0)) out) (coerce (jnumber c "value" 0) 'double-float))))
+    out))
+
+(defun snapshot-parse-state (isre)
+  "{length, nonZero: [{index, value}]} as a state; NIL when malformed."
+  (when (and (hash-table-p isre) (vectorp (jget isre "nonZero")) (not (stringp (jget isre "nonZero"))))
+    (let ((out (make-hash-table)))
+      (loop for c across (jget isre "nonZero")
+            do (let ((i (and (hash-table-p c) (jget c "index"))) (v (and (hash-table-p c) (jget c "value"))))
+                 (unless (and (realp i) (realp v) (>= i 0)) (return-from snapshot-parse-state nil))
+                 (setf (gethash (truncate i) out) (coerce v 'double-float))))
+      out)))
+
+(defun snapshot-score (query state)
+  "The sparse dot product over the cells both hold, in double, summed in ascending
+cell order as every runtime sums it (a hash table's order would move the last bit)."
+  (let ((sum 0d0) cells)
+    (maphash (lambda (cell v) (push (cons cell v) cells)) query)
+    (dolist (c (sort cells #'< :key #'car) sum)
+      (let ((w (gethash (car c) state))) (when w (incf sum (* (cdr c) w)))))))
+
+(defun snapshot-summary (b)
+  (let ((k (jget b "kline")))
+    (obj "id" (snapshot-id b) "digest" (jget b "digest") "scope" (jget k "scope")
+         "span" (jget k "span") "machines" (jget (jget b "corpus") "machines"))))
+
+(defun snapshot-lamport (b) (jnumber (jget (jget (jget b "kline") "clocks") "to") "lamport" 0))
+
+(defun bytes< (a b) (string< a b))
+
+(defun snapshot-ranked (scored limit)
+  "SCORED is ((score . body) ...): highest first, then id; at most LIMIT."
+  (let ((sorted (sort (copy-list scored)
+                      (lambda (a b) (if (/= (car a) (car b)) (> (car a) (car b))
+                                        (bytes< (snapshot-id (cdr a)) (snapshot-id (cdr b))))))))
+    (obj "snapshots" (vectorize (loop for (sc . b) in sorted for i below limit
+                                      collect (let ((e (snapshot-summary b))) (setf (gethash "score" e) sc) e))))))
+
+(defun snapshot-sparse (state)
+  (let (cells)
+    (maphash (lambda (c v) (push (cons c v) cells)) state)
+    (setf cells (sort cells #'< :key #'car))
+    (obj "indices" (vectorize (mapcar #'car cells)) "values" (vectorize (mapcar #'cdr cells)))))
+
 ;;; ── The store ─────────────────────────────────────────────────────────────
 
-(defstruct (snapshot-store (:conc-name snps-)) (mode :memory) dir (memory (make-hash-table :test #'equal)))
+(define-condition snapshot-store-unavailable (error)
+  ((reason :initarg :reason :reader snapshot-store-unavailable-reason))
+  (:report (lambda (c s) (format s "snapshot store unavailable: ~a" (snapshot-store-unavailable-reason c))))
+  (:documentation "Qdrant unreachable or answering an error: that request is 503 (#900)."))
+
+(defstruct (snapshot-store (:conc-name snps-))
+  (mode :memory) dir (memory (make-hash-table :test #'equal))
+  ;; qdrant:<url> (#900): one collection, points filtered by this instance.
+  url collection instance off-reason (ready nil))
 
 (defun snapshot-store-from-environment ()
-  "RE_SNAPSHOT_STORE: memory (default), file:<dir>, off. qdrant:<url> is phase 3
-and is off until then, never a boot failure."
-  (let ((v (or (env "RE_SNAPSHOT_STORE" nil) "memory")))
+  "RE_SNAPSHOT_STORE: memory (default), file:<dir>, qdrant:<https url>, off. An
+unusable value is off, with the reason in the log; never a boot failure."
+  (let ((st (snapshot-store-from-value (or (env "RE_SNAPSHOT_STORE" nil) "memory"))))
+    (cond ((snps-off-reason st) (format *error-output* "~&~a~%" (snps-off-reason st)))
+          ((eq (snps-mode st) :qdrant) (format *error-output* "~&Snapshot store: Qdrant (RE_SNAPSHOT_STORE)~%")))
+    st))
+
+(defun snapshot-store-from-value (value)
+  (let ((v value))
     (cond ((or (string= v "") (string= v "memory")) (make-snapshot-store :mode :memory))
+          ((string= v "off") (make-snapshot-store :mode :off))
           ((and (> (length v) 5) (string= "file:" v :end2 5))
            (let ((dir (uiop:ensure-directory-pathname (subseq v 5))))
              (ensure-directories-exist dir)
              (make-snapshot-store :mode :file :dir dir)))
-          (t (make-snapshot-store :mode :off)))))
+          ((and (> (length v) 7) (string= "qdrant:" v :end2 7))
+           (let ((url (string-right-trim "/" (subseq v 7))))
+             (if (and (>= (length url) 8) (string-equal "https://" url :end2 8))
+                 (make-snapshot-store :mode :qdrant :url url
+                                      :collection (let ((c (env "RE_SNAPSHOT_COLLECTION" nil)))
+                                                    (if (and c (plusp (length c))) c "re-snapshots"))
+                                      :instance (let ((i (env "INSTANCE_UUID" nil)))
+                                                  (if (and i (plusp (length i))) i "unidentified")))
+                 ;; Never a plaintext link (ENGINEERING_CONTRACT, data in motion).
+                 (make-snapshot-store :mode :off :off-reason
+                                      "RE_SNAPSHOT_STORE=qdrant: needs an https URL; the snapshot store is off"))))
+          (t (make-snapshot-store
+              :mode :off
+              :off-reason (format nil "RE_SNAPSHOT_STORE=~a is not memory, file:<dir>, qdrant:<url> or off; the snapshot store is off" v))))))
 
 (defun snapshot-store-enabled-p (st) (not (eq (snps-mode st) :off)))
+(defun snapshot-store-qdrant-p (st) (eq (snps-mode st) :qdrant))
 
 (defun snapshot-id-p (id) (and (plusp (length id)) (every (lambda (c) (find c "0123456789abcdef")) id)))
 
+(defun snapshot-qdrant (st method path &optional payload)
+  "One Qdrant call: its `result`, or SNAPSHOT-STORE-UNAVAILABLE. Qdrant is not a
+clock participant, so the call carries no RE-Clock and never moves the clock."
+  (let ((res (handler-case
+                 (let ((*client-clock-stamp* nil) (*client-clock-receive* nil))
+                   (http-request-json (format nil "~a~a" (snps-url st) path) :method method :payload payload))
+               (error (e) (error 'snapshot-store-unavailable :reason (format nil "Qdrant: ~a" e))))))
+    (unless (and (hash-table-p res) (equal (jget res "status") "ok"))
+      (let ((why (and (hash-table-p res) (hash-table-p (jget res "status")) (jget (jget res "status") "error"))))
+        (error 'snapshot-store-unavailable :reason (format nil "Qdrant: ~a" (or why "an error")))))
+    (jget res "result")))
+
+(defun snapshot-qdrant-ready (st)
+  (unless (snps-ready st)
+    (let ((c (snps-collection st)))
+      (unless (eq (jget (snapshot-qdrant st :get (format nil "/collections/~a/exists" c)) "exists") t)
+        (snapshot-qdrant st :put (format nil "/collections/~a" c) (obj "sparse_vectors" (obj "isre" (obj))))
+        (snapshot-qdrant st :put (format nil "/collections/~a/index?wait=true" c)
+                         (obj "field_name" "instance" "field_schema" "keyword"))))
+    (setf (snps-ready st) t)))
+
+(defun snapshot-point-id (st id)
+  (let ((h (sha256-hex (format nil "~a:~a" (snps-instance st) id))))
+    (format nil "~a-~a-~a-~a-~a" (subseq h 0 8) (subseq h 8 12) (subseq h 12 16) (subseq h 16 20) (subseq h 20 32))))
+
+(defun snapshot-instance-filter (st)
+  (obj "must" (vector (obj "key" "instance" "match" (obj "value" (snps-instance st))))))
+
 (defun snapshot-store-put (st id body)
-  (if (eq (snps-mode st) :file)
-      (write-durable (merge-pathnames (format nil "~a.json" id) (snps-dir st)) (format nil "~a~%" (jcs body)))
-      (setf (gethash id (snps-memory st)) body)))
+  (case (snps-mode st)
+    (:file (write-durable (merge-pathnames (format nil "~a.json" id) (snps-dir st)) (format nil "~a~%" (jcs body))))
+    (:qdrant
+     (snapshot-qdrant-ready st)
+     (let ((k (jget body "kline")))
+       (snapshot-qdrant st :put (format nil "/collections/~a/points?wait=true" (snps-collection st))
+                        (obj "points" (vector (obj "id" (snapshot-point-id st id)
+                                                   "vector" (obj "isre" (snapshot-sparse (snapshot-state-of body)))
+                                                   "payload" (obj "instance" (snps-instance st) "id" id
+                                                                  "digest" (jget body "digest") "scope" (jget k "scope")
+                                                                  "span" (jget k "span")
+                                                                  "machines" (jget (jget body "corpus") "machines")
+                                                                  "lamport" (snapshot-lamport body)
+                                                                  "body" (jcs body))))))))
+    (t (setf (gethash id (snps-memory st)) body))))
 
 (defun snapshot-store-get (st id)
   (when (snapshot-id-p id)
-    (if (eq (snps-mode st) :file)
-        (let ((f (merge-pathnames (format nil "~a.json" id) (snps-dir st))))
-          (and (probe-file f) (parse-json (uiop:read-file-string f))))
-        (gethash id (snps-memory st)))))
+    (case (snps-mode st)
+      (:file (let ((f (merge-pathnames (format nil "~a.json" id) (snps-dir st))))
+               (and (probe-file f) (parse-json (uiop:read-file-string f)))))
+      (:qdrant
+       (snapshot-qdrant-ready st)
+       (loop for pt across (or (snapshot-qdrant st :post (format nil "/collections/~a/points" (snps-collection st))
+                                                (obj "ids" (vector (snapshot-point-id st id)) "with_payload" t))
+                               #())
+             for pl = (jget pt "payload")
+             when (and (equal (jget pl "instance") (snps-instance st)) (equal (jget pl "id") id))
+               return (parse-json (jget pl "body"))))
+      (t (gethash id (snps-memory st))))))
 
 (defun snapshot-store-remove (st id)
   (when (snapshot-store-get st id)
-    (if (eq (snps-mode st) :file)
-        (delete-file (merge-pathnames (format nil "~a.json" id) (snps-dir st)))
-        (remhash id (snps-memory st)))
+    (case (snps-mode st)
+      (:file (delete-file (merge-pathnames (format nil "~a.json" id) (snps-dir st))))
+      (:qdrant (snapshot-qdrant st :post (format nil "/collections/~a/points/delete?wait=true" (snps-collection st))
+                                (obj "points" (vector (snapshot-point-id st id)))))
+      (t (remhash id (snps-memory st))))
     t))
 
+(defun snapshot-store-bodies (st)
+  (case (snps-mode st)
+    (:file (loop for f in (uiop:directory-files (snps-dir st) "*.json")
+                 collect (parse-json (uiop:read-file-string f))))
+    (:qdrant
+     (snapshot-qdrant-ready st)
+     (let ((offset nil) out)
+       (loop
+         (let* ((req (obj "filter" (snapshot-instance-filter st) "limit" 256 "with_payload" t "with_vector" +json-false+))
+                (res (progn (when offset (setf (gethash "offset" req) offset))
+                            (snapshot-qdrant st :post (format nil "/collections/~a/points/scroll" (snps-collection st)) req))))
+           (loop for pt across (or (jget res "points") #())
+                 do (push (parse-json (jget (jget pt "payload") "body")) out))
+           (setf offset (jget res "next_page_offset"))
+           (when (or (null offset) (eq offset +json-null+)) (return (nreverse out)))))))
+    (t (loop for b being the hash-values of (snps-memory st) collect b))))
+
 (defun snapshot-store-list (st)
-  (let ((bodies (if (eq (snps-mode st) :file)
-                    (loop for f in (uiop:directory-files (snps-dir st) "*.json")
-                          collect (parse-json (uiop:read-file-string f)))
-                    (loop for b being the hash-values of (snps-memory st) collect b))))
-    (setf bodies (stable-sort bodies #'< :key (lambda (b) (jnumber (jget (jget (jget b "kline") "clocks") "to") "lamport" 0))))
-    (obj "snapshots" (vectorize (mapcar (lambda (b)
-                                          (let ((k (jget b "kline")))
-                                            (obj "id" (snapshot-id b) "digest" (jget b "digest") "scope" (jget k "scope")
-                                                 "span" (jget k "span") "machines" (jget (jget b "corpus") "machines"))))
-                                        bodies)))))
+  "{snapshots: [summary]}, oldest first by clocks.to.lamport, then id: every store alike."
+  (let ((bodies (sort (snapshot-store-bodies st)
+                      (lambda (a b) (if (/= (snapshot-lamport a) (snapshot-lamport b))
+                                        (< (snapshot-lamport a) (snapshot-lamport b))
+                                        (bytes< (snapshot-id a) (snapshot-id b)))))))
+    (obj "snapshots" (vectorize (mapcar #'snapshot-summary bodies)))))
+
+(defun snapshot-store-nearest (st query limit)
+  "{snapshots: [{id, score, scope, span, machines}]}: score > 0, highest first, then id."
+  (if (zerop (hash-table-count query))
+      (obj "snapshots" #())
+      (let ((candidates
+              (if (snapshot-store-qdrant-p st)
+                  ;; Qdrant's candidates, scored and ordered here (ties at the
+                  ;; limit-th place are Qdrant's to break; SURFACE_SPEC "Nearest").
+                  (progn
+                    (snapshot-qdrant-ready st)
+                    (loop for pt across (or (jget (snapshot-qdrant st :post (format nil "/collections/~a/points/query" (snps-collection st))
+                                                                   (obj "query" (snapshot-sparse query) "using" "isre"
+                                                                        "filter" (snapshot-instance-filter st) "limit" limit
+                                                                        "with_payload" t))
+                                                  "points")
+                                            #())
+                          collect (parse-json (jget (jget pt "payload") "body"))))
+                  (snapshot-store-bodies st))))
+        (snapshot-ranked (loop for b in candidates
+                               for sc = (snapshot-score query (snapshot-state-of b))
+                               when (> sc 0) collect (cons sc b))
+                         limit))))
